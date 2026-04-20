@@ -20,7 +20,7 @@ from .index_config import resolve_db_path
 from .indexing import IndexingPipeline
 from .indexing.metadata import auto_discover_profile
 from .search import IndexedQueryEngine
-from .storage import DuckDBStorage
+from .storage import PostgresStorage
 from .workflow import (
     AskHumanEvent,
     GoDeeperEvent,
@@ -139,11 +139,8 @@ async def index_status(folder: str, db_path: str | None = None):
             return {"indexed": False}
 
         resolved_db_path = resolve_db_path(db_path)
-        if not Path(resolved_db_path).exists():
-            return {"indexed": False}
-
         try:
-            storage = DuckDBStorage(resolved_db_path, read_only=True, initialize=False)
+            storage = PostgresStorage(resolved_db_path, read_only=True, initialize=False)
         except Exception:
             return {"indexed": False}
 
@@ -224,7 +221,7 @@ async def build_index(request: IndexRequest):
                 except ValueError:
                     embedding_provider = None
             pipeline = IndexingPipeline(
-                storage=DuckDBStorage(resolved_db_path),
+                storage=PostgresStorage(resolved_db_path),
                 embedding_provider=embedding_provider,
             )
             effective_with_metadata = (
@@ -271,7 +268,7 @@ async def search_index(request: SearchRequest):
             )
 
         resolved_db_path = resolve_db_path(request.db_path)
-        storage = DuckDBStorage(resolved_db_path, read_only=True, initialize=False)
+        storage = PostgresStorage(resolved_db_path, read_only=True, initialize=False)
         corpus_id = storage.get_corpus_id(str(folder_path))
         if corpus_id is None:
             storage.close()
@@ -338,7 +335,7 @@ async def websocket_explore(websocket: WebSocket):
         db_path = data.get("db_path")
         enable_semantic = bool(data.get("enable_semantic", False))
         enable_metadata = bool(data.get("enable_metadata", False))
-        index_storage: DuckDBStorage | None = None
+        index_storage: PostgresStorage | None = None
 
         if not task:
             await websocket.send_json(
@@ -359,7 +356,7 @@ async def websocket_explore(websocket: WebSocket):
             resolved_db_path = resolve_db_path(
                 db_path if isinstance(db_path, str) else None
             )
-            storage = DuckDBStorage(resolved_db_path)
+            storage = PostgresStorage(resolved_db_path)
             corpus_id = storage.get_corpus_id(str(folder_path))
             if corpus_id is None:
                 await websocket.send_json(

@@ -100,10 +100,11 @@ def describe_dir_content(directory: str) -> str:
     
     for child in children:
         fullpath = os.path.join(directory, child)
+        normalized = fullpath.replace("\\", "/")
         if os.path.isfile(fullpath):
-            files.append(fullpath)
+            files.append(normalized)
         else:
-            directories.append(fullpath)
+            directories.append(normalized)
     
     description = f"Content of {directory}\n"
     description += "FILES:\n- " + "\n- ".join(files)

@@ -1,27 +1,30 @@
 """
-Configuration helpers for local index storage.
+Configuration helpers for index storage.
 """
 
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 
-DEFAULT_DB_PATH = "~/.fs_explorer/index.duckdb"
-ENV_DB_PATH = "FS_EXPLORER_DB_PATH"
+DEFAULT_DB_PATH = "postgresql://fs_explorer:devpassword@127.0.0.1:5432/fs_explorer"
+ENV_DB_DSN = "FS_EXPLORER_DB_DSN"
+ENV_DB_PATH_LEGACY = "FS_EXPLORER_DB_PATH"
 
 
 def resolve_db_path(override_path: str | None = None) -> str:
     """
-    Resolve the DuckDB path from CLI override, env var, or default.
+    Resolve the PostgreSQL DSN from request override, env var, or default.
 
     Precedence:
     1) explicit override_path
-    2) FS_EXPLORER_DB_PATH
-    3) default path
+    2) FS_EXPLORER_DB_DSN
+    3) FS_EXPLORER_DB_PATH (legacy alias)
+    4) default DSN
     """
-    raw_path = override_path or os.getenv(ENV_DB_PATH) or DEFAULT_DB_PATH
-    resolved = Path(raw_path).expanduser().resolve()
-    resolved.parent.mkdir(parents=True, exist_ok=True)
-    return str(resolved)
+    return (
+        override_path
+        or os.getenv(ENV_DB_DSN)
+        or os.getenv(ENV_DB_PATH_LEGACY)
+        or DEFAULT_DB_PATH
+    )

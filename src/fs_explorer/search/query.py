@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ..embeddings import EmbeddingProvider
-from ..storage import DuckDBStorage, StorageBackend
+from ..storage import PostgresStorage, StorageBackend
 from .filters import MetadataFilter, parse_metadata_filters
 from .ranker import RankedDocument, rank_documents
 
@@ -167,11 +167,13 @@ class IndexedQueryEngine:
                 corpus_id=corpus_id
             ):
                 query_embedding = self.embedding_provider.embed_query(query)
-                return scoped_storage.search_chunks_semantic(
+                semantic_rows = scoped_storage.search_chunks_semantic(
                     corpus_id=corpus_id,
                     query_embedding=query_embedding,
                     limit=limit,
                 )
+                if semantic_rows:
+                    return semantic_rows
             return scoped_storage.search_chunks(
                 corpus_id=corpus_id, query=query, limit=limit
             )
@@ -196,8 +198,8 @@ class IndexedQueryEngine:
             cleanup()
 
     def _acquire_query_storage(self) -> tuple[StorageBackend, Callable[[], None]]:
-        if isinstance(self.storage, DuckDBStorage):
-            clone = DuckDBStorage(
+        if isinstance(self.storage, PostgresStorage):
+            clone = PostgresStorage(
                 self.storage.db_path,
                 read_only=self.storage.read_only,
                 initialize=False,

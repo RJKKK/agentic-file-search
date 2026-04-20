@@ -22,7 +22,7 @@ from rich.text import Text
 from .embeddings import EmbeddingProvider
 from .index_config import resolve_db_path
 from .indexing import IndexingPipeline, SchemaDiscovery
-from .storage import DuckDBStorage
+from .storage import PostgresStorage
 from .agent import set_index_context, clear_index_context
 from .workflow import (
     workflow,
@@ -281,10 +281,10 @@ async def run_workflow(
         return
 
     resolved_db_path: str | None = None
-    index_storage: DuckDBStorage | None = None
+    index_storage: PostgresStorage | None = None
     if use_index:
         resolved_db_path = resolve_db_path(db_path)
-        storage = DuckDBStorage(resolved_db_path)
+        storage = PostgresStorage(resolved_db_path)
         corpus_id = storage.get_corpus_id(resolved_folder)
         if corpus_id is None:
             console.print(
@@ -441,6 +441,8 @@ async def run_workflow(
         print_workflow_summary(console, agent, step_number, trace, cited_sources)
     finally:
         clear_index_context()
+        if index_storage is not None:
+            index_storage.close()
 
 
 @app.callback(invoke_without_command=True)
@@ -471,7 +473,7 @@ def main(
     ] = False,
     db_path: Annotated[
         str | None,
-        Option("--db-path", help="Path to DuckDB index file."),
+        Option("--db-path", help="PostgreSQL DSN for index storage."),
     ] = None,
 ) -> None:
     """
@@ -494,7 +496,7 @@ def main(
         try:
             resolved_folder = os.path.abspath(folder)
             resolved_db = resolve_db_path(db_path)
-            storage = DuckDBStorage(resolved_db, read_only=True, initialize=False)
+            storage = PostgresStorage(resolved_db, read_only=True, initialize=False)
             if storage.get_corpus_id(resolved_folder) is not None:
                 effective_use_index = True
             storage.close()
@@ -514,7 +516,7 @@ def index_command(
     ] = ".",
     db_path: Annotated[
         str | None,
-        Option("--db-path", help="Path to DuckDB index file."),
+        Option("--db-path", help="PostgreSQL DSN for index storage."),
     ] = None,
     discover_schema: Annotated[
         bool,
@@ -558,7 +560,7 @@ def index_command(
     """Build or refresh an index for a folder."""
     console = Console()
     resolved_db_path = resolve_db_path(db_path)
-    storage = DuckDBStorage(resolved_db_path)
+    storage = PostgresStorage(resolved_db_path)
 
     embedding_provider: EmbeddingProvider | None = None
     if with_embeddings:
@@ -638,7 +640,7 @@ def query_command(
     ] = ".",
     db_path: Annotated[
         str | None,
-        Option("--db-path", help="Path to DuckDB index file."),
+        Option("--db-path", help="PostgreSQL DSN for index storage."),
     ] = None,
 ) -> None:
     """Run the agent with indexed retrieval enabled."""
@@ -653,7 +655,7 @@ def schema_discover_command(
     ] = ".",
     db_path: Annotated[
         str | None,
-        Option("--db-path", help="Path to DuckDB index file."),
+        Option("--db-path", help="PostgreSQL DSN for index storage."),
     ] = None,
     name: Annotated[
         str | None,
@@ -691,7 +693,7 @@ def schema_discover_command(
         raise BadParameter(f"No such directory: {resolved_folder}")
 
     resolved_db_path = resolve_db_path(db_path)
-    storage = DuckDBStorage(resolved_db_path)
+    storage = PostgresStorage(resolved_db_path)
     corpus_id = storage.get_or_create_corpus(resolved_folder)
     metadata_profile = _load_metadata_profile(metadata_profile_path)
     effective_with_metadata = with_metadata or metadata_profile is not None
@@ -750,14 +752,14 @@ def schema_show_command(
     ] = ".",
     db_path: Annotated[
         str | None,
-        Option("--db-path", help="Path to DuckDB index file."),
+        Option("--db-path", help="PostgreSQL DSN for index storage."),
     ] = None,
 ) -> None:
     """Show saved schemas for a folder's corpus."""
     console = Console()
     resolved_folder = str(os.path.abspath(folder))
     resolved_db_path = resolve_db_path(db_path)
-    storage = DuckDBStorage(resolved_db_path)
+    storage = PostgresStorage(resolved_db_path)
 
     corpus_id = storage.get_corpus_id(resolved_folder)
     if corpus_id is None:

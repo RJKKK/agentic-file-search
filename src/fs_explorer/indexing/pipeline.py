@@ -21,7 +21,7 @@ from .metadata import (
 from .schema import SchemaDiscovery
 from ..embeddings import EmbeddingProvider
 from ..fs import SUPPORTED_EXTENSIONS, parse_file
-from ..storage import ChunkRecord, DocumentRecord, DuckDBStorage, StorageBackend
+from ..storage import ChunkRecord, DocumentRecord, PostgresStorage, StorageBackend
 
 _PARSE_ERROR_PREFIXES: tuple[str, ...] = (
     "Error parsing ",
@@ -122,7 +122,7 @@ class IndexingPipeline:
             metadata_json = json.dumps(metadata, sort_keys=True)
 
             stat = os.stat(file_path)
-            doc_id = DuckDBStorage.make_document_id(corpus_id, relative_path)
+            doc_id = PostgresStorage.make_document_id(corpus_id, relative_path)
             doc_record = DocumentRecord(
                 id=doc_id,
                 corpus_id=corpus_id,
@@ -139,7 +139,7 @@ class IndexingPipeline:
             for chunk in chunks:
                 chunk_records.append(
                     ChunkRecord(
-                        id=DuckDBStorage.make_chunk_id(
+                        id=PostgresStorage.make_chunk_id(
                             doc_id,
                             chunk.position,
                             chunk.start_char,
@@ -372,7 +372,7 @@ class IndexingPipeline:
             chunk_embeddings=pairs,
         )
 
-        if isinstance(self.storage, DuckDBStorage):
+        if isinstance(self.storage, PostgresStorage):
             self.storage.create_hnsw_index(corpus_id=corpus_id)
 
         return written

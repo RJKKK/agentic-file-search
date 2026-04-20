@@ -10,11 +10,12 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "docling>=2.55.0",
-    "duckdb>=1.0.0",
     "fastapi>=0.115.0",
     "google-genai>=1.55.0",
     "langextract>=1.0.0",
     "llama-index-workflows>=2.11.5",
+    "pgvector>=0.3.6",
+    "psycopg[binary]>=3.2.9",
     "python-dotenv>=1.0.0",
     "reportlab>=4.4.7",
     "rich>=13.0.0",

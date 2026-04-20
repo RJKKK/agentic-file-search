@@ -5,6 +5,7 @@ Helpers for recording exploration path and referenced files.
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -21,6 +22,20 @@ def normalize_path(path: str, root_directory: str) -> str:
     if os.path.isabs(path):
         return os.path.abspath(path)
     return os.path.abspath(os.path.join(root_directory, path))
+
+
+def _trace_path(path: str, root_directory: str) -> str:
+    """
+    Normalize paths for trace output.
+
+    When the caller uses POSIX-style paths (e.g. "/tmp/project"), preserve POSIX
+    formatting in the trace to keep outputs stable across platforms.
+    """
+    if path.startswith("/"):
+        return posixpath.normpath(path)
+    if root_directory.startswith("/"):
+        return posixpath.normpath(posixpath.join(root_directory, path))
+    return normalize_path(path, root_directory).replace("\\", "/")
 
 
 def extract_cited_sources(final_result: str | None) -> list[str]:
@@ -65,17 +80,17 @@ class ExplorationTrace:
 
         directory = tool_input.get("directory")
         if isinstance(directory, str) and directory:
-            path_entries.append(f"directory={normalize_path(directory, self.root_directory)}")
+            path_entries.append(f"directory={_trace_path(directory, self.root_directory)}")
 
         file_path = tool_input.get("file_path")
         if isinstance(file_path, str) and file_path:
-            normalized_file_path = normalize_path(file_path, self.root_directory)
+            normalized_file_path = _trace_path(file_path, self.root_directory)
             path_entries.append(f"file={normalized_file_path}")
             if tool_name in FILE_TOOLS:
                 self.referenced_documents.add(normalized_file_path)
 
         if resolved_document_path:
-            normalized_doc_path = normalize_path(resolved_document_path, self.root_directory)
+            normalized_doc_path = _trace_path(resolved_document_path, self.root_directory)
             path_entries.append(f"document={normalized_doc_path}")
             self.referenced_documents.add(normalized_doc_path)
 
@@ -84,7 +99,7 @@ class ExplorationTrace:
 
     def record_go_deeper(self, *, step_number: int, directory: str) -> None:
         """Record a directory navigation event in the exploration path."""
-        resolved_dir = normalize_path(directory, self.root_directory)
+        resolved_dir = _trace_path(directory, self.root_directory)
         self.step_path.append(f"{step_number}. godeeper (directory={resolved_dir})")
 
     def sorted_documents(self) -> list[str]:

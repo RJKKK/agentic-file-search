@@ -31,7 +31,7 @@ from .search import (
     MetadataFilterParseError,
     supported_filter_syntax,
 )
-from .storage import DuckDBStorage
+from .storage import PostgresStorage
 
 # Load .env file from project root
 _env_path = Path(__file__).parent.parent.parent / ".env"
@@ -187,12 +187,12 @@ def clear_index_context() -> None:
 
 
 def _get_index_storage_and_corpus() -> tuple[
-    DuckDBStorage | None, str | None, str | None
+    PostgresStorage | None, str | None, str | None
 ]:
     if _INDEX_CONTEXT is None:
         return None, None, "Index context is not configured. Re-run with `--use-index`."
 
-    storage = DuckDBStorage(_INDEX_CONTEXT.db_path)
+    storage = PostgresStorage(_INDEX_CONTEXT.db_path)
     corpus_id = storage.get_corpus_id(_INDEX_CONTEXT.root_folder)
     if corpus_id is None:
         return (
