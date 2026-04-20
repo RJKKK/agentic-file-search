@@ -48,6 +48,34 @@ class SchemaRecord:
     created_at: str
 
 
+@dataclass(frozen=True)
+class ParsedUnitRecord:
+    """A parsed page-sized unit stored for incremental parse cache reuse."""
+
+    document_id: str
+    parser_name: str
+    parser_version: str
+    page_no: int
+    markdown: str
+    content_hash: str
+    images_json: str
+
+
+@dataclass(frozen=True)
+class ImageSemanticRecord:
+    """A cached image semantic placeholder or enriched description."""
+
+    image_hash: str
+    source_document_id: str
+    source_page_no: int
+    source_image_index: int
+    mime_type: str | None
+    width: int | None
+    height: int | None
+    semantic_text: str | None = None
+    semantic_model: str | None = None
+
+
 class StorageBackend(Protocol):
     """Protocol for persistence operations used by indexing and schema workflows."""
 
@@ -104,6 +132,47 @@ class StorageBackend(Protocol):
 
     def get_document(self, *, doc_id: str) -> dict[str, Any] | None:
         """Get a document by id."""
+
+    def list_parsed_units(
+        self,
+        *,
+        document_id: str,
+        parser_version: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return cached parsed units for a document."""
+
+    def sync_parsed_units(
+        self,
+        *,
+        document_id: str,
+        parser_name: str,
+        parser_version: str,
+        units: list[ParsedUnitRecord],
+    ) -> dict[str, int]:
+        """Upsert parsed units and delete stale pages for the same parser version."""
+
+    def upsert_image_semantics(
+        self,
+        *,
+        images: list[ImageSemanticRecord],
+    ) -> int:
+        """Insert image semantic placeholders for extracted images."""
+
+    def get_image_semantics(
+        self,
+        *,
+        image_hashes: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch cached image semantics keyed by image hash."""
+
+    def update_image_semantic(
+        self,
+        *,
+        image_hash: str,
+        semantic_text: str,
+        semantic_model: str | None = None,
+    ) -> None:
+        """Persist a lazy semantic enhancement result for an image hash."""
 
     def save_schema(
         self,

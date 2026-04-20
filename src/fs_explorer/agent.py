@@ -5,6 +5,7 @@ This module contains the agent that interacts with the Gemini AI model
 to make decisions about filesystem exploration actions.
 """
 
+import contextvars
 import os
 import re
 from pathlib import Path
@@ -25,6 +26,8 @@ from .fs import (
     parse_file,
 )
 from .embeddings import EmbeddingProvider
+from .document_parsing import PARSER_VERSION, enhance_page_image_semantics
+from .image_semantics import build_image_semantic_enhancer
 from .index_config import resolve_db_path
 from .search import (
     IndexedQueryEngine,
@@ -133,72 +136,103 @@ class IndexContext:
     db_path: str
 
 
-_INDEX_CONTEXT: IndexContext | None = None
-_EMBEDDING_PROVIDER: EmbeddingProvider | None = None
-_FIELD_CATALOG_SHOWN: bool = False
-_ENABLE_SEMANTIC: bool = False
-_ENABLE_METADATA: bool = False
+RuntimeEventCallback = Callable[[str, dict[str, Any]], None]
+
+
+_INDEX_CONTEXT_VAR: contextvars.ContextVar[IndexContext | None] = contextvars.ContextVar(
+    "_INDEX_CONTEXT_VAR", default=None
+)
+_EMBEDDING_PROVIDER_VAR: contextvars.ContextVar[EmbeddingProvider | None] = (
+    contextvars.ContextVar("_EMBEDDING_PROVIDER_VAR", default=None)
+)
+_IMAGE_SEMANTIC_ENHANCER_VAR: contextvars.ContextVar[Any | None] = (
+    contextvars.ContextVar("_IMAGE_SEMANTIC_ENHANCER_VAR", default=None)
+)
+_FIELD_CATALOG_SHOWN_VAR: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_FIELD_CATALOG_SHOWN_VAR", default=False
+)
+_ENABLE_SEMANTIC_VAR: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_ENABLE_SEMANTIC_VAR", default=False
+)
+_ENABLE_METADATA_VAR: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_ENABLE_METADATA_VAR", default=False
+)
+_RUNTIME_EVENT_CALLBACK_VAR: contextvars.ContextVar[RuntimeEventCallback | None] = (
+    contextvars.ContextVar("_RUNTIME_EVENT_CALLBACK_VAR", default=None)
+)
 
 
 def set_search_flags(
     *, enable_semantic: bool = False, enable_metadata: bool = False
 ) -> None:
     """Configure which indexed retrieval paths are active."""
-    global _ENABLE_SEMANTIC, _ENABLE_METADATA
-    _ENABLE_SEMANTIC = enable_semantic
-    _ENABLE_METADATA = enable_metadata
+    _ENABLE_SEMANTIC_VAR.set(enable_semantic)
+    _ENABLE_METADATA_VAR.set(enable_metadata)
 
 
 def get_search_flags() -> tuple[bool, bool]:
     """Return (enable_semantic, enable_metadata)."""
-    return _ENABLE_SEMANTIC, _ENABLE_METADATA
+    return _ENABLE_SEMANTIC_VAR.get(), _ENABLE_METADATA_VAR.get()
 
 
 def set_embedding_provider(provider: EmbeddingProvider | None) -> None:
     """Set the embedding provider for vector search in indexed tools."""
-    global _EMBEDDING_PROVIDER
-    _EMBEDDING_PROVIDER = provider
+    _EMBEDDING_PROVIDER_VAR.set(provider)
+
+
+def set_image_semantic_enhancer(enhancer) -> None:
+    """Override the lazy image semantic enhancer, primarily for tests."""
+    _IMAGE_SEMANTIC_ENHANCER_VAR.set(enhancer)
+
+
+def set_runtime_event_callback(callback: RuntimeEventCallback | None) -> None:
+    """Register an optional callback for runtime cache/enhancement events."""
+    _RUNTIME_EVENT_CALLBACK_VAR.set(callback)
 
 
 def set_index_context(folder: str, db_path: str | None = None) -> None:
     """Enable indexed tools for a specific folder corpus."""
-    global _INDEX_CONTEXT, _EMBEDDING_PROVIDER
-    _INDEX_CONTEXT = IndexContext(
+    _INDEX_CONTEXT_VAR.set(
+        IndexContext(
         root_folder=str(Path(folder).resolve()),
         db_path=resolve_db_path(db_path),
+        )
     )
     # Auto-create embedding provider if API key available
-    if _EMBEDDING_PROVIDER is None:
+    if _EMBEDDING_PROVIDER_VAR.get() is None:
         try:
-            _EMBEDDING_PROVIDER = EmbeddingProvider()
+            _EMBEDDING_PROVIDER_VAR.set(EmbeddingProvider())
         except ValueError:
             pass
+    if _IMAGE_SEMANTIC_ENHANCER_VAR.get() is None:
+        _IMAGE_SEMANTIC_ENHANCER_VAR.set(build_image_semantic_enhancer())
 
 
 def clear_index_context() -> None:
     """Disable indexed tools for the current process."""
-    global _INDEX_CONTEXT, _EMBEDDING_PROVIDER, _FIELD_CATALOG_SHOWN
-    global _ENABLE_SEMANTIC, _ENABLE_METADATA
-    _INDEX_CONTEXT = None
-    _EMBEDDING_PROVIDER = None
-    _FIELD_CATALOG_SHOWN = False
-    _ENABLE_SEMANTIC = False
-    _ENABLE_METADATA = False
+    _INDEX_CONTEXT_VAR.set(None)
+    _EMBEDDING_PROVIDER_VAR.set(None)
+    _IMAGE_SEMANTIC_ENHANCER_VAR.set(None)
+    _RUNTIME_EVENT_CALLBACK_VAR.set(None)
+    _FIELD_CATALOG_SHOWN_VAR.set(False)
+    _ENABLE_SEMANTIC_VAR.set(False)
+    _ENABLE_METADATA_VAR.set(False)
 
 
 def _get_index_storage_and_corpus() -> tuple[
     PostgresStorage | None, str | None, str | None
 ]:
-    if _INDEX_CONTEXT is None:
+    index_context = _INDEX_CONTEXT_VAR.get()
+    if index_context is None:
         return None, None, "Index context is not configured. Re-run with `--use-index`."
 
-    storage = PostgresStorage(_INDEX_CONTEXT.db_path)
-    corpus_id = storage.get_corpus_id(_INDEX_CONTEXT.root_folder)
+    storage = PostgresStorage(index_context.db_path)
+    corpus_id = storage.get_corpus_id(index_context.root_folder)
     if corpus_id is None:
         return (
             None,
             None,
-            f"No index found for folder {_INDEX_CONTEXT.root_folder}. "
+            f"No index found for folder {index_context.root_folder}. "
             "Run `explore index <folder>` first.",
         )
     return storage, corpus_id, None
@@ -211,6 +245,189 @@ def _clean_excerpt(text: str, max_chars: int = 320) -> str:
     return f"{squashed[:max_chars]}..."
 
 
+def _normalize_lookup_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _emit_runtime_event(event_type: str, **data: Any) -> None:
+    """Fan out an optional runtime event if a callback is configured."""
+    callback = _RUNTIME_EVENT_CALLBACK_VAR.get()
+    if callback is not None:
+        callback(event_type, data)
+
+
+def _pending_image_hashes_for_unit(
+    storage: PostgresStorage,
+    unit: dict[str, Any],
+) -> list[str]:
+    images = unit.get("images")
+    if not isinstance(images, list) or not images:
+        return []
+    image_hashes = [
+        str(image["image_hash"])
+        for image in images
+        if isinstance(image, dict) and isinstance(image.get("image_hash"), str)
+    ]
+    if not image_hashes:
+        return []
+    semantics = storage.get_image_semantics(image_hashes=image_hashes)
+    return [
+        image_hash
+        for image_hash in image_hashes
+        if image_hash not in semantics or not semantics[image_hash].get("semantic_text")
+    ]
+
+
+def _select_relevant_page_numbers(
+    units: list[dict[str, Any]],
+    excerpt: str,
+    *,
+    max_pages: int = 2,
+) -> list[int]:
+    if not units:
+        return []
+
+    excerpt_text = _normalize_lookup_text(excerpt)
+    if not excerpt_text:
+        return [int(units[0]["page_no"])]
+
+    excerpt_terms = [
+        term
+        for term in re.findall(r"[a-z0-9]{4,}", excerpt_text)
+        if term not in {"with", "from", "that", "this"}
+    ]
+
+    scored: list[tuple[int, int]] = []
+    for unit in units:
+        page_text = _normalize_lookup_text(str(unit.get("markdown", "")))
+        score = 0
+        if excerpt_text and excerpt_text in page_text:
+            score += 100
+        score += sum(1 for term in excerpt_terms if term in page_text)
+        if score > 0:
+            scored.append((int(unit["page_no"]), score))
+
+    if scored:
+        scored.sort(key=lambda item: (-item[1], item[0]))
+        return [page_no for page_no, _ in scored[:max_pages]]
+
+    if len(units) == 1:
+        return [int(units[0]["page_no"])]
+    return []
+
+
+def _maybe_enhance_images_for_hits(
+    storage: PostgresStorage,
+    hits,
+) -> tuple[int, int]:
+    enhancer = _IMAGE_SEMANTIC_ENHANCER_VAR.get()
+    if enhancer is None:
+        return 0, 0
+
+    enhanced_images = 0
+    cached_pages = 0
+    seen_pages: set[tuple[str, int]] = set()
+
+    for hit in hits:
+        units = storage.list_parsed_units(
+            document_id=hit.doc_id,
+            parser_version=PARSER_VERSION,
+        )
+        for page_no in _select_relevant_page_numbers(units, hit.text):
+            page_key = (hit.doc_id, page_no)
+            if page_key in seen_pages:
+                continue
+            seen_pages.add(page_key)
+            unit = next(
+                (candidate for candidate in units if int(candidate["page_no"]) == page_no),
+                None,
+            )
+            if unit is None:
+                continue
+            pending_hashes = _pending_image_hashes_for_unit(storage, unit)
+            if pending_hashes:
+                _emit_runtime_event(
+                    "image_enhance_started",
+                    doc_id=hit.doc_id,
+                    absolute_path=hit.absolute_path,
+                    page_no=page_no,
+                    image_hashes=pending_hashes,
+                    pending_images=len(pending_hashes),
+                )
+                page_enhanced = enhance_page_image_semantics(
+                    storage=storage,
+                    document_id=hit.doc_id,
+                    page_no=page_no,
+                    enhancer=enhancer,
+                )
+                enhanced_images += page_enhanced
+                _emit_runtime_event(
+                    "image_enhance_done",
+                    doc_id=hit.doc_id,
+                    absolute_path=hit.absolute_path,
+                    page_no=page_no,
+                    image_hashes=pending_hashes,
+                    enhanced_images=page_enhanced,
+                )
+            elif unit.get("images"):
+                cached_pages += 1
+                _emit_runtime_event(
+                    "cache_hit",
+                    cache_kind="image_semantics",
+                    doc_id=hit.doc_id,
+                    absolute_path=hit.absolute_path,
+                    page_no=page_no,
+                    cached_images=len(unit["images"]),
+                )
+
+    return enhanced_images, cached_pages
+
+
+def _format_cached_image_semantics(
+    storage: PostgresStorage,
+    *,
+    document_id: str,
+) -> str:
+    units = storage.list_parsed_units(
+        document_id=document_id,
+        parser_version=PARSER_VERSION,
+    )
+    if not units:
+        return ""
+
+    lines: list[str] = []
+    for unit in units:
+        images = unit.get("images")
+        if not isinstance(images, list) or not images:
+            continue
+        image_hashes = [
+            str(image["image_hash"])
+            for image in images
+            if isinstance(image, dict) and isinstance(image.get("image_hash"), str)
+        ]
+        semantics = storage.get_image_semantics(image_hashes=image_hashes)
+        page_entries: list[str] = []
+        for image in images:
+            if not isinstance(image, dict):
+                continue
+            image_hash = image.get("image_hash")
+            if not isinstance(image_hash, str):
+                continue
+            semantic = semantics.get(image_hash)
+            if semantic is None or not semantic.get("semantic_text"):
+                continue
+            page_entries.append(
+                f"- image {image.get('image_index', '?')}: {semantic['semantic_text']}"
+            )
+        if page_entries:
+            lines.append(f"Page {unit['page_no']}:")
+            lines.extend(page_entries)
+
+    if not lines:
+        return ""
+    return "\n\nImage semantics cache:\n" + "\n".join(lines)
+
+
 def semantic_search(query: str, filters: str | None = None, limit: int = 5) -> str:
     """Search indexed chunks and return ranked excerpts."""
     storage, corpus_id, error = _get_index_storage_and_corpus()
@@ -218,15 +435,19 @@ def semantic_search(query: str, filters: str | None = None, limit: int = 5) -> s
         return error
     assert storage is not None and corpus_id is not None
 
-    engine = IndexedQueryEngine(storage, embedding_provider=_EMBEDDING_PROVIDER)
+    engine = IndexedQueryEngine(
+        storage,
+        embedding_provider=_EMBEDDING_PROVIDER_VAR.get(),
+    )
+    enable_semantic, enable_metadata = get_search_flags()
     try:
         hits = engine.search(
             corpus_id=corpus_id,
             query=query,
             filters=filters,
             limit=limit,
-            enable_semantic=_ENABLE_SEMANTIC,
-            enable_metadata=_ENABLE_METADATA,
+            enable_semantic=enable_semantic,
+            enable_metadata=enable_metadata,
         )
     except MetadataFilterParseError as exc:
         return f"Invalid metadata filter: {exc}\n{supported_filter_syntax()}"
@@ -237,6 +458,8 @@ def semantic_search(query: str, filters: str | None = None, limit: int = 5) -> s
         if filters:
             return f"No indexed matches found for query={query!r} with filters={filters!r}."
         return f"No indexed matches found for query: {query!r}"
+
+    enhanced_images, cached_image_pages = _maybe_enhance_images_for_hits(storage, hits)
 
     lines = [
         "=== INDEXED SEARCH RESULTS ===",
@@ -263,11 +486,16 @@ def semantic_search(query: str, filters: str | None = None, limit: int = 5) -> s
     lines.append(
         "Use get_document(doc_id=...) to read full content for the most relevant documents."
     )
+    if enhanced_images or cached_image_pages:
+        lines.append("")
+        lines.append(
+            "Image semantics: "
+            f"enhanced {enhanced_images} images, reused cached semantics for {cached_image_pages} pages."
+        )
 
     # Include a rich field catalog on the first search so the agent can
     # construct effective metadata filters.
-    global _FIELD_CATALOG_SHOWN
-    if not _FIELD_CATALOG_SHOWN:
+    if not _FIELD_CATALOG_SHOWN_VAR.get():
         active_schema = storage.get_active_schema(corpus_id=corpus_id)
         if active_schema is not None:
             schema_fields = active_schema.schema_def.get("fields")
@@ -320,7 +548,7 @@ def semantic_search(query: str, filters: str | None = None, limit: int = 5) -> s
                     )
                     for desc in field_descs:
                         lines.append(f"  - {desc}")
-                _FIELD_CATALOG_SHOWN = True
+                _FIELD_CATALOG_SHOWN_VAR.set(True)
 
     return "\n".join(lines)
 
@@ -338,10 +566,13 @@ def get_document(doc_id: str) -> str:
     if document["is_deleted"]:
         return f"Document {doc_id} is marked as deleted in the index."
 
+    semantic_section = _format_cached_image_semantics(storage, document_id=doc_id)
+
     return (
         f"=== DOCUMENT {doc_id} ===\n"
         f"Path: {document['absolute_path']}\n\n"
         f"{document['content']}"
+        f"{semantic_section}"
     )
 
 
@@ -600,7 +831,7 @@ class FsExplorerAgent:
             model="gemini-3-flash-preview",
             contents=self._chat_history,  # type: ignore
             config={
-                "system_instruction": _build_system_prompt(_ENABLE_SEMANTIC, _ENABLE_METADATA),
+                "system_instruction": _build_system_prompt(*get_search_flags()),
                 "response_mime_type": "application/json",
                 "response_schema": Action,
             },

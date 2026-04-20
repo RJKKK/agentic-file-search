@@ -7,16 +7,28 @@ from unittest.mock import patch
 from google.genai import Client as GenAIClient
 from google.genai.types import HttpOptions
 
+import fs_explorer.agent as agent_module
 from fs_explorer.agent import (
     FsExplorerAgent,
     SYSTEM_PROMPT,
     TokenUsage,
     _build_system_prompt,
+    get_document,
+    semantic_search,
     set_search_flags,
+    set_image_semantic_enhancer,
+    set_runtime_event_callback,
     get_search_flags,
     clear_index_context,
 )
 from fs_explorer.models import Action, StopAction
+from fs_explorer.storage import (
+    ChunkRecord,
+    DocumentRecord,
+    DuckDBStorage,
+    ImageSemanticRecord,
+    ParsedUnitRecord,
+)
 from .conftest import MockGenAIClient
 
 
@@ -227,3 +239,185 @@ class TestSearchFlags:
 
         last = agent._chat_history[-1]
         assert "not available" not in last.parts[0].text
+
+
+class TestImageSemanticEnhancement:
+    def teardown_method(self) -> None:
+        clear_index_context()
+
+    @staticmethod
+    def _seed_indexed_pdf(tmp_path):
+        storage = DuckDBStorage(str(tmp_path / "index.duckdb"))
+        corpus_id = storage.get_or_create_corpus(str(tmp_path.resolve()))
+        doc_id = storage.make_document_id(corpus_id, "report.pdf")
+        document = DocumentRecord(
+            id=doc_id,
+            corpus_id=corpus_id,
+            relative_path="report.pdf",
+            absolute_path=str(tmp_path / "report.pdf"),
+            content="Quarterly review includes revenue chart and commentary.",
+            metadata_json="{}",
+            file_mtime=0.0,
+            file_size=128,
+            content_sha256="sha-report",
+        )
+        chunk = ChunkRecord(
+            id=storage.make_chunk_id(doc_id, 0, 0, 56),
+            doc_id=doc_id,
+            text="Quarterly review includes revenue chart and commentary.",
+            position=0,
+            start_char=0,
+            end_char=56,
+        )
+        storage.upsert_document(document, [chunk])
+        storage.sync_parsed_units(
+            document_id=doc_id,
+            parser_name="pymupdf4llm",
+            parser_version="m2-v1",
+            units=[
+                ParsedUnitRecord(
+                    document_id=doc_id,
+                    parser_name="pymupdf4llm",
+                    parser_version="m2-v1",
+                    page_no=1,
+                    markdown="Quarterly review includes revenue chart and commentary.",
+                    content_hash="page-1-hash",
+                    images_json='[{"image_hash":"img-1","image_index":1,"mime_type":"image/png","width":320,"height":200}]',
+                )
+            ],
+        )
+        storage.upsert_image_semantics(
+            images=[
+                ImageSemanticRecord(
+                    image_hash="img-1",
+                    source_document_id=doc_id,
+                    source_page_no=1,
+                    source_image_index=1,
+                    mime_type="image/png",
+                    width=320,
+                    height=200,
+                )
+            ]
+        )
+        return storage, corpus_id, doc_id
+
+    def test_semantic_search_lazily_enhances_hit_images(
+        self,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        storage, corpus_id, _ = self._seed_indexed_pdf(tmp_path)
+
+        class StubEnhancer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def describe_image(self, **kwargs):  # noqa: ANN003
+                self.calls += 1
+                return "Revenue bar chart with quarterly labels.", "stub-vision"
+
+        enhancer = StubEnhancer()
+        monkeypatch.setattr(
+            agent_module,
+            "_get_index_storage_and_corpus",
+            lambda: (storage, corpus_id, None),
+        )
+        monkeypatch.setattr(
+            "fs_explorer.document_parsing._extract_pdf_images",
+            lambda file_path, page_no, include_bytes=False: [
+                {
+                    "image_hash": "img-1",
+                    "image_index": 1,
+                    "mime_type": "image/png",
+                    "width": 320,
+                    "height": 200,
+                    "image_bytes": b"fake-image",
+                }
+            ],
+        )
+        set_search_flags(enable_semantic=True, enable_metadata=False)
+        set_image_semantic_enhancer(enhancer)
+
+        first = semantic_search("revenue chart")
+        second = semantic_search("revenue chart")
+
+        semantics = storage.get_image_semantics(image_hashes=["img-1"])
+        assert enhancer.calls == 1
+        assert semantics["img-1"]["semantic_text"] == "Revenue bar chart with quarterly labels."
+        assert "enhanced 1 images" in first
+        assert "reused cached semantics for 1 pages" in second
+        storage.close()
+
+    def test_semantic_search_emits_runtime_cache_and_enhancement_events(
+        self,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        storage, corpus_id, doc_id = self._seed_indexed_pdf(tmp_path)
+
+        class StubEnhancer:
+            def describe_image(self, **kwargs):  # noqa: ANN003
+                return "Revenue bar chart with quarterly labels.", "stub-vision"
+
+        events: list[tuple[str, dict]] = []
+        monkeypatch.setattr(
+            agent_module,
+            "_get_index_storage_and_corpus",
+            lambda: (storage, corpus_id, None),
+        )
+        monkeypatch.setattr(
+            "fs_explorer.document_parsing._extract_pdf_images",
+            lambda file_path, page_no, include_bytes=False: [
+                {
+                    "image_hash": "img-1",
+                    "image_index": 1,
+                    "mime_type": "image/png",
+                    "width": 320,
+                    "height": 200,
+                    "image_bytes": b"fake-image",
+                }
+            ],
+        )
+        set_search_flags(enable_semantic=True, enable_metadata=False)
+        set_image_semantic_enhancer(StubEnhancer())
+        set_runtime_event_callback(lambda event_type, data: events.append((event_type, dict(data))))
+
+        semantic_search("revenue chart")
+        semantic_search("revenue chart")
+
+        assert [event_type for event_type, _ in events] == [
+            "image_enhance_started",
+            "image_enhance_done",
+            "cache_hit",
+        ]
+        assert events[0][1]["doc_id"] == doc_id
+        assert events[0][1]["page_no"] == 1
+        assert events[0][1]["pending_images"] == 1
+        assert events[1][1]["enhanced_images"] == 1
+        assert events[2][1]["cache_kind"] == "image_semantics"
+        assert events[2][1]["cached_images"] == 1
+        storage.close()
+
+    def test_get_document_includes_cached_image_semantics(
+        self,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        storage, corpus_id, doc_id = self._seed_indexed_pdf(tmp_path)
+        storage.update_image_semantic(
+            image_hash="img-1",
+            semantic_text="Revenue bar chart with quarterly labels.",
+            semantic_model="stub-vision",
+        )
+        monkeypatch.setattr(
+            agent_module,
+            "_get_index_storage_and_corpus",
+            lambda: (storage, corpus_id, None),
+        )
+
+        rendered = get_document(doc_id)
+
+        assert "Image semantics cache:" in rendered
+        assert "Page 1:" in rendered
+        assert "image 1: Revenue bar chart with quarterly labels." in rendered
+        storage.close()

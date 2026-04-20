@@ -19,15 +19,36 @@ from .metadata import (
     langextract_field_names,
 )
 from .schema import SchemaDiscovery
+from ..document_parsing import (
+    DocumentParseError,
+    ParsedDocument,
+    ParsedPage,
+    PARSER_VERSION,
+    compute_file_sha256,
+    parse_document,
+    reconstruct_parsed_document,
+)
 from ..embeddings import EmbeddingProvider
-from ..fs import SUPPORTED_EXTENSIONS, parse_file
-from ..storage import ChunkRecord, DocumentRecord, PostgresStorage, StorageBackend
+from ..fs import SUPPORTED_EXTENSIONS
+from ..storage import (
+    ChunkRecord,
+    DocumentRecord,
+    ImageSemanticRecord,
+    ParsedUnitRecord,
+    PostgresStorage,
+    StorageBackend,
+)
 
 _PARSE_ERROR_PREFIXES: tuple[str, ...] = (
     "Error parsing ",
     "Unsupported file extension",
     "No such file:",
 )
+
+
+def parse_file(file_path: str) -> str:
+    """Compatibility hook for older tests and callers that monkeypatch parsing."""
+    return parse_document(file_path).markdown
 
 
 @dataclass(frozen=True)
@@ -42,6 +63,9 @@ class IndexingResult:
     active_documents: int
     schema_used: str | None
     embeddings_written: int = 0
+    parsed_cache_hits: int = 0
+    parsed_pages_updated: int = 0
+    image_placeholders_written: int = 0
 
 
 class IndexingPipeline:
@@ -86,25 +110,67 @@ class IndexingPipeline:
             schema_def
         )
 
-        # Pass 1: Parse all documents
-        parsed_docs: list[tuple[str, str, str]] = []  # (file_path, relative_path, content)
+        # Pass 1: Parse all documents or reuse page-level cache
+        parsed_docs: list[dict[str, Any]] = []
         skipped_files = 0
         active_paths: set[str] = set()
+        parsed_cache_hits = 0
 
         for file_path in self._iter_supported_files(root):
             relative_path = os.path.relpath(file_path, root)
             active_paths.add(relative_path)
+            doc_id = PostgresStorage.make_document_id(corpus_id, relative_path)
+            file_sha256 = compute_file_sha256(file_path)
+            existing_doc = self.storage.get_document(doc_id=doc_id)
 
-            content = parse_file(file_path)
-            if self._is_parse_error(content):
+            if (
+                existing_doc is not None
+                and existing_doc.get("content_sha256") == file_sha256
+            ):
+                cached_units = self.storage.list_parsed_units(
+                    document_id=doc_id,
+                    parser_version=PARSER_VERSION,
+                )
+                cached_document = reconstruct_parsed_document(cached_units)
+                if cached_document is not None:
+                    parsed_docs.append(
+                        {
+                            "file_path": file_path,
+                            "relative_path": relative_path,
+                            "doc_id": doc_id,
+                            "file_sha256": file_sha256,
+                            "content": cached_document.markdown,
+                            "parsed_document": cached_document,
+                            "from_cache": True,
+                        }
+                    )
+                    parsed_cache_hits += 1
+                    continue
+
+            try:
+                parsed_document = self._parse_document_for_indexing(file_path)
+            except DocumentParseError:
                 skipped_files += 1
                 continue
 
-            parsed_docs.append((file_path, relative_path, content))
+            parsed_docs.append(
+                {
+                    "file_path": file_path,
+                    "relative_path": relative_path,
+                    "doc_id": doc_id,
+                    "file_sha256": file_sha256,
+                    "content": parsed_document.markdown,
+                    "parsed_document": parsed_document,
+                    "from_cache": False,
+                }
+            )
 
         # Parallel metadata extraction across documents
         metadata_map = self._extract_metadata_batch(
-            parsed_docs=parsed_docs,
+            parsed_docs=[
+                (item["file_path"], item["relative_path"], item["content"])
+                for item in parsed_docs
+            ],
             root_path=root,
             schema_def=schema_def,
             with_langextract=effective_with_metadata,
@@ -115,14 +181,20 @@ class IndexingPipeline:
         indexed_files = 0
         chunks_written = 0
         all_chunk_records: list[ChunkRecord] = []
+        parsed_pages_updated = 0
+        image_placeholders_written = 0
 
-        for file_path, relative_path, content in parsed_docs:
+        for item in parsed_docs:
+            file_path = str(item["file_path"])
+            relative_path = str(item["relative_path"])
+            doc_id = str(item["doc_id"])
+            content = str(item["content"])
+            parsed_document = item["parsed_document"]
             chunks = self.chunker.chunk_text(content)
             metadata = metadata_map[relative_path]
             metadata_json = json.dumps(metadata, sort_keys=True)
 
             stat = os.stat(file_path)
-            doc_id = PostgresStorage.make_document_id(corpus_id, relative_path)
             doc_record = DocumentRecord(
                 id=doc_id,
                 corpus_id=corpus_id,
@@ -132,7 +204,7 @@ class IndexingPipeline:
                 metadata_json=metadata_json,
                 file_mtime=float(stat.st_mtime),
                 file_size=int(stat.st_size),
-                content_sha256=self._sha256(content),
+                content_sha256=str(item["file_sha256"]),
             )
 
             chunk_records: list[ChunkRecord] = []
@@ -154,6 +226,57 @@ class IndexingPipeline:
                 )
 
             self.storage.upsert_document(doc_record, chunk_records)
+
+            if not bool(item["from_cache"]):
+                unit_records = [
+                    ParsedUnitRecord(
+                        document_id=doc_id,
+                        parser_name=parsed_document.parser_name,
+                        parser_version=parsed_document.parser_version,
+                        page_no=page.page_no,
+                        markdown=page.markdown,
+                        content_hash=page.content_hash,
+                        images_json=json.dumps(
+                            [
+                                {
+                                    "image_hash": image.image_hash,
+                                    "image_index": image.image_index,
+                                    "mime_type": image.mime_type,
+                                    "width": image.width,
+                                    "height": image.height,
+                                }
+                                for image in page.images
+                            ],
+                            sort_keys=True,
+                        ),
+                    )
+                    for page in parsed_document.pages
+                ]
+                sync_stats = self.storage.sync_parsed_units(
+                    document_id=doc_id,
+                    parser_name=parsed_document.parser_name,
+                    parser_version=parsed_document.parser_version,
+                    units=unit_records,
+                )
+                parsed_pages_updated += int(sync_stats["upserted"])
+
+                image_records = [
+                    ImageSemanticRecord(
+                        image_hash=image.image_hash,
+                        source_document_id=doc_id,
+                        source_page_no=image.page_no,
+                        source_image_index=image.image_index,
+                        mime_type=image.mime_type,
+                        width=image.width,
+                        height=image.height,
+                    )
+                    for page in parsed_document.pages
+                    for image in page.images
+                ]
+                image_placeholders_written += self.storage.upsert_image_semantics(
+                    images=image_records
+                )
+
             all_chunk_records.extend(chunk_records)
             indexed_files += 1
             chunks_written += len(chunk_records)
@@ -180,6 +303,9 @@ class IndexingPipeline:
             active_documents=active_documents,
             schema_used=selected_schema_name,
             embeddings_written=embeddings_written,
+            parsed_cache_hits=parsed_cache_hits,
+            parsed_pages_updated=parsed_pages_updated,
+            image_placeholders_written=image_placeholders_written,
         )
 
     def _extract_metadata_batch(
@@ -214,6 +340,31 @@ class IndexingPipeline:
                 result[relative_path] = metadata
 
         return result
+
+    def _parse_document_for_indexing(self, file_path: str):
+        compatibility_parse = globals()["parse_file"]
+        if compatibility_parse is parse_file:
+            return parse_document(file_path)
+
+        content = compatibility_parse(file_path)
+        if self._is_parse_error(content):
+            raise DocumentParseError(
+                file_path=file_path,
+                code="compat_parse_failed",
+                message=content,
+            )
+        normalized = str(content)
+        return ParsedDocument(
+            parser_name="compat_parse_file",
+            parser_version=PARSER_VERSION,
+            pages=(
+                ParsedPage(
+                    page_no=1,
+                    markdown=normalized,
+                    content_hash=self._sha256(normalized),
+                ),
+            ),
+        )
 
     def _resolve_schema(
         self,

@@ -604,6 +604,12 @@ def index_command(
     summary.add_row("Chunks Written:", str(result.chunks_written))
     summary.add_row("Active Documents:", str(result.active_documents))
     summary.add_row("Embeddings Written:", str(result.embeddings_written))
+    summary.add_row("Parse Cache Hits:", str(result.parsed_cache_hits))
+    summary.add_row("Parsed Pages Updated:", str(result.parsed_pages_updated))
+    summary.add_row(
+        "Image Placeholders:",
+        str(result.image_placeholders_written),
+    )
     summary.add_row("Schema Used:", result.schema_used or "<none>")
     summary.add_row(
         "Metadata Mode:",

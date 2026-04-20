@@ -1,173 +1,156 @@
 # Agentic File Search
 
-> **Based on**: [run-llama/fs-explorer](https://github.com/run-llama/fs-explorer) — The original CLI agent for filesystem exploration.
+一个面向文档目录问答的 Agent 检索系统。它会先解析本地文档，再把结构化内容、文本分块和检索索引写入 PostgreSQL，随后通过 Agent 工作流完成检索、追踪引用和回答生成。
 
-An AI-powered document search agent that explores files like a human would — scanning, reasoning, and following cross-references. Unlike traditional RAG systems that rely on pre-computed embeddings, this agent dynamically navigates documents to find answers.
+当前主执行路径已经以 `PostgreSQL + pgvector` 为中心，安装和开发流程统一使用系统 Python 直接安装，不使用虚拟环境，也不使用 `uv`。
 
-## Why Agentic Search?
+## 功能概览
 
-Traditional RAG (Retrieval-Augmented Generation) has limitations:
-- **Chunks lose context** — Splitting documents destroys relationships between sections
-- **Cross-references are invisible** — "See Exhibit B" means nothing to embeddings
-- **Similarity ≠ Relevance** — Semantic matching misses logical connections
+- 支持目录索引、关键词检索、语义检索和基于 Agent 的问答
+- 支持 `PDF / DOCX / DOC / PPTX / XLSX / HTML / Markdown`
+- PDF 解析按页落库，支持页级缓存和图片语义占位缓存
+- FastAPI 提供 Web UI 和 API
+- 保留 CLI 入口，便于本地调试和回归验证
 
-This system uses a **three-phase strategy**:
-1. **Parallel Scan** — Preview all documents in a folder at once
-2. **Deep Dive** — Full extraction on relevant documents only
-3. **Backtrack** — Follow cross-references to previously skipped documents
+## 环境要求
 
-## Watch the video
-This video explains the architecture of the project and how to run it. 
-[![Watch the demo on YouTube](https://img.youtube.com/vi/rMADSuus6jg/maxresdefault.jpg)](https://www.youtube.com/watch?v=rMADSuus6jg)
+- Python 3.10+
+- PostgreSQL 15+，并安装 `pgvector`
+- 可选：LibreOffice
+  - 仅在需要解析 `.doc` 文件时使用，命令需要能找到 `soffice`
 
-## Features
+## 直接安装
 
-- 🔍 **6 Tools**: `scan_folder`, `preview_file`, `parse_file`, `read`, `grep`, `glob`
-- 📄 **Document Support**: PDF, DOCX, PPTX, XLSX, HTML, Markdown (via Docling)
-- 🤖 **Powered by**: Google Gemini 3 Flash with structured JSON output
-- 💰 **Cost Efficient**: ~$0.001 per query with token tracking
-- 🌐 **Web UI**: Real-time WebSocket streaming interface
-- 📊 **Citations**: Answers include source references
-
-## Installation
+以下命令默认直接安装到当前系统 Python 环境。
 
 ```bash
-# Clone the repository
 git clone https://github.com/PromtEngineer/agentic-file-search.git
 cd agentic-file-search
 
-# Install with uv (recommended)
-uv pip install .
-
-# Or with pip
-pip install .
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e .
 ```
 
-## Configuration
+如果你在中国大陆网络环境下，建议直接使用清华镜像：
 
-Create a `.env` file in the project root:
+```bash
+python -m pip install --upgrade pip setuptools wheel -i https://pypi.tuna.tsinghua.edu.cn/simple
+python -m pip install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+安装开发依赖：
+
+```bash
+python -m pip install -e ".[dev]"
+```
+
+## PostgreSQL 准备
+
+项目运行前需要准备数据库，并确保目标库可创建 `vector` 扩展。
+
+```sql
+CREATE DATABASE fs_explorer;
+\c fs_explorer
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+默认连接串：
+
+```text
+postgresql://fs_explorer:devpassword@127.0.0.1:5432/fs_explorer
+```
+
+也可以通过环境变量覆盖：
+
+```bash
+FS_EXPLORER_DB_DSN=postgresql://user:password@127.0.0.1:5432/fs_explorer
+```
+
+仓库里也提供了 `docker/docker-compose.yml` 作为本地 PostgreSQL/pgvector 的启动参考。
+
+## 配置
+
+在项目根目录创建 `.env`：
 
 ```bash
 GOOGLE_API_KEY=your_api_key_here
+FS_EXPLORER_DB_DSN=postgresql://fs_explorer:devpassword@127.0.0.1:5432/fs_explorer
 ```
 
-Get your API key from [Google AI Studio](https://aistudio.google.com/apikey).
+如果需要语义检索或后续视觉增强能力，建议同时准备兼容的模型配置。
 
-## Usage
+## 启动方式
 
-### CLI
+### 1. Web UI
 
 ```bash
-# Basic query
-uv run explore --task "What is the purchase price in data/test_acquisition/?"
-
-# Multi-document query
-uv run explore --task "Look in data/large_acquisition/. What are all the financial terms including adjustments and escrow?"
+python -m uvicorn fs_explorer.server:app --host 127.0.0.1 --port 8000
 ```
 
-### Web UI
+浏览器打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。
+
+### 2. CLI
 
 ```bash
-# Start the server
-uv run uvicorn fs_explorer.server:app --host 127.0.0.1 --port 8000
-
-# Open http://127.0.0.1:8000 in your browser
+python -m fs_explorer.main --help
 ```
 
-The web UI provides:
-- Folder browser to select target directory
-- Real-time step-by-step execution log
-- Final answer with citations
-- Token usage and cost statistics
+示例：
 
-## Architecture
-
-```
-User Query
-    ↓
-┌─────────────────┐
-│ Workflow Engine │ ←→ LlamaIndex Workflows (event-driven)
-└────────┬────────┘
-         ↓
-┌─────────────────┐
-│     Agent       │ ←→ Gemini 3 Flash (structured JSON)
-└────────┬────────┘
-         ↓
-┌─────────────────────────────────────────┐
-│ scan_folder │ preview │ parse │ read │ grep │ glob │
-└─────────────────────────────────────────┘
-                    ↓
-              Document Parser (Docling - local)
-```
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed diagrams.
-
-## Test Documents
-
-The repo includes test document sets for evaluation:
-
-- `data/test_acquisition/` — 10 interconnected legal documents
-- `data/large_acquisition/` — 25 documents with extensive cross-references
-
-Example queries:
 ```bash
-# Simple (single doc)
-uv run explore --task "Look in data/test_acquisition/. Who is the CTO?"
-
-# Cross-reference required
-uv run explore --task "Look in data/test_acquisition/. What is the adjusted purchase price?"
-
-# Multi-document synthesis
-uv run explore --task "Look in data/large_acquisition/. What happens to employees after the acquisition?"
+python -m fs_explorer.main index data/test_acquisition --discover-schema
+python -m fs_explorer.main query --task "Look in data/test_acquisition/. What is the adjusted purchase price?"
 ```
 
-## Tech Stack
+如果你的环境已经安装了 entry point，也可以直接使用：
 
-| Component | Technology |
-|-----------|------------|
-| LLM | Google Gemini 3 Flash |
-| Document Parsing | Docling (local, open-source) |
-| Orchestration | LlamaIndex Workflows |
-| CLI | Typer + Rich |
-| Web Server | FastAPI + WebSocket |
-| Package Manager | uv |
-
-## Project Structure
-
+```bash
+explore --task "Look in data/test_acquisition/. Who is the CTO?"
+explore-ui
 ```
+
+## 开发检查
+
+```bash
+python -m pytest
+python -m ruff check .
+```
+
+## M2 相关实现说明
+
+当前仓库已经开始落地解析链路升级，重点包括：
+
+- PDF 按页解析并清理重复页眉页脚
+- `parsed_units` 表缓存页级 Markdown
+- 基于内容 hash 的重复索引复用
+- `image_semantics` 表缓存图片基础信息，语义字段支持后续懒增强
+- 检索命中相关页时可触发图片语义增强，`get_document` 会展示已缓存语义
+
+这部分仍会继续向 API 和前端状态可视化延伸，详细拆分见 [docs/revamp/IMPLEMENTATION_TASK_BREAKDOWN.md](docs/revamp/IMPLEMENTATION_TASK_BREAKDOWN.md)。
+
+## 目录结构
+
+```text
 src/fs_explorer/
-├── agent.py      # Gemini client, token tracking
-├── workflow.py   # LlamaIndex workflow engine
-├── fs.py         # File tools: scan, parse, grep
-├── models.py     # Pydantic models for actions
-├── main.py       # CLI entry point
-├── server.py     # FastAPI + WebSocket server
-└── ui.html       # Single-file web interface
+  agent.py
+  document_parsing.py
+  fs.py
+  server.py
+  workflow.py
+  indexing/
+  search/
+  storage/
+tests/
+docs/revamp/
+docker/
 ```
 
-## Development
+## 参考文档
 
-```bash
-# Install dev dependencies
-uv pip install -e ".[dev]"
-
-# Run tests
-uv run pytest
-
-# Lint
-uv run ruff check .
-```
+- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)
+- [docs/revamp/IMPLEMENTATION_TASK_BREAKDOWN.md](docs/revamp/IMPLEMENTATION_TASK_BREAKDOWN.md)
 
 ## License
 
 MIT
-
-## Acknowledgments
-
-- Original concept from [run-llama/fs-explorer](https://github.com/run-llama/fs-explorer)
-- Document parsing by [Docling](https://github.com/DS4SD/docling)
-- Powered by [Google Gemini](https://deepmind.google/technologies/gemini/)
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=PromtEngineer/agentic-file-search&type=Date)](https://star-history.com/#PromtEngineer/agentic-file-search&Date)

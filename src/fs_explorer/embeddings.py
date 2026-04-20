@@ -10,9 +10,6 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from google.genai import Client as GenAIClient
-
-
 _DEFAULT_MODEL = "gemini-embedding-001"
 _DEFAULT_DIM = 768
 _DEFAULT_BATCH_SIZE = 50
@@ -45,6 +42,12 @@ class EmbeddingProvider:
                     "GOOGLE_API_KEY not found. "
                     "Provide api_key or set the environment variable."
                 )
+            try:
+                from google.genai import Client as GenAIClient
+            except ImportError as exc:  # pragma: no cover - depends on local env
+                raise ValueError(
+                    "google-genai is not installed. Run `python -m pip install -e .` first."
+                ) from exc
             self._client = GenAIClient(api_key=resolved_key)
 
     def embed_texts(

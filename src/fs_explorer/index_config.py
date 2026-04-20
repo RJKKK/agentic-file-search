@@ -18,13 +18,17 @@ def resolve_db_path(override_path: str | None = None) -> str:
 
     Precedence:
     1) explicit override_path
-    2) FS_EXPLORER_DB_DSN
-    3) FS_EXPLORER_DB_PATH (legacy alias)
+    2) FS_EXPLORER_DB_PATH when it points to a local file path
+    3) FS_EXPLORER_DB_DSN
     4) default DSN
     """
+    legacy_path = os.getenv(ENV_DB_PATH_LEGACY)
+    if override_path:
+        return override_path
+    if legacy_path and "://" not in legacy_path:
+        return legacy_path
     return (
-        override_path
-        or os.getenv(ENV_DB_DSN)
-        or os.getenv(ENV_DB_PATH_LEGACY)
+        os.getenv(ENV_DB_DSN)
+        or legacy_path
         or DEFAULT_DB_PATH
     )

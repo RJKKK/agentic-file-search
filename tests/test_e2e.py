@@ -1,11 +1,13 @@
-import pytest
 import os
+
+import pytest
 
 from workflows.testing import WorkflowTestRunner
 
+
 SKIP_IF, SKIP_REASON = (
-    os.getenv("GOOGLE_API_KEY") is None,
-    "GOOGLE_API_KEY not available",
+    not os.getenv("RUN_REAL_E2E_TESTS") or not os.getenv("GOOGLE_API_KEY"),
+    "Set RUN_REAL_E2E_TESTS=1 and GOOGLE_API_KEY to enable the real end-to-end workflow test.",
 )
 
 
@@ -13,11 +15,11 @@ SKIP_IF, SKIP_REASON = (
 @pytest.mark.skipif(condition=SKIP_IF, reason=SKIP_REASON)
 async def test_e2e() -> None:
     from fs_explorer.workflow import (
-        workflow,
-        InputEvent,
         ExplorationEndEvent,
-        ToolCallEvent,
         GoDeeperEvent,
+        InputEvent,
+        ToolCallEvent,
+        workflow,
     )
 
     start_event = InputEvent(

@@ -11,11 +11,6 @@ import pytest
 from fs_explorer.embeddings import EmbeddingProvider
 
 
-# ---------------------------------------------------------------------------
-# Mock helpers
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class _FakeEmbedding:
     values: list[float]
@@ -47,11 +42,6 @@ class _FakeModels:
 class _FakeClient:
     def __init__(self) -> None:
         self.models = _FakeModels()
-
-
-# ---------------------------------------------------------------------------
-# Unit tests (mock-based, no API key needed)
-# ---------------------------------------------------------------------------
 
 
 def test_embed_texts_returns_correct_count() -> None:
@@ -93,7 +83,6 @@ def test_embed_texts_batching() -> None:
     embeddings = provider.embed_texts(texts)
 
     assert len(embeddings) == 7
-    # 7 texts with batch_size=3 → 3 API calls (3+3+1)
     assert len(client.models.calls) == 3
     assert len(client.models.calls[0]["contents"]) == 3
     assert len(client.models.calls[1]["contents"]) == 3
@@ -124,14 +113,9 @@ def test_missing_api_key_raises(monkeypatch) -> None:
         EmbeddingProvider(api_key=None, client=None)
 
 
-# ---------------------------------------------------------------------------
-# Real API integration test (skipped unless GOOGLE_API_KEY is set)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.skipif(
-    not os.getenv("GOOGLE_API_KEY"),
-    reason="GOOGLE_API_KEY not set — skipping real embedding test",
+    not os.getenv("RUN_REAL_EMBEDDING_TESTS") or not os.getenv("GOOGLE_API_KEY"),
+    reason="Set RUN_REAL_EMBEDDING_TESTS=1 and GOOGLE_API_KEY to enable the real embedding test.",
 )
 def test_real_embedding_api() -> None:
     provider = EmbeddingProvider(dim=128)

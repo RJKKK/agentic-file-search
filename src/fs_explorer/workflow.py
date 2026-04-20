@@ -25,7 +25,7 @@ from .agent import FsExplorerAgent
 from .models import GoDeeperAction, ToolCallAction, StopAction, AskHumanAction, Action
 from .fs import describe_dir_content
 
-# Per-asyncio-task agent storage — each WebSocket connection gets its own.
+# Per-asyncio-task agent storage — each exploration session gets its own.
 _AGENT_VAR: contextvars.ContextVar[FsExplorerAgent | None] = contextvars.ContextVar(
     "_AGENT_VAR", default=None
 )

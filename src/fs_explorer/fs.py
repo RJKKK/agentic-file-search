@@ -2,7 +2,7 @@
 Filesystem utilities for the FsExplorer agent.
 
 This module provides functions for reading, searching, and parsing files
-in the filesystem, including support for complex document formats via Docling.
+in the filesystem, including normalized page-aware document parsing.
 """
 
 import os
@@ -11,17 +11,16 @@ import glob as glob_module
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from docling.document_converter import DocumentConverter
+from .document_parsing import (
+    DocumentParseError,
+    SUPPORTED_EXTENSIONS,
+    parse_document,
+)
 
 
 # =============================================================================
 # Configuration Constants
 # =============================================================================
-
-# Supported document extensions for parsing
-SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({
-    ".pdf", ".docx", ".doc", ".pptx", ".xlsx", ".html", ".md"
-})
 
 # Preview settings
 DEFAULT_PREVIEW_CHARS = 3000  # Characters for single file preview (~2-3 pages)
@@ -64,9 +63,7 @@ def _get_cached_or_parse(file_path: str) -> str:
     cache_key = f"{abs_path}:{os.path.getmtime(abs_path)}"
     
     if cache_key not in _DOCUMENT_CACHE:
-        converter = DocumentConverter()
-        result = converter.convert(file_path)
-        _DOCUMENT_CACHE[cache_key] = result.document.export_to_markdown()
+        _DOCUMENT_CACHE[cache_key] = parse_document(file_path).markdown
     
     return _DOCUMENT_CACHE[cache_key]
 
@@ -259,6 +256,8 @@ def parse_file(file_path: str) -> str:
 
     try:
         return _get_cached_or_parse(file_path)
+    except DocumentParseError as exc:
+        return f"Error parsing {file_path}: [{exc.code}] {exc.message}"
     except Exception as e:
         return f"Error parsing {file_path}: {e}"
 

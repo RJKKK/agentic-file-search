@@ -1091,7 +1091,8 @@
 
     <script>
         // State
-        let ws = null;
+        let eventSource = null;
+        let activeSessionId = null;
         let stepCount = 0;
         let isRunning = false;
         let currentFolder = '.';
@@ -1386,7 +1387,11 @@
             const query = queryInput.value.trim();
             if (!query || isRunning) return;
 
-            if (ws) { ws.close(); ws = null; }
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            activeSessionId = null;
 
             isRunning = true;
             stepCount = 0;
@@ -1403,27 +1408,65 @@
             const useIndex = (enableSemantic || enableMetadata) && indexStatus && indexStatus.indexed;
             updateStatus('Connecting', 'active');
 
-            const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-            const wsUrl = `${wsProtocol}://${window.location.host}/ws/explore`;
-            ws = new WebSocket(wsUrl);
+            try {
+                const createRes = await fetch('/api/explore/sessions', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        task: query,
+                        folder: currentFolder,
+                        use_index: useIndex,
+                        enable_semantic: enableSemantic,
+                        enable_metadata: enableMetadata,
+                    }),
+                });
+                const payload = await createRes.json();
+                if (!createRes.ok) {
+                    throw new Error(payload.detail || payload.error || 'Failed to start exploration');
+                }
 
-            ws.onopen = () => {
+                activeSessionId = payload.session_id;
+                eventSource = new EventSource(`/api/explore/sessions/${encodeURIComponent(activeSessionId)}/events`);
                 updateStatus('Executing', 'active');
-                ws.send(JSON.stringify({
-                    task: query,
-                    folder: currentFolder,
-                    use_index: useIndex,
-                    enable_semantic: enableSemantic,
-                    enable_metadata: enableMetadata,
-                }));
-            };
 
-            ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
-            ws.onerror = () => {
-                showError('Connection failed. Is the server running?');
+                const forwardEvent = (event) => handleMessage(JSON.parse(event.data));
+                eventSource.addEventListener('start', forwardEvent);
+                eventSource.addEventListener('tool_call', forwardEvent);
+                eventSource.addEventListener('go_deeper', forwardEvent);
+                eventSource.addEventListener('ask_human', forwardEvent);
+                eventSource.addEventListener('cache_hit', forwardEvent);
+                eventSource.addEventListener('image_enhance_started', forwardEvent);
+                eventSource.addEventListener('image_enhance_done', forwardEvent);
+                eventSource.addEventListener('complete', (event) => {
+                    forwardEvent(event);
+                    finish();
+                });
+                eventSource.addEventListener('error', (event) => {
+                    if (!event.data) return;
+                    forwardEvent(event);
+                    finish();
+                });
+                eventSource.onerror = async () => {
+                    if (!activeSessionId) return;
+                    try {
+                        const statusRes = await fetch(`/api/explore/sessions/${encodeURIComponent(activeSessionId)}`);
+                        if (statusRes.ok) {
+                            const status = await statusRes.json();
+                            if (status.status === 'completed' || status.status === 'error') {
+                                finish();
+                                return;
+                            }
+                        }
+                    } catch (e) {
+                        // Fall through to generic connection failure.
+                    }
+                    showError('Connection failed. Is the server running?');
+                    finish();
+                };
+            } catch (e) {
+                showError(e.message || 'Failed to start exploration');
                 finish();
-            };
-            ws.onclose = () => finish();
+            }
         }
 
         // Handle message
@@ -1437,6 +1480,15 @@
                     break;
                 case 'ask_human':
                     showHumanModal(msg.data);
+                    break;
+                case 'cache_hit':
+                    addRuntimeEventStep('cache hit', msg.data);
+                    break;
+                case 'image_enhance_started':
+                    addRuntimeEventStep('image enhance', msg.data, 'Enhancing page images');
+                    break;
+                case 'image_enhance_done':
+                    addRuntimeEventStep('image ready', msg.data, 'Image semantics updated');
                     break;
                 case 'complete':
                     showResult(msg.data);
@@ -1496,6 +1548,33 @@
             stepsList.scrollTop = stepsList.scrollHeight;
         }
 
+        function addRuntimeEventStep(label, data, fallbackReason = '') {
+            if (stepsList.querySelector('.empty-state')) {
+                stepsList.innerHTML = '';
+            }
+
+            const target = data.absolute_path || data.doc_id || '';
+            const parts = [];
+            if (typeof data.page_no === 'number') parts.push(`page ${data.page_no}`);
+            if (typeof data.pending_images === 'number') parts.push(`${data.pending_images} pending`);
+            if (typeof data.enhanced_images === 'number') parts.push(`${data.enhanced_images} enhanced`);
+            if (typeof data.cached_images === 'number') parts.push(`${data.cached_images} cached`);
+            if (data.cache_kind) parts.push(String(data.cache_kind));
+            const reason = parts.join(' · ') || fallbackReason;
+
+            const html = `
+                <div class="step preview">
+                    <div class="step-header">
+                        <span class="step-tool">${esc(label)}</span>
+                    </div>
+                    ${target ? `<div class="step-target">${esc(target)}</div>` : ''}
+                    ${reason ? `<div class="step-reason">${esc(reason)}</div>` : ''}
+                </div>
+            `;
+            stepsList.insertAdjacentHTML('beforeend', html);
+            stepsList.scrollTop = stepsList.scrollHeight;
+        }
+
         // Show human modal
         function showHumanModal(data) {
             document.getElementById('modalQuestion').textContent = data.question;
@@ -1505,12 +1584,25 @@
         }
 
         // Submit human response
-        function submitHumanResponse() {
+        async function submitHumanResponse() {
             const response = document.getElementById('modalInput').value.trim();
-            if (!response) return;
+            if (!response || !activeSessionId) return;
             humanModal.classList.remove('active');
-            ws.send(JSON.stringify({ type: 'human_response', response }));
-            updateStatus('Executing', 'active');
+            try {
+                const replyRes = await fetch(`/api/explore/sessions/${encodeURIComponent(activeSessionId)}/reply`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ response }),
+                });
+                const payload = await replyRes.json();
+                if (!replyRes.ok) {
+                    throw new Error(payload.detail || payload.error || 'Failed to submit response');
+                }
+                updateStatus('Executing', 'active');
+            } catch (e) {
+                showError(e.message || 'Failed to submit response');
+                finish();
+            }
         }
 
         // Show result
@@ -1550,7 +1642,11 @@
             isRunning = false;
             queryBtn.disabled = false;
             progressBar.classList.remove('active');
-            if (ws) { ws.close(); ws = null; }
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            activeSessionId = null;
         }
 
         // Update status
