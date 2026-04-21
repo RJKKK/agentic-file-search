@@ -1061,6 +1061,10 @@ def _iter_action_json_candidates(raw_text: str) -> list[str | dict[str, Any]]:
 
     candidates: list[str | dict[str, Any]] = [stripped]
     seen_strings = {stripped}
+    escaped_windows_paths = _escape_invalid_json_backslashes(stripped)
+    if escaped_windows_paths != stripped:
+        seen_strings.add(escaped_windows_paths)
+        candidates.append(escaped_windows_paths)
 
     for fenced in re.findall(
         r"```(?:json)?\s*(.*?)```",
@@ -1071,6 +1075,10 @@ def _iter_action_json_candidates(raw_text: str) -> list[str | dict[str, Any]]:
         if candidate and candidate not in seen_strings:
             seen_strings.add(candidate)
             candidates.append(candidate)
+            escaped_candidate = _escape_invalid_json_backslashes(candidate)
+            if escaped_candidate != candidate and escaped_candidate not in seen_strings:
+                seen_strings.add(escaped_candidate)
+                candidates.append(escaped_candidate)
 
     decoder = json.JSONDecoder()
     for index, char in enumerate(stripped):
@@ -1091,12 +1099,33 @@ def _iter_action_json_candidates(raw_text: str) -> list[str | dict[str, Any]]:
     return candidates
 
 
+def _escape_invalid_json_backslashes(text: str) -> str:
+    """Escape backslashes that are invalid in JSON strings, common in Windows paths."""
+    text = re.sub(
+        r'(:\s*")([A-Za-z]:\\[^"\n]*)(")',
+        lambda match: (
+            f"{match.group(1)}"
+            f"{re.sub(r'\\+', lambda _: chr(92) * 2, match.group(2))}"
+            f"{match.group(3)}"
+        ),
+        text,
+    )
+    return re.sub(r'(?<!\\)\\(?!["\\/bfnrtu])', r"\\\\", text)
+
+
 def _parse_action_response(raw_text: str) -> Action | None:
     """Parse an Action from raw model text, allowing fenced or embedded JSON."""
     for candidate in _iter_action_json_candidates(raw_text):
         try:
             if isinstance(candidate, dict):
                 normalized = _normalize_action_candidate(candidate)
+                return Action.model_validate(normalized)
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                normalized = _normalize_action_candidate(parsed)
                 return Action.model_validate(normalized)
             return Action.model_validate_json(candidate)
         except (ValidationError, json.JSONDecodeError):
@@ -1107,6 +1136,7 @@ def _parse_action_response(raw_text: str) -> Action | None:
 def _normalize_action_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     """Normalize loosely-structured action payloads into the Action schema shape."""
     normalized = dict(candidate)
+    normalized = _normalize_context_plan_candidate(normalized)
     action_payload = normalized.get("action")
 
     if isinstance(action_payload, str):
@@ -1122,7 +1152,11 @@ def _normalize_action_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         action_dict = dict(action_payload)
         tool_name = action_dict.get("tool_name")
         if isinstance(tool_name, str) and tool_name.strip() in get_args(Tools):
-            if "tool_input" not in action_dict and "parameters" in action_dict:
+            if isinstance(action_dict.get("tool_input"), dict):
+                action_dict["tool_input"] = _parameters_to_tool_input(
+                    action_dict.get("tool_input")
+                )
+            elif "tool_input" not in action_dict and "parameters" in action_dict:
                 action_dict["tool_input"] = _parameters_to_tool_input(
                     action_dict.get("parameters")
                 )
@@ -1145,6 +1179,24 @@ def _normalize_action_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
                 ),
             }
     return normalized
+
+
+def _normalize_context_plan_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Drop invalid loose context_plan values so valid actions still execute."""
+    if "context_plan" not in candidate:
+        return candidate
+    context_plan = candidate.get("context_plan")
+    if context_plan is None:
+        return candidate
+    if not isinstance(context_plan, dict):
+        normalized = dict(candidate)
+        normalized.pop("context_plan", None)
+        return normalized
+    if "operation" not in context_plan:
+        normalized = dict(candidate)
+        normalized.pop("context_plan", None)
+        return normalized
+    return candidate
 
 
 def _parameters_to_tool_input(parameters: Any) -> list[dict[str, Any]]:

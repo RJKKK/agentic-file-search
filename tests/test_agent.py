@@ -124,6 +124,51 @@ class TestAgentConfiguration:
 class TestAgentActions:
     """Tests for agent action handling."""
     
+    def test_parse_action_response_accepts_tool_json_with_text_context_plan(self) -> None:
+        raw = r"""
+{
+  "action": {
+    "tool_name": "read",
+    "tool_input": [
+      {
+        "parameter_name": "file_path",
+        "parameter_value": "D:\projects\agent-file-search\data\object_store\documents\report.pdf\pages\page-0033.md"
+      }
+    ]
+  },
+  "reason": "Read the most relevant page before answering.",
+  "context_plan": "After reading this page, decide whether adjacent pages are needed."
+}
+"""
+        action = _parse_action_response(raw)
+
+        assert action is not None
+        assert isinstance(action.action, ToolCallAction)
+        assert action.action.tool_name == "read"
+        assert action.action.to_fn_args() == {
+            "file_path": r"D:\projects\agent-file-search\data\object_store\documents\report.pdf\pages\page-0033.md",
+        }
+        assert action.context_plan is None
+
+    def test_parse_action_response_accepts_dict_tool_input(self) -> None:
+        raw = """
+{
+  "action": {
+    "tool_name": "read",
+    "tool_input": {
+      "file_path": "pages/page-0033.md"
+    }
+  },
+  "reason": "Read the page."
+}
+"""
+        action = _parse_action_response(raw)
+
+        assert action is not None
+        assert isinstance(action.action, ToolCallAction)
+        assert action.action.tool_name == "read"
+        assert action.action.to_fn_args() == {"file_path": "pages/page-0033.md"}
+
     @pytest.mark.asyncio
     @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
     async def test_take_action_returns_action(self) -> None:
