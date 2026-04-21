@@ -12,6 +12,8 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from ..model_config import resolve_langextract_config, resolve_text_config
+from ..openai_compat import OpenAICompatClient
 
 _CURRENCY_RE = re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?")
 _DATE_RE = re.compile(
@@ -212,11 +214,9 @@ _AUTO_PROFILE_PROMPT_TEMPLATE = (
 )
 
 
-def _get_genai_client(api_key: str) -> Any:
-    """Instantiate a Google GenAI client. Separated for test patching."""
-    from google.genai import Client as _GenAIClient
-
-    return _GenAIClient(api_key=api_key)
+def _get_genai_client(api_key: str, base_url: str | None = None) -> Any:
+    """Instantiate a text generation client. Separated for test patching."""
+    return OpenAICompatClient(api_key=api_key, base_url=base_url)
 
 
 def auto_discover_profile(
@@ -256,16 +256,17 @@ def auto_discover_profile(
     if not snippets:
         return default_langextract_profile()
 
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
+    text_config = resolve_text_config()
+    if not text_config.api_key:
         return default_langextract_profile()
 
-    effective_model = model_id or os.getenv(
-        "FS_EXPLORER_PROFILE_MODEL", "gemini-2.0-flash"
-    )
+    effective_model = model_id or text_config.model_name
 
     try:
-        client = _get_genai_client(api_key=api_key)
+        client = _get_genai_client(
+            api_key=text_config.api_key,
+            base_url=text_config.base_url,
+        )
         prompt = _AUTO_PROFILE_PROMPT_TEMPLATE.replace(
             "SAMPLES_PLACEHOLDER", "\n\n".join(snippets)
         )
@@ -599,16 +600,13 @@ def _extract_langextract_metadata(
     normalized_profile = normalize_langextract_profile(profile)
     defaults = _profile_defaults(normalized_profile)
 
-    api_key = (
-        os.getenv("LANGEXTRACT_API_KEY")
-        or os.getenv("GEMINI_API_KEY")
-        or os.getenv("GOOGLE_API_KEY")
-    )
-    if not api_key:
+    langextract_config = resolve_langextract_config(model_name=model_id)
+    if not langextract_config.api_key:
         return defaults
 
     try:
         import langextract as lx  # type: ignore[import-not-found]
+        from langextract.factory import ModelConfig
     except Exception:
         return defaults
 
@@ -631,17 +629,24 @@ def _extract_langextract_metadata(
     if not snippet.strip():
         return defaults
 
-    effective_model_id = model_id or os.getenv(
-        "FS_EXPLORER_LANGEXTRACT_MODEL",
-        "gemini-3-flash-preview",
-    )
+    effective_model_id = langextract_config.model_name
     try:
         result = lx.extract(
             text_or_documents=snippet,
             prompt_description=str(normalized_profile["prompt_description"]),
             examples=_langextract_examples(lx),
-            model_id=effective_model_id,
-            api_key=api_key,
+            config=ModelConfig(
+                model_id=effective_model_id,
+                provider="openai",
+                provider_kwargs={
+                    "api_key": langextract_config.api_key,
+                    **(
+                        {"base_url": langextract_config.base_url}
+                        if langextract_config.base_url
+                        else {}
+                    ),
+                },
+            ),
             max_char_buffer=min(1200, max_chars),
             show_progress=False,
             prompt_validation_level=lx.prompt_validation.PromptValidationLevel.OFF,

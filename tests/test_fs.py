@@ -55,6 +55,16 @@ class TestReadFile:
         content = read_file("tests/testfiles/file2.txt")
         assert content == "No such file: tests/testfiles/file2.txt"
 
+    def test_windows_encoded_file(self, tmp_path: Path) -> None:
+        """Test reading a GBK/CP936-style file on Windows-friendly fallback paths."""
+        file_path = tmp_path / "board.txt"
+        file_path.write_text("董事会成员：张三、李四", encoding="gbk")
+
+        content = read_file(str(file_path))
+
+        assert "董事会成员" in content
+        assert "张三" in content
+
 
 class TestGrepFileContent:
     """Tests for grep_file_content function."""
@@ -74,6 +84,16 @@ class TestGrepFileContent:
         """Test searching in a file that doesn't exist."""
         result = grep_file_content("tests/testfiles/file2.txt", r"test")
         assert result == "No such file: tests/testfiles/file2.txt"
+
+    def test_pattern_match_in_windows_encoded_file(self, tmp_path: Path) -> None:
+        """Test regex search in a GBK/CP936-style file."""
+        file_path = tmp_path / "minutes.txt"
+        file_path.write_text("董事会成员：张三、李四", encoding="gbk")
+
+        result = grep_file_content(str(file_path), r"董事会成员|张三")
+
+        assert "MATCHES for 董事会成员|张三" in result
+        assert "董事会成员" in result or "张三" in result
 
 
 class TestGlobPaths:

@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - optional dependency during lightweight
 
 from .base import (
     ChunkRecord,
+    CollectionRecord,
     DocumentRecord,
     ImageSemanticRecord,
     ParsedUnitRecord,
@@ -35,6 +36,8 @@ logger = logging.getLogger(__name__)
 class _LocalStorageState:
     corpora: dict[str, dict[str, Any]] = field(default_factory=dict)
     documents: dict[str, dict[str, Any]] = field(default_factory=dict)
+    collections: dict[str, dict[str, Any]] = field(default_factory=dict)
+    collection_documents: set[tuple[str, str]] = field(default_factory=set)
     chunks: dict[str, dict[str, Any]] = field(default_factory=dict)
     schemas: dict[str, dict[str, Any]] = field(default_factory=dict)
     parsed_units: dict[tuple[str, str, int], dict[str, Any]] = field(default_factory=dict)
@@ -88,6 +91,15 @@ def _numeric_value(value: Any) -> float | None:
     if isinstance(value, str) and re.fullmatch(r"-?[0-9]+(\.[0-9]+)?", value.strip()):
         return float(value)
     return None
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _cosine_similarity(left: list[float], right: list[float]) -> float:
@@ -185,15 +197,64 @@ class PostgresStorage:
                     corpus_id TEXT NOT NULL REFERENCES corpora(id),
                     relative_path TEXT NOT NULL,
                     absolute_path TEXT NOT NULL,
+                    original_filename TEXT NOT NULL DEFAULT '',
+                    object_key TEXT NOT NULL DEFAULT '',
+                    storage_uri TEXT NOT NULL DEFAULT '',
+                    content_type TEXT,
+                    upload_status TEXT NOT NULL DEFAULT 'indexed',
                     content TEXT NOT NULL,
                     metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                     file_mtime DOUBLE PRECISION NOT NULL,
                     file_size BIGINT NOT NULL,
                     content_sha256 TEXT NOT NULL,
+                    parsed_content_sha256 TEXT,
+                    parsed_is_complete BOOLEAN NOT NULL DEFAULT FALSE,
                     last_indexed_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                     is_deleted BOOLEAN DEFAULT FALSE,
                     UNIQUE(corpus_id, relative_path)
                 )
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE documents
+                ADD COLUMN IF NOT EXISTS parsed_content_sha256 TEXT
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE documents
+                ADD COLUMN IF NOT EXISTS parsed_is_complete BOOLEAN NOT NULL DEFAULT FALSE
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE documents
+                ADD COLUMN IF NOT EXISTS original_filename TEXT NOT NULL DEFAULT ''
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE documents
+                ADD COLUMN IF NOT EXISTS object_key TEXT NOT NULL DEFAULT ''
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE documents
+                ADD COLUMN IF NOT EXISTS storage_uri TEXT NOT NULL DEFAULT ''
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE documents
+                ADD COLUMN IF NOT EXISTS content_type TEXT
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE documents
+                ADD COLUMN IF NOT EXISTS upload_status TEXT NOT NULL DEFAULT 'indexed'
                 """
             )
             cur.execute(
@@ -203,9 +264,16 @@ class PostgresStorage:
                     doc_id TEXT NOT NULL REFERENCES documents(id),
                     text TEXT NOT NULL,
                     position INTEGER NOT NULL,
+                    source_unit_no INTEGER,
                     start_char INTEGER NOT NULL,
                     end_char INTEGER NOT NULL
                 )
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE chunks
+                ADD COLUMN IF NOT EXISTS source_unit_no INTEGER
                 """
             )
             cur.execute(
@@ -217,10 +285,24 @@ class PostgresStorage:
                     page_no INTEGER NOT NULL,
                     markdown TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
+                    heading TEXT,
+                    source_locator TEXT,
                     images_json JSONB NOT NULL DEFAULT '[]'::jsonb,
                     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (document_id, page_no, parser_version)
                 )
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE parsed_units
+                ADD COLUMN IF NOT EXISTS heading TEXT
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE parsed_units
+                ADD COLUMN IF NOT EXISTS source_locator TEXT
                 """
             )
             cur.execute(
@@ -253,6 +335,27 @@ class PostgresStorage:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS collections (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS collection_documents (
+                    collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+                    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (collection_id, document_id)
+                )
+                """
+            )
             if vector_extension_available:
                 cur.execute(
                     f"""
@@ -281,8 +384,20 @@ class PostgresStorage:
             )
             cur.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_documents_object_key
+                ON documents (object_key)
+                """
+            )
+            cur.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_chunks_doc_position
                 ON chunks (doc_id, position)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chunks_doc_unit
+                ON chunks (doc_id, source_unit_no)
                 """
             )
             cur.execute(
@@ -301,6 +416,12 @@ class PostgresStorage:
                 """
                 CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_corpus
                 ON chunk_embeddings (corpus_id)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_collection_documents_collection
+                ON collection_documents (collection_id, document_id)
                 """
             )
             cur.execute(
@@ -365,6 +486,32 @@ class PostgresStorage:
         ]
         docs.sort(key=lambda item: str(item["relative_path"]))
         return docs
+
+    def _local_documents_by_ids(
+        self,
+        *,
+        doc_ids: list[str],
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        wanted = {str(doc_id) for doc_id in doc_ids}
+        docs = [
+            copy.deepcopy(document)
+            for document in self._local().documents.values()
+            if str(document["id"]) in wanted
+            and (include_deleted or not bool(document["is_deleted"]))
+        ]
+        docs.sort(key=lambda item: str(item["relative_path"]))
+        return docs
+
+    @staticmethod
+    def _collection_record_from_dict(record: dict[str, Any]) -> CollectionRecord:
+        return CollectionRecord(
+            id=str(record["id"]),
+            name=str(record["name"]),
+            is_deleted=bool(record.get("is_deleted", False)),
+            created_at=str(record["created_at"]),
+            updated_at=str(record["updated_at"]),
+        )
 
     @classmethod
     def _local_matches_metadata_filter(
@@ -453,6 +600,22 @@ class PostgresStorage:
             return None
         return str(row[0])
 
+    def get_corpus_root_path(self, *, corpus_id: str) -> str | None:
+        if self._use_local:
+            for record in self._local().corpora.values():
+                if str(record["id"]) == corpus_id:
+                    return str(record["root_path"])
+            return None
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT root_path FROM corpora WHERE id = %s",
+                (corpus_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return str(row[0])
+
     def upsert_document(
         self, document: DocumentRecord, chunks: list[ChunkRecord]
     ) -> None:
@@ -463,11 +626,18 @@ class PostgresStorage:
                 "corpus_id": document.corpus_id,
                 "relative_path": document.relative_path,
                 "absolute_path": document.absolute_path,
+                "original_filename": document.original_filename or document.relative_path,
+                "object_key": document.object_key,
+                "storage_uri": document.storage_uri,
+                "content_type": document.content_type,
+                "upload_status": document.upload_status or "indexed",
                 "content": document.content,
                 "metadata_json": document.metadata_json,
                 "file_mtime": document.file_mtime,
                 "file_size": document.file_size,
                 "content_sha256": document.content_sha256,
+                "parsed_content_sha256": document.content_sha256,
+                "parsed_is_complete": True,
                 "last_indexed_at": _utcnow_iso(),
                 "is_deleted": False,
             }
@@ -485,6 +655,7 @@ class PostgresStorage:
                     "doc_id": chunk.doc_id,
                     "text": chunk.text,
                     "position": chunk.position,
+                    "source_unit_no": chunk.source_unit_no,
                     "start_char": chunk.start_char,
                     "end_char": chunk.end_char,
                 }
@@ -502,19 +673,28 @@ class PostgresStorage:
             cur.execute(
                 """
                 INSERT INTO documents (
-                    id, corpus_id, relative_path, absolute_path, content, metadata_json,
-                    file_mtime, file_size, content_sha256, is_deleted
+                    id, corpus_id, relative_path, absolute_path, original_filename,
+                    object_key, storage_uri, content_type, upload_status, content, metadata_json,
+                    file_mtime, file_size, content_sha256,
+                    parsed_content_sha256, parsed_is_complete, is_deleted
                 )
-                VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, FALSE)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, TRUE, FALSE)
                 ON CONFLICT(id) DO UPDATE SET
                     corpus_id = EXCLUDED.corpus_id,
                     relative_path = EXCLUDED.relative_path,
                     absolute_path = EXCLUDED.absolute_path,
+                    original_filename = EXCLUDED.original_filename,
+                    object_key = EXCLUDED.object_key,
+                    storage_uri = EXCLUDED.storage_uri,
+                    content_type = EXCLUDED.content_type,
+                    upload_status = EXCLUDED.upload_status,
                     content = EXCLUDED.content,
                     metadata_json = EXCLUDED.metadata_json,
                     file_mtime = EXCLUDED.file_mtime,
                     file_size = EXCLUDED.file_size,
                     content_sha256 = EXCLUDED.content_sha256,
+                    parsed_content_sha256 = EXCLUDED.parsed_content_sha256,
+                    parsed_is_complete = TRUE,
                     last_indexed_at = CURRENT_TIMESTAMP,
                     is_deleted = FALSE
                 """,
@@ -523,10 +703,16 @@ class PostgresStorage:
                     document.corpus_id,
                     document.relative_path,
                     document.absolute_path,
+                    document.original_filename or document.relative_path,
+                    document.object_key,
+                    document.storage_uri,
+                    document.content_type,
+                    document.upload_status or "indexed",
                     document.content,
                     document.metadata_json,
                     document.file_mtime,
                     document.file_size,
+                    document.content_sha256,
                     document.content_sha256,
                 ),
             )
@@ -534,8 +720,10 @@ class PostgresStorage:
             if chunks:
                 cur.executemany(
                     """
-                    INSERT INTO chunks (id, doc_id, text, position, start_char, end_char)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    INSERT INTO chunks (
+                        id, doc_id, text, position, source_unit_no, start_char, end_char
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """,
                     [
                         (
@@ -543,12 +731,116 @@ class PostgresStorage:
                             chunk.doc_id,
                             chunk.text,
                             chunk.position,
+                            chunk.source_unit_no,
                             chunk.start_char,
                             chunk.end_char,
                         )
                         for chunk in chunks
                     ],
                 )
+
+    def upsert_document_stub(self, document: DocumentRecord) -> None:
+        if self._use_local:
+            state = self._local()
+            state.documents[document.id] = {
+                "id": document.id,
+                "corpus_id": document.corpus_id,
+                "relative_path": document.relative_path,
+                "absolute_path": document.absolute_path,
+                "original_filename": document.original_filename or document.relative_path,
+                "object_key": document.object_key,
+                "storage_uri": document.storage_uri,
+                "content_type": document.content_type,
+                "upload_status": document.upload_status or "uploaded",
+                "content": "",
+                "metadata_json": document.metadata_json,
+                "file_mtime": document.file_mtime,
+                "file_size": document.file_size,
+                "content_sha256": "",
+                "parsed_content_sha256": None,
+                "parsed_is_complete": False,
+                "last_indexed_at": _utcnow_iso(),
+                "is_deleted": False,
+            }
+            chunk_ids_to_delete = [
+                chunk_id
+                for chunk_id, item in state.chunks.items()
+                if item["doc_id"] == document.id
+            ]
+            for chunk_id in chunk_ids_to_delete:
+                state.chunks.pop(chunk_id, None)
+                state.chunk_embeddings.pop(chunk_id, None)
+            stale_parsed_keys = [
+                key for key in list(state.parsed_units) if key[0] == document.id
+            ]
+            for key in stale_parsed_keys:
+                state.parsed_units.pop(key, None)
+            stale_image_hashes = [
+                image_hash
+                for image_hash, item in list(state.image_semantics.items())
+                if item["source_document_id"] == document.id
+            ]
+            for image_hash in stale_image_hashes:
+                state.image_semantics.pop(image_hash, None)
+            return
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM chunk_embeddings
+                WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id = %s)
+                """,
+                (document.id,),
+            )
+            cur.execute("DELETE FROM chunks WHERE doc_id = %s", (document.id,))
+            cur.execute("DELETE FROM parsed_units WHERE document_id = %s", (document.id,))
+            cur.execute(
+                "DELETE FROM image_semantics WHERE source_document_id = %s",
+                (document.id,),
+            )
+            cur.execute(
+                """
+                INSERT INTO documents (
+                    id, corpus_id, relative_path, absolute_path, original_filename,
+                    object_key, storage_uri, content_type, upload_status, content, metadata_json,
+                    file_mtime, file_size, content_sha256,
+                    parsed_content_sha256, parsed_is_complete, is_deleted
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, '', %s::jsonb, %s, %s, '', NULL, FALSE, FALSE)
+                ON CONFLICT(id) DO UPDATE SET
+                    corpus_id = EXCLUDED.corpus_id,
+                    relative_path = EXCLUDED.relative_path,
+                    absolute_path = EXCLUDED.absolute_path,
+                    original_filename = EXCLUDED.original_filename,
+                    object_key = EXCLUDED.object_key,
+                    storage_uri = EXCLUDED.storage_uri,
+                    content_type = EXCLUDED.content_type,
+                    upload_status = EXCLUDED.upload_status,
+                    content = '',
+                    metadata_json = EXCLUDED.metadata_json,
+                    file_mtime = EXCLUDED.file_mtime,
+                    file_size = EXCLUDED.file_size,
+                    content_sha256 = '',
+                    parsed_content_sha256 = NULL,
+                    parsed_is_complete = FALSE,
+                    last_indexed_at = CURRENT_TIMESTAMP,
+                    is_deleted = FALSE
+                """,
+                (
+                    document.id,
+                    document.corpus_id,
+                    document.relative_path,
+                    document.absolute_path,
+                    document.original_filename or document.relative_path,
+                    document.object_key,
+                    document.storage_uri,
+                    document.content_type,
+                    document.upload_status or "uploaded",
+                    document.metadata_json,
+                    document.file_mtime,
+                    document.file_size,
+                ),
+            )
 
     def mark_deleted_missing_documents(
         self,
@@ -612,10 +904,21 @@ class PostgresStorage:
             return [
                 {
                     "id": str(document["id"]),
+                    "corpus_id": str(document["corpus_id"]),
                     "relative_path": str(document["relative_path"]),
                     "absolute_path": str(document["absolute_path"]),
+                    "original_filename": str(document.get("original_filename") or document["relative_path"]),
+                    "object_key": str(document.get("object_key") or ""),
+                    "storage_uri": str(document.get("storage_uri") or ""),
+                    "content_type": document.get("content_type"),
+                    "upload_status": str(document.get("upload_status") or "uploaded"),
                     "file_size": int(document["file_size"]),
                     "file_mtime": float(document["file_mtime"]),
+                    "metadata_json": str(document["metadata_json"]),
+                    "content_sha256": str(document["content_sha256"]),
+                    "parsed_content_sha256": document.get("parsed_content_sha256"),
+                    "parsed_is_complete": bool(document.get("parsed_is_complete", False)),
+                    "last_indexed_at": str(document["last_indexed_at"]),
                     "is_deleted": bool(document["is_deleted"]),
                 }
                 for document in self._local_documents_for_corpus(
@@ -624,7 +927,24 @@ class PostgresStorage:
                 )
             ]
         sql = """
-            SELECT id, relative_path, absolute_path, file_size, file_mtime, is_deleted
+            SELECT
+                id,
+                corpus_id,
+                relative_path,
+                absolute_path,
+                original_filename,
+                object_key,
+                storage_uri,
+                content_type,
+                upload_status,
+                file_size,
+                file_mtime,
+                metadata_json,
+                content_sha256,
+                parsed_content_sha256,
+                parsed_is_complete,
+                last_indexed_at,
+                is_deleted
             FROM documents
             WHERE corpus_id = %s
         """
@@ -639,14 +959,109 @@ class PostgresStorage:
 
         results: list[dict[str, Any]] = []
         for row in rows:
+            metadata_json_obj = row[11]
+            if isinstance(metadata_json_obj, str):
+                metadata_json = metadata_json_obj
+            else:
+                metadata_json = json.dumps(metadata_json_obj, sort_keys=True)
             results.append(
                 {
                     "id": str(row[0]),
-                    "relative_path": str(row[1]),
-                    "absolute_path": str(row[2]),
-                    "file_size": int(row[3]),
-                    "file_mtime": float(row[4]),
-                    "is_deleted": bool(row[5]),
+                    "corpus_id": str(row[1]),
+                    "relative_path": str(row[2]),
+                    "absolute_path": str(row[3]),
+                    "original_filename": str(row[4] or row[2]),
+                    "object_key": str(row[5] or ""),
+                    "storage_uri": str(row[6] or ""),
+                    "content_type": row[7],
+                    "upload_status": str(row[8] or "uploaded"),
+                    "file_size": int(row[9]),
+                    "file_mtime": float(row[10]),
+                    "metadata_json": metadata_json,
+                    "content_sha256": str(row[12]),
+                    "parsed_content_sha256": row[13],
+                    "parsed_is_complete": bool(row[14]),
+                    "last_indexed_at": row[15].isoformat()
+                    if hasattr(row[15], "isoformat")
+                    else str(row[15]),
+                    "is_deleted": bool(row[16]),
+                }
+            )
+        return results
+
+    def list_documents_by_ids(
+        self,
+        *,
+        doc_ids: list[str],
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        if not doc_ids:
+            return []
+        if self._use_local:
+            return self._local_documents_by_ids(
+                doc_ids=doc_ids,
+                include_deleted=include_deleted,
+            )
+
+        placeholders = ", ".join(["%s"] * len(doc_ids))
+        sql = f"""
+            SELECT
+                id,
+                corpus_id,
+                relative_path,
+                absolute_path,
+                original_filename,
+                object_key,
+                storage_uri,
+                content_type,
+                upload_status,
+                file_size,
+                file_mtime,
+                metadata_json,
+                content_sha256,
+                parsed_content_sha256,
+                parsed_is_complete,
+                last_indexed_at,
+                is_deleted
+            FROM documents
+            WHERE id IN ({placeholders})
+        """
+        params: list[Any] = [*doc_ids]
+        if not include_deleted:
+            sql += " AND is_deleted = FALSE"
+        sql += " ORDER BY relative_path"
+        with self._conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            metadata_json_obj = row[11]
+            if isinstance(metadata_json_obj, str):
+                metadata_json = metadata_json_obj
+            else:
+                metadata_json = json.dumps(metadata_json_obj, sort_keys=True)
+            results.append(
+                {
+                    "id": str(row[0]),
+                    "corpus_id": str(row[1]),
+                    "relative_path": str(row[2]),
+                    "absolute_path": str(row[3]),
+                    "original_filename": str(row[4] or row[2]),
+                    "object_key": str(row[5] or ""),
+                    "storage_uri": str(row[6] or ""),
+                    "content_type": row[7],
+                    "upload_status": str(row[8] or "uploaded"),
+                    "file_size": int(row[9]),
+                    "file_mtime": float(row[10]),
+                    "metadata_json": metadata_json,
+                    "content_sha256": str(row[12]),
+                    "parsed_content_sha256": row[13],
+                    "parsed_is_complete": bool(row[14]),
+                    "last_indexed_at": row[15].isoformat()
+                    if hasattr(row[15], "isoformat")
+                    else str(row[15]),
+                    "is_deleted": bool(row[16]),
                 }
             )
         return results
@@ -681,14 +1096,17 @@ class PostgresStorage:
         corpus_id: str,
         query: str,
         limit: int = 5,
+        document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         if self._use_local:
             terms = _query_terms(query)
             if not terms:
                 return []
+            allowed_doc_ids = {str(doc_id) for doc_id in document_ids or []}
             documents = {
                 document["id"]: document
                 for document in self._local_documents_for_corpus(corpus_id=corpus_id)
+                if not allowed_doc_ids or str(document["id"]) in allowed_doc_ids
             }
             hits: list[dict[str, Any]] = []
             for chunk in self._local().chunks.values():
@@ -705,6 +1123,7 @@ class PostgresStorage:
                         "relative_path": str(document["relative_path"]),
                         "absolute_path": str(document["absolute_path"]),
                         "position": int(chunk["position"]),
+                        "source_unit_no": _optional_int(chunk.get("source_unit_no")),
                         "text": str(chunk["text"]),
                         "score": int(score),
                     }
@@ -726,6 +1145,7 @@ class PostgresStorage:
                     d.relative_path,
                     d.absolute_path,
                     c.position,
+                    c.source_unit_no,
                     c.text,
                     ({score_expr}) AS score
                 FROM chunks c
@@ -737,7 +1157,15 @@ class PostgresStorage:
             ORDER BY score DESC, relative_path ASC, position ASC
             LIMIT %s
         """
-        params: list[Any] = [*terms, corpus_id, limit]
+        params: list[Any] = [*terms, corpus_id]
+        if document_ids:
+            placeholders = ", ".join(["%s"] * len(document_ids))
+            sql = sql.replace(
+                "AND d.is_deleted = FALSE",
+                f"AND d.is_deleted = FALSE AND d.id IN ({placeholders})",
+            )
+            params.extend(document_ids)
+        params.append(limit)
         with self._conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
@@ -750,8 +1178,9 @@ class PostgresStorage:
                     "relative_path": str(row[1]),
                     "absolute_path": str(row[2]),
                     "position": int(row[3]),
-                    "text": str(row[4]),
-                    "score": int(row[5]),
+                    "source_unit_no": _optional_int(row[4]),
+                    "text": str(row[5]),
+                    "score": int(row[6]),
                 }
             )
         return results
@@ -762,12 +1191,16 @@ class PostgresStorage:
         corpus_id: str,
         filters: list[dict[str, Any]],
         limit: int = 20,
+        document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         if self._use_local:
             if not filters:
                 return []
+            allowed_doc_ids = {str(doc_id) for doc_id in document_ids or []}
             matches: list[dict[str, Any]] = []
             for document in self._local_documents_for_corpus(corpus_id=corpus_id):
+                if allowed_doc_ids and str(document["id"]) not in allowed_doc_ids:
+                    continue
                 metadata = _parse_metadata_json(str(document["metadata_json"]))
                 if not all(
                     self._local_matches_metadata_filter(metadata, flt)
@@ -799,6 +1232,10 @@ class PostgresStorage:
               AND d.is_deleted = FALSE
         """
         params: list[Any] = [corpus_id]
+        if document_ids:
+            placeholders = ", ".join(["%s"] * len(document_ids))
+            sql += f"\n  AND d.id IN ({placeholders})"
+            params.extend(document_ids)
 
         for flt in filters:
             field = str(flt["field"])
@@ -840,8 +1277,10 @@ class PostgresStorage:
             cur.execute(
                 """
                 SELECT
-                    id, corpus_id, relative_path, absolute_path, content, metadata_json,
-                    content_sha256, is_deleted
+                    id, corpus_id, relative_path, absolute_path, original_filename,
+                    object_key, storage_uri, content_type, upload_status, content, metadata_json,
+                    file_size, file_mtime, content_sha256,
+                    parsed_content_sha256, parsed_is_complete, last_indexed_at, is_deleted
                 FROM documents
                 WHERE id = %s
                 LIMIT 1
@@ -851,7 +1290,7 @@ class PostgresStorage:
             row = cur.fetchone()
         if row is None:
             return None
-        metadata_json_obj = row[5]
+        metadata_json_obj = row[10]
         if isinstance(metadata_json_obj, str):
             metadata_json = metadata_json_obj
         else:
@@ -861,30 +1300,170 @@ class PostgresStorage:
             "corpus_id": str(row[1]),
             "relative_path": str(row[2]),
             "absolute_path": str(row[3]),
-            "content": str(row[4]),
+            "original_filename": str(row[4] or row[2]),
+            "object_key": str(row[5] or ""),
+            "storage_uri": str(row[6] or ""),
+            "content_type": row[7],
+            "upload_status": str(row[8] or "uploaded"),
+            "content": str(row[9]),
             "metadata_json": metadata_json,
-            "content_sha256": str(row[6]),
-            "is_deleted": bool(row[7]),
+            "file_size": int(row[11]),
+            "file_mtime": float(row[12]),
+            "content_sha256": str(row[13]),
+            "parsed_content_sha256": row[14],
+            "parsed_is_complete": bool(row[15]),
+            "last_indexed_at": row[16].isoformat()
+            if hasattr(row[16], "isoformat")
+            else str(row[16]),
+            "is_deleted": bool(row[17]),
         }
+
+    def update_document_metadata(
+        self,
+        *,
+        doc_id: str,
+        metadata_json: str,
+    ) -> dict[str, Any] | None:
+        parsed_metadata = _parse_metadata_json(metadata_json)
+        if self._use_local:
+            document = self._local().documents.get(doc_id)
+            if document is None:
+                return None
+            document["metadata_json"] = _stringify_metadata(parsed_metadata)
+            document["last_indexed_at"] = _utcnow_iso()
+            return copy.deepcopy(document)
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE documents
+                SET metadata_json = %s::jsonb,
+                    last_indexed_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """,
+                (_stringify_metadata(parsed_metadata), doc_id),
+            )
+            if cur.rowcount == 0:
+                return None
+        return self.get_document(doc_id=doc_id)
+
+    def set_document_deleted(
+        self,
+        *,
+        doc_id: str,
+        is_deleted: bool,
+    ) -> dict[str, Any] | None:
+        if self._use_local:
+            document = self._local().documents.get(doc_id)
+            if document is None:
+                return None
+            document["is_deleted"] = bool(is_deleted)
+            document["last_indexed_at"] = _utcnow_iso()
+            return copy.deepcopy(document)
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE documents
+                SET is_deleted = %s,
+                    last_indexed_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """,
+                (is_deleted, doc_id),
+            )
+            if cur.rowcount == 0:
+                return None
+        return self.get_document(doc_id=doc_id)
+
+    def update_document_absolute_path(
+        self,
+        *,
+        doc_id: str,
+        absolute_path: str,
+    ) -> dict[str, Any] | None:
+        if self._use_local:
+            document = self._local().documents.get(doc_id)
+            if document is None:
+                return None
+            document["absolute_path"] = absolute_path
+            return copy.deepcopy(document)
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE documents
+                SET absolute_path = %s
+                WHERE id = %s
+                """,
+                (absolute_path, doc_id),
+            )
+            if cur.rowcount == 0:
+                return None
+        return self.get_document(doc_id=doc_id)
+
+    def update_document_parse_state(
+        self,
+        *,
+        doc_id: str,
+        parsed_content_sha256: str | None,
+        parsed_is_complete: bool,
+    ) -> dict[str, Any] | None:
+        if self._use_local:
+            document = self._local().documents.get(doc_id)
+            if document is None:
+                return None
+            document["parsed_content_sha256"] = parsed_content_sha256
+            if parsed_is_complete:
+                document["parsed_is_complete"] = True
+            else:
+                document["parsed_is_complete"] = bool(document.get("parsed_is_complete", False))
+            document["last_indexed_at"] = _utcnow_iso()
+            return copy.deepcopy(document)
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE documents
+                SET parsed_content_sha256 = %s,
+                    parsed_is_complete = CASE
+                        WHEN %s THEN TRUE
+                        ELSE parsed_is_complete
+                    END,
+                    last_indexed_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """,
+                (parsed_content_sha256, parsed_is_complete, doc_id),
+            )
+            if cur.rowcount == 0:
+                return None
+        return self.get_document(doc_id=doc_id)
 
     def list_parsed_units(
         self,
         *,
         document_id: str,
         parser_version: str | None = None,
+        unit_nos: list[int] | None = None,
     ) -> list[dict[str, Any]]:
+        if unit_nos is not None and len(unit_nos) == 0:
+            return []
         if self._use_local:
+            allowed_units = set(unit_nos) if unit_nos is not None else None
             result = []
             for (doc_id, version, page_no), item in self._local().parsed_units.items():
                 if doc_id != document_id:
                     continue
                 if parser_version is not None and version != parser_version:
                     continue
+                if allowed_units is not None and page_no not in allowed_units:
+                    continue
                 result.append(copy.deepcopy(item))
             result.sort(key=lambda item: int(item["page_no"]))
             return result
         sql = """
-            SELECT document_id, parser_name, parser_version, page_no, markdown, content_hash, images_json
+            SELECT
+                document_id, parser_name, parser_version, page_no, markdown, content_hash,
+                heading, source_locator, images_json
             FROM parsed_units
             WHERE document_id = %s
         """
@@ -892,6 +1471,10 @@ class PostgresStorage:
         if parser_version is not None:
             sql += " AND parser_version = %s"
             params.append(parser_version)
+        if unit_nos:
+            placeholders = ", ".join(["%s"] * len(unit_nos))
+            sql += f" AND page_no IN ({placeholders})"
+            params.extend(sorted(set(unit_nos)))
         sql += " ORDER BY page_no ASC"
 
         with self._conn.cursor() as cur:
@@ -900,7 +1483,7 @@ class PostgresStorage:
 
         results: list[dict[str, Any]] = []
         for row in rows:
-            images_obj = row[6]
+            images_obj = row[8]
             if isinstance(images_obj, list):
                 images = images_obj
             else:
@@ -913,6 +1496,8 @@ class PostgresStorage:
                     "page_no": int(row[3]),
                     "markdown": str(row[4]),
                     "content_hash": str(row[5]),
+                    "heading": row[6],
+                    "source_locator": row[7],
                     "images": images,
                 }
             )
@@ -946,6 +1531,8 @@ class PostgresStorage:
                     "page_no": unit.page_no,
                     "markdown": unit.markdown,
                     "content_hash": unit.content_hash,
+                    "heading": unit.heading,
+                    "source_locator": unit.source_locator,
                     "images": json.loads(unit.images_json),
                 }
                 previous = existing.get(unit.page_no)
@@ -987,6 +1574,8 @@ class PostgresStorage:
                     previous is not None
                     and previous["content_hash"] == unit.content_hash
                     and previous["markdown"] == unit.markdown
+                    and previous.get("heading") == unit.heading
+                    and previous.get("source_locator") == unit.source_locator
                     and previous_images == current_images
                 ):
                     untouched += 1
@@ -996,13 +1585,15 @@ class PostgresStorage:
                     """
                     INSERT INTO parsed_units (
                         document_id, parser_name, parser_version, page_no, markdown,
-                        content_hash, images_json, updated_at
+                        content_hash, heading, source_locator, images_json, updated_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, CURRENT_TIMESTAMP)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, CURRENT_TIMESTAMP)
                     ON CONFLICT(document_id, page_no, parser_version) DO UPDATE SET
                         parser_name = EXCLUDED.parser_name,
                         markdown = EXCLUDED.markdown,
                         content_hash = EXCLUDED.content_hash,
+                        heading = EXCLUDED.heading,
+                        source_locator = EXCLUDED.source_locator,
                         images_json = EXCLUDED.images_json,
                         updated_at = CURRENT_TIMESTAMP
                     """,
@@ -1013,6 +1604,8 @@ class PostgresStorage:
                         unit.page_no,
                         unit.markdown,
                         unit.content_hash,
+                        unit.heading,
+                        unit.source_locator,
                         unit.images_json,
                     ),
                 )
@@ -1040,6 +1633,100 @@ class PostgresStorage:
             deleted = cur.rowcount if cur.rowcount is not None else 0
 
         return {"upserted": upserted, "untouched": untouched, "deleted": int(deleted)}
+
+    def upsert_parsed_units(
+        self,
+        *,
+        document_id: str,
+        parser_name: str,
+        parser_version: str,
+        units: list[ParsedUnitRecord],
+    ) -> dict[str, int]:
+        if self._use_local:
+            state = self._local()
+            existing = {
+                int(item["page_no"]): item
+                for item in self.list_parsed_units(
+                    document_id=document_id,
+                    parser_version=parser_version,
+                )
+            }
+            upserted = 0
+            untouched = 0
+            for unit in units:
+                current = {
+                    "document_id": document_id,
+                    "parser_name": parser_name,
+                    "parser_version": parser_version,
+                    "page_no": unit.page_no,
+                    "markdown": unit.markdown,
+                    "content_hash": unit.content_hash,
+                    "heading": unit.heading,
+                    "source_locator": unit.source_locator,
+                    "images": json.loads(unit.images_json),
+                }
+                previous = existing.get(unit.page_no)
+                if previous == current:
+                    untouched += 1
+                else:
+                    upserted += 1
+                state.parsed_units[(document_id, parser_version, unit.page_no)] = current
+            return {"upserted": upserted, "untouched": untouched, "deleted": 0}
+
+        existing = {
+            int(unit["page_no"]): unit
+            for unit in self.list_parsed_units(
+                document_id=document_id,
+                parser_version=parser_version,
+            )
+        }
+        upserted = 0
+        untouched = 0
+        with self._conn.cursor() as cur:
+            for unit in units:
+                previous = existing.get(unit.page_no)
+                previous_images = previous.get("images") if previous is not None else []
+                current_images = json.loads(unit.images_json)
+                if (
+                    previous is not None
+                    and previous["content_hash"] == unit.content_hash
+                    and previous["markdown"] == unit.markdown
+                    and previous.get("heading") == unit.heading
+                    and previous.get("source_locator") == unit.source_locator
+                    and previous_images == current_images
+                ):
+                    untouched += 1
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO parsed_units (
+                        document_id, parser_name, parser_version, page_no, markdown,
+                        content_hash, heading, source_locator, images_json, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, CURRENT_TIMESTAMP)
+                    ON CONFLICT(document_id, page_no, parser_version) DO UPDATE SET
+                        parser_name = EXCLUDED.parser_name,
+                        markdown = EXCLUDED.markdown,
+                        content_hash = EXCLUDED.content_hash,
+                        heading = EXCLUDED.heading,
+                        source_locator = EXCLUDED.source_locator,
+                        images_json = EXCLUDED.images_json,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        document_id,
+                        parser_name,
+                        parser_version,
+                        unit.page_no,
+                        unit.markdown,
+                        unit.content_hash,
+                        unit.heading,
+                        unit.source_locator,
+                        unit.images_json,
+                    ),
+                )
+                upserted += 1
+        return {"upserted": upserted, "untouched": untouched, "deleted": 0}
 
     def upsert_image_semantics(
         self,
@@ -1404,13 +2091,16 @@ class PostgresStorage:
         corpus_id: str,
         query_embedding: list[float],
         limit: int = 5,
+        document_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         if self._use_local:
             if not self._vector_enabled:
                 return []
+            allowed_doc_ids = {str(doc_id) for doc_id in document_ids or []}
             docs = {
                 document["id"]: document
                 for document in self._local_documents_for_corpus(corpus_id=corpus_id)
+                if not allowed_doc_ids or str(document["id"]) in allowed_doc_ids
             }
             scored: list[dict[str, Any]] = []
             for chunk_id, stored in self._local().chunk_embeddings.items():
@@ -1429,6 +2119,7 @@ class PostgresStorage:
                         "relative_path": str(document["relative_path"]),
                         "absolute_path": str(document["absolute_path"]),
                         "position": int(chunk["position"]),
+                        "source_unit_no": _optional_int(chunk.get("source_unit_no")),
                         "text": str(chunk["text"]),
                         "score": float(score),
                     }
@@ -1445,6 +2136,7 @@ class PostgresStorage:
                 d.relative_path,
                 d.absolute_path,
                 c.position,
+                c.source_unit_no,
                 c.text,
                 1 - (ce.embedding <=> %s::vector) AS score
             FROM chunk_embeddings ce
@@ -1455,8 +2147,17 @@ class PostgresStorage:
             ORDER BY ce.embedding <=> %s::vector ASC
             LIMIT %s
         """
+        params: list[Any] = [query_vector, corpus_id]
+        if document_ids:
+            placeholders = ", ".join(["%s"] * len(document_ids))
+            sql = sql.replace(
+                "AND d.is_deleted = FALSE",
+                f"AND d.is_deleted = FALSE AND d.id IN ({placeholders})",
+            )
+            params.extend(document_ids)
+        params.extend([query_vector, limit])
         with self._conn.cursor() as cur:
-            cur.execute(sql, (query_vector, corpus_id, query_vector, limit))
+            cur.execute(sql, params)
             rows = cur.fetchall()
 
         results: list[dict[str, Any]] = []
@@ -1467,8 +2168,9 @@ class PostgresStorage:
                     "relative_path": str(row[1]),
                     "absolute_path": str(row[2]),
                     "position": int(row[3]),
-                    "text": str(row[4]),
-                    "score": float(row[5]),
+                    "source_unit_no": _optional_int(row[4]),
+                    "text": str(row[5]),
+                    "score": float(row[6]),
                 }
             )
         return results
@@ -1530,6 +2232,237 @@ class PostgresStorage:
             )
             row = cur.fetchone()
         return bool(row and int(row[0]) > 0)
+
+    def create_collection(self, *, name: str) -> CollectionRecord:
+        collection_id = _stable_id("collection", f"{name}:{_utcnow_iso()}")
+        created_at = _utcnow_iso()
+        record = {
+            "id": collection_id,
+            "name": name,
+            "is_deleted": False,
+            "created_at": created_at,
+            "updated_at": created_at,
+        }
+        if self._use_local:
+            self._local().collections[collection_id] = record
+            return self._collection_record_from_dict(record)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO collections (id, name, is_deleted, created_at, updated_at)
+                VALUES (%s, %s, FALSE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                (collection_id, name),
+            )
+        collection = self.get_collection(collection_id=collection_id)
+        if collection is None:
+            raise RuntimeError("Failed to create collection.")
+        return collection
+
+    def list_collections(self, *, include_deleted: bool = False) -> list[CollectionRecord]:
+        if self._use_local:
+            records = [
+                self._collection_record_from_dict(record)
+                for record in self._local().collections.values()
+                if include_deleted or not bool(record.get("is_deleted", False))
+            ]
+            records.sort(key=lambda item: item.name.lower())
+            return records
+        sql = """
+            SELECT id, name, is_deleted, created_at, updated_at
+            FROM collections
+        """
+        if not include_deleted:
+            sql += " WHERE is_deleted = FALSE"
+        sql += " ORDER BY lower(name), created_at"
+        with self._conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        return [
+            CollectionRecord(
+                id=str(row[0]),
+                name=str(row[1]),
+                is_deleted=bool(row[2]),
+                created_at=row[3].isoformat() if hasattr(row[3], "isoformat") else str(row[3]),
+                updated_at=row[4].isoformat() if hasattr(row[4], "isoformat") else str(row[4]),
+            )
+            for row in rows
+        ]
+
+    def get_collection(self, *, collection_id: str) -> CollectionRecord | None:
+        if self._use_local:
+            record = self._local().collections.get(collection_id)
+            return None if record is None else self._collection_record_from_dict(record)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, name, is_deleted, created_at, updated_at
+                FROM collections
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (collection_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return CollectionRecord(
+            id=str(row[0]),
+            name=str(row[1]),
+            is_deleted=bool(row[2]),
+            created_at=row[3].isoformat() if hasattr(row[3], "isoformat") else str(row[3]),
+            updated_at=row[4].isoformat() if hasattr(row[4], "isoformat") else str(row[4]),
+        )
+
+    def update_collection(
+        self,
+        *,
+        collection_id: str,
+        name: str,
+    ) -> CollectionRecord | None:
+        if self._use_local:
+            record = self._local().collections.get(collection_id)
+            if record is None:
+                return None
+            record["name"] = name
+            record["updated_at"] = _utcnow_iso()
+            return self._collection_record_from_dict(record)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE collections
+                SET name = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """,
+                (name, collection_id),
+            )
+            if cur.rowcount == 0:
+                return None
+        return self.get_collection(collection_id=collection_id)
+
+    def set_collection_deleted(
+        self,
+        *,
+        collection_id: str,
+        is_deleted: bool,
+    ) -> CollectionRecord | None:
+        if self._use_local:
+            record = self._local().collections.get(collection_id)
+            if record is None:
+                return None
+            record["is_deleted"] = bool(is_deleted)
+            record["updated_at"] = _utcnow_iso()
+            return self._collection_record_from_dict(record)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE collections
+                SET is_deleted = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """,
+                (is_deleted, collection_id),
+            )
+            if cur.rowcount == 0:
+                return None
+        return self.get_collection(collection_id=collection_id)
+
+    def list_collection_documents(
+        self,
+        *,
+        collection_id: str,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        if self._use_local:
+            doc_ids = [
+                doc_id
+                for coll_id, doc_id in self._local().collection_documents
+                if coll_id == collection_id
+            ]
+            return self._local_documents_by_ids(
+                doc_ids=doc_ids,
+                include_deleted=include_deleted,
+            )
+        sql = """
+            SELECT d.id
+            FROM collection_documents cd
+            JOIN documents d ON d.id = cd.document_id
+            WHERE cd.collection_id = %s
+        """
+        params: list[Any] = [collection_id]
+        if not include_deleted:
+            sql += " AND d.is_deleted = FALSE"
+        sql += " ORDER BY d.relative_path"
+        with self._conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        return self.list_documents_by_ids(
+            doc_ids=[str(row[0]) for row in rows],
+            include_deleted=include_deleted,
+        )
+
+    def attach_documents_to_collection(
+        self,
+        *,
+        collection_id: str,
+        document_ids: list[str],
+    ) -> int:
+        if not document_ids:
+            return 0
+        unique_ids = sorted({str(doc_id) for doc_id in document_ids if str(doc_id).strip()})
+        if self._use_local:
+            before = len(self._local().collection_documents)
+            for doc_id in unique_ids:
+                self._local().collection_documents.add((collection_id, doc_id))
+            return len(self._local().collection_documents) - before
+        with self._conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO collection_documents (collection_id, document_id)
+                VALUES (%s, %s)
+                ON CONFLICT(collection_id, document_id) DO NOTHING
+                """,
+                [(collection_id, doc_id) for doc_id in unique_ids],
+            )
+        return len(unique_ids)
+
+    def detach_document_from_collection(
+        self,
+        *,
+        collection_id: str,
+        doc_id: str,
+    ) -> bool:
+        if self._use_local:
+            key = (collection_id, doc_id)
+            existed = key in self._local().collection_documents
+            self._local().collection_documents.discard(key)
+            return existed
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM collection_documents
+                WHERE collection_id = %s AND document_id = %s
+                """,
+                (collection_id, doc_id),
+            )
+            return bool(cur.rowcount)
+
+    def remove_document_from_all_collections(self, *, doc_id: str) -> int:
+        if self._use_local:
+            matches = [key for key in self._local().collection_documents if key[1] == doc_id]
+            for key in matches:
+                self._local().collection_documents.discard(key)
+            return len(matches)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM collection_documents
+                WHERE document_id = %s
+                """,
+                (doc_id,),
+            )
+            return int(cur.rowcount or 0)
 
     def create_hnsw_index(self, *, corpus_id: str) -> bool:
         if not self._vector_enabled:

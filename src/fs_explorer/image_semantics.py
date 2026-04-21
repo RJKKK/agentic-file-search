@@ -4,47 +4,46 @@ Helpers for lazy image semantic enhancement.
 
 from __future__ import annotations
 
-import os
+import base64
 from typing import Any
 
+from openai import OpenAI
+
 from .document_parsing import ImageSemanticEnhancer
+from .model_config import resolve_vision_config
 
-_DEFAULT_VISION_MODEL = "gemini-2.5-flash"
 
-
-class GeminiImageSemanticEnhancer(ImageSemanticEnhancer):
-    """Describe page images using a Gemini multimodal model."""
+class OpenAIImageSemanticEnhancer(ImageSemanticEnhancer):
+    """Describe page images using an OpenAI-compatible multimodal model."""
 
     def __init__(
         self,
         *,
         api_key: str | None = None,
         model: str | None = None,
+        base_url: str | None = None,
         client: Any | None = None,
     ) -> None:
-        self.model = model or os.getenv(
-            "FS_EXPLORER_VISION_MODEL",
-            _DEFAULT_VISION_MODEL,
+        config = resolve_vision_config(
+            api_key=api_key,
+            model_name=model,
+            base_url=base_url,
         )
+        if not config.api_key and client is None:
+            raise ValueError(
+                "Vision model is not configured. Set VISION_API_KEY "
+                "(or TEXT_API_KEY / OPENAI_API_KEY) and optionally VISION_BASE_URL."
+            )
+        self.model = config.model_name
 
         if client is not None:
             self._client = client
             return
 
-        resolved_key = api_key or os.getenv("GOOGLE_API_KEY")
-        if not resolved_key:
-            raise ValueError(
-                "GOOGLE_API_KEY not found. Provide api_key or set the environment variable."
-            )
-
-        try:
-            from google.genai import Client as GenAIClient
-        except ImportError as exc:  # pragma: no cover - depends on local env
-            raise ValueError(
-                "google-genai is not installed. Run `python -m pip install -e .` first."
-            ) from exc
-
-        self._client = GenAIClient(api_key=resolved_key)
+        client_kwargs = {"api_key": config.api_key}
+        if config.base_url:
+            client_kwargs["base_url"] = config.base_url
+        self._client = OpenAI(**client_kwargs)
 
     def describe_image(
         self,
@@ -60,21 +59,43 @@ class GeminiImageSemanticEnhancer(ImageSemanticEnhancer):
             "Focus on charts, tables, labels, legends, axes, and any text visible. "
             "Keep it concise but specific."
         )
-        response = self._client.models.generate_content(
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        media_type = mime_type or "image/png"
+        response = self._client.chat.completions.create(
             model=self.model,
-            contents=[
-                prompt,
+            messages=[
                 {
-                    "inline_data": {
-                        "mime_type": mime_type or "image/png",
-                        "data": image_bytes,
-                    }
-                },
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{encoded}"
+                            },
+                        },
+                    ],
+                }
             ],
+            temperature=0,
         )
-        text = getattr(response, "text", "") or ""
-        if text.strip():
-            return text.strip(), self.model
+
+        content = response.choices[0].message.content
+        if isinstance(content, str):
+            text = content.strip()
+        else:
+            chunks: list[str] = []
+            for item in content or []:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    chunks.append(str(item.get("text", "")))
+                else:
+                    item_text = getattr(item, "text", None)
+                    if item_text is not None:
+                        chunks.append(str(item_text))
+            text = "\n".join(chunk for chunk in chunks if chunk).strip()
+
+        if text:
+            return text, self.model
 
         fallback = (
             f"Image {image_index} on page {page_no} of {file_path} was processed, "
@@ -86,6 +107,6 @@ class GeminiImageSemanticEnhancer(ImageSemanticEnhancer):
 def build_image_semantic_enhancer() -> ImageSemanticEnhancer | None:
     """Return a best-effort image enhancer when runtime dependencies are available."""
     try:
-        return GeminiImageSemanticEnhancer()
+        return OpenAIImageSemanticEnhancer()
     except ValueError:
         return None

@@ -121,17 +121,24 @@ class MemoryStorage:
         *,
         document_id: str,
         parser_version: str | None = None,
+        unit_nos: list[int] | None = None,
     ) -> list[dict[str, object]]:
+        allowed_units = set(unit_nos) if unit_nos is not None else None
         if parser_version is None:
             items: list[dict[str, object]] = []
             for (doc_id, _version), values in self.parsed_units.items():
                 if doc_id == document_id:
-                    items.extend(unit.copy() for unit in values)
+                    for unit in values:
+                        if allowed_units is not None and int(unit["page_no"]) not in allowed_units:
+                            continue
+                        items.append(unit.copy())
             return sorted(items, key=lambda unit: int(unit["page_no"]))
-        return [
-            unit.copy()
-            for unit in self.parsed_units.get((document_id, parser_version), [])
-        ]
+        result = []
+        for unit in self.parsed_units.get((document_id, parser_version), []):
+            if allowed_units is not None and int(unit["page_no"]) not in allowed_units:
+                continue
+            result.append(unit.copy())
+        return result
 
     def sync_parsed_units(
         self,

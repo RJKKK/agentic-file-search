@@ -49,9 +49,8 @@ class WorkflowState(BaseModel):
     """State maintained throughout the workflow execution."""
 
     initial_task: str = ""
-    root_directory: str = "."
-    current_directory: str = "."
-    use_index: bool = False
+    document_labels: list[str] = []
+    collection_name: str | None = None
     enable_semantic: bool = False
     enable_metadata: bool = False
 
@@ -60,8 +59,9 @@ class InputEvent(StartEvent):
     """Initial event containing the user's task."""
 
     task: str
-    folder: str = "."
-    use_index: bool = False
+    document_ids: list[str] = []
+    document_labels: list[str] = []
+    collection_name: str | None = None
     enable_semantic: bool = False
     enable_metadata: bool = False
 
@@ -71,6 +71,7 @@ class GoDeeperEvent(Event):
 
     directory: str
     reason: str
+    context_plan: dict[str, Any] | None = None
 
 
 class ToolCallEvent(Event):
@@ -79,6 +80,7 @@ class ToolCallEvent(Event):
     tool_name: str
     tool_input: dict[str, Any]
     reason: str
+    context_plan: dict[str, Any] | None = None
 
 
 class AskHumanEvent(InputRequiredEvent):
@@ -86,6 +88,7 @@ class AskHumanEvent(InputRequiredEvent):
 
     question: str
     reason: str
+    context_plan: dict[str, Any] | None = None
 
 
 class HumanAnswerEvent(HumanResponseEvent):
@@ -126,7 +129,15 @@ def _handle_action_result(
     """
     if action_type == "godeeper":
         godeeper = cast(GoDeeperAction, action.action)
-        event = GoDeeperEvent(directory=godeeper.directory, reason=action.reason)
+        event = GoDeeperEvent(
+            directory=godeeper.directory,
+            reason=action.reason,
+            context_plan=(
+                action.context_plan.model_dump(exclude_none=True)
+                if action.context_plan is not None
+                else None
+            ),
+        )
         ctx.write_event_to_stream(event)
         return event
 
@@ -136,6 +147,11 @@ def _handle_action_result(
             tool_name=toolcall.tool_name,
             tool_input=toolcall.to_fn_args(),
             reason=action.reason,
+            context_plan=(
+                action.context_plan.model_dump(exclude_none=True)
+                if action.context_plan is not None
+                else None
+            ),
         )
         ctx.write_event_to_stream(event)
         return event
@@ -143,7 +159,15 @@ def _handle_action_result(
     elif action_type == "askhuman":
         askhuman = cast(AskHumanAction, action.action)
         # InputRequiredEvent is written to the stream by default
-        return AskHumanEvent(question=askhuman.question, reason=action.reason)
+        return AskHumanEvent(
+            question=askhuman.question,
+            reason=action.reason,
+            context_plan=(
+                action.context_plan.model_dump(exclude_none=True)
+                if action.context_plan is not None
+                else None
+            ),
+        )
 
     else:  # stop
         stopaction = cast(StopAction, action.action)
@@ -201,44 +225,44 @@ class FsExplorerWorkflow(Workflow):
         agent: Annotated[FsExplorerAgent, Resource(get_agent)],
     ) -> WorkflowEvent:
         """Initialize exploration with the user's task."""
-        root_directory = os.path.abspath(ev.folder)
-        if not os.path.exists(root_directory) or not os.path.isdir(root_directory):
-            return ExplorationEndEvent(error=f"No such directory: {root_directory}")
-
         async with ctx.store.edit_state() as state:
             state.initial_task = ev.task
-            state.root_directory = root_directory
-            state.current_directory = root_directory
-            state.use_index = ev.use_index
+            state.document_labels = list(ev.document_labels)
+            state.collection_name = ev.collection_name
             state.enable_semantic = ev.enable_semantic
             state.enable_metadata = ev.enable_metadata
 
-        dirdescription = describe_dir_content(root_directory)
+        scope_name = (
+            f"collection '{ev.collection_name}'"
+            if ev.collection_name
+            else "selected documents"
+        )
+        document_summary = "\n".join(f"- {label}" for label in ev.document_labels) or "- (none)"
         if ev.enable_semantic and ev.enable_metadata:
             index_hint = (
-                "An index is available. Start with `semantic_search` (with optional "
-                "filters) for fast retrieval, then use filesystem tools for deep dives."
+                "Use `semantic_search` first, optionally with metadata filters, "
+                "then use `get_document` or focused `parse_file` on the returned files."
             )
         elif ev.enable_semantic:
             index_hint = (
-                "An index is available. Use `semantic_search` (no filters) for "
-                "similarity search, then use filesystem tools for details."
+                "Use `semantic_search` first for similarity retrieval, then drill in."
             )
         elif ev.enable_metadata:
             index_hint = (
-                "An index is available. Use `semantic_search` with metadata "
-                "filters, then use filesystem tools for details."
+                "Use `semantic_search` with filters first, then drill in."
             )
         else:
-            index_hint = "Prefer absolute paths from the directory listing when calling tools."
+            index_hint = (
+                "Only work inside the selected document set and prefer focused reads."
+            )
         agent.configure_task(
-            f"Given that the current directory ('{root_directory}') looks like this:\n\n"
-            f"```text\n{dirdescription}\n```\n\n"
-            f"And that the user is giving you this task: '{ev.task}', "
-            f"what action should you take first? {index_hint}"
+            f"You can only access the current {scope_name}. The available documents are:\n\n"
+            f"```text\n{document_summary}\n```\n\n"
+            f"The user task is: '{ev.task}'. "
+            f"What action should you take first? {index_hint}"
         )
 
-        return await _process_agent_action(agent, ctx, update_directory=True)
+        return await _process_agent_action(agent, ctx, update_directory=False)
 
     @step
     async def go_deeper_action(
@@ -249,16 +273,15 @@ class FsExplorerWorkflow(Workflow):
     ) -> WorkflowEvent:
         """Handle navigation into a subdirectory."""
         state = await ctx.store.get_state()
-        dirdescription = describe_dir_content(state.current_directory)
+        document_summary = "\n".join(f"- {label}" for label in state.document_labels) or "- (none)"
 
         agent.configure_task(
-            f"Given that the current directory ('{state.current_directory}') "
-            f"looks like this:\n\n```text\n{dirdescription}\n```\n\n"
-            f"And that the user is giving you this task: '{state.initial_task}', "
-            f"what action should you take next?"
+            f"Stay within the selected documents below:\n\n```text\n{document_summary}\n```\n\n"
+            f"The user task is still: '{state.initial_task}'. "
+            f"Based on what you learned, what action should you take next?"
         )
 
-        return await _process_agent_action(agent, ctx, update_directory=True)
+        return await _process_agent_action(agent, ctx, update_directory=False)
 
     @step
     async def receive_human_answer(
@@ -276,7 +299,7 @@ class FsExplorerWorkflow(Workflow):
             f"original task: {state.initial_task}"
         )
 
-        return await _process_agent_action(agent, ctx, update_directory=True)
+        return await _process_agent_action(agent, ctx, update_directory=False)
 
     @step
     async def tool_call_action(
@@ -286,15 +309,18 @@ class FsExplorerWorkflow(Workflow):
         agent: Annotated[FsExplorerAgent, Resource(get_agent)],
     ) -> WorkflowEvent:
         """Process the result of a tool call."""
+        state = await ctx.store.get_state()
         agent.configure_task(
-            "Given the result from the tool call you just performed, "
-            "what action should you take next?"
+            f"The user task is still: '{state.initial_task}'. "
+            "Given the tool result and structured context you just received, "
+            "choose the next action. Do not assume the previously active pages still contain the answer. "
+            "If the current range is stale or insufficient, run a fresh search or parse a genuinely new range."
         )
 
         return await _process_agent_action(agent, ctx, update_directory=True)
 
 
 # Workflow timeout for complex multi-document analysis (5 minutes)
-WORKFLOW_TIMEOUT_SECONDS = 300
+WORKFLOW_TIMEOUT_SECONDS = 3000
 
 workflow = FsExplorerWorkflow(timeout=WORKFLOW_TIMEOUT_SECONDS)

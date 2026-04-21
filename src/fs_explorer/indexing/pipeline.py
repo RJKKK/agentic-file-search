@@ -22,7 +22,7 @@ from .schema import SchemaDiscovery
 from ..document_parsing import (
     DocumentParseError,
     ParsedDocument,
-    ParsedPage,
+    ParsedUnit,
     PARSER_VERSION,
     compute_file_sha256,
     parse_document,
@@ -133,15 +133,19 @@ class IndexingPipeline:
                 )
                 cached_document = reconstruct_parsed_document(cached_units)
                 if cached_document is not None:
+                    full_content, unit_offsets = self._join_units_with_offsets(
+                        cached_document.units
+                    )
                     parsed_docs.append(
                         {
                             "file_path": file_path,
                             "relative_path": relative_path,
                             "doc_id": doc_id,
                             "file_sha256": file_sha256,
-                            "content": cached_document.markdown,
+                            "content": full_content,
                             "parsed_document": cached_document,
                             "from_cache": True,
+                            "unit_offsets": unit_offsets,
                         }
                     )
                     parsed_cache_hits += 1
@@ -153,15 +157,20 @@ class IndexingPipeline:
                 skipped_files += 1
                 continue
 
+            full_content, unit_offsets = self._join_units_with_offsets(
+                parsed_document.units
+            )
+
             parsed_docs.append(
                 {
                     "file_path": file_path,
                     "relative_path": relative_path,
                     "doc_id": doc_id,
                     "file_sha256": file_sha256,
-                    "content": parsed_document.markdown,
+                    "content": full_content,
                     "parsed_document": parsed_document,
                     "from_cache": False,
+                    "unit_offsets": unit_offsets,
                 }
             )
 
@@ -190,6 +199,7 @@ class IndexingPipeline:
             doc_id = str(item["doc_id"])
             content = str(item["content"])
             parsed_document = item["parsed_document"]
+            unit_offsets = list(item.get("unit_offsets") or [])
             chunks = self.chunker.chunk_text(content)
             metadata = metadata_map[relative_path]
             metadata_json = json.dumps(metadata, sort_keys=True)
@@ -220,6 +230,11 @@ class IndexingPipeline:
                         doc_id=doc_id,
                         text=chunk.text,
                         position=chunk.position,
+                        source_unit_no=self._pick_chunk_unit_no(
+                            chunk_start=chunk.start_char,
+                            chunk_end=chunk.end_char,
+                            unit_offsets=unit_offsets,
+                        ),
                         start_char=chunk.start_char,
                         end_char=chunk.end_char,
                     )
@@ -236,6 +251,8 @@ class IndexingPipeline:
                         page_no=page.page_no,
                         markdown=page.markdown,
                         content_hash=page.content_hash,
+                        heading=page.heading,
+                        source_locator=page.source_locator,
                         images_json=json.dumps(
                             [
                                 {
@@ -308,6 +325,249 @@ class IndexingPipeline:
             image_placeholders_written=image_placeholders_written,
         )
 
+    def index_documents(
+        self,
+        documents: list[dict[str, Any]],
+        *,
+        corpus_id: str,
+        discover_schema: bool = False,
+        schema_name: str | None = None,
+        with_metadata: bool = False,
+        metadata_profile: dict[str, Any] | None = None,
+    ) -> IndexingResult:
+        """Index only the selected uploaded documents."""
+        effective_with_metadata = with_metadata or metadata_profile is not None
+        schema_def, selected_schema_name = self._resolve_schema(
+            corpus_id=corpus_id,
+            root=corpus_id,
+            discover_schema=discover_schema,
+            schema_name=schema_name,
+            with_metadata=effective_with_metadata,
+            metadata_profile=metadata_profile,
+        )
+        effective_profile = metadata_profile or self._schema_metadata_profile(
+            schema_def
+        )
+
+        parsed_docs: list[dict[str, Any]] = []
+        skipped_files = 0
+        parsed_cache_hits = 0
+
+        for document in documents:
+            doc_id = str(document["id"])
+            file_path = str(document["absolute_path"])
+            relative_path = str(
+                document.get("relative_path")
+                or document.get("original_filename")
+                or doc_id
+            )
+            file_sha256 = compute_file_sha256(file_path)
+            existing_doc = self.storage.get_document(doc_id=doc_id)
+
+            if (
+                existing_doc is not None
+                and existing_doc.get("content_sha256") == file_sha256
+            ):
+                cached_units = self.storage.list_parsed_units(
+                    document_id=doc_id,
+                    parser_version=PARSER_VERSION,
+                )
+                cached_document = reconstruct_parsed_document(cached_units)
+                if cached_document is not None:
+                    full_content, unit_offsets = self._join_units_with_offsets(
+                        cached_document.units
+                    )
+                    parsed_docs.append(
+                        {
+                            "file_path": file_path,
+                            "relative_path": relative_path,
+                            "doc_id": doc_id,
+                            "file_sha256": file_sha256,
+                            "content": full_content,
+                            "parsed_document": cached_document,
+                            "from_cache": True,
+                            "unit_offsets": unit_offsets,
+                            "document_row": document,
+                        }
+                    )
+                    parsed_cache_hits += 1
+                    continue
+
+            try:
+                parsed_document = self._parse_document_for_indexing(file_path)
+            except DocumentParseError:
+                skipped_files += 1
+                continue
+
+            full_content, unit_offsets = self._join_units_with_offsets(
+                parsed_document.units
+            )
+            parsed_docs.append(
+                {
+                    "file_path": file_path,
+                    "relative_path": relative_path,
+                    "doc_id": doc_id,
+                    "file_sha256": file_sha256,
+                    "content": full_content,
+                    "parsed_document": parsed_document,
+                    "from_cache": False,
+                    "unit_offsets": unit_offsets,
+                    "document_row": document,
+                }
+            )
+
+        metadata_map = self._extract_metadata_batch(
+            parsed_docs=[
+                (item["file_path"], item["relative_path"], item["content"])
+                for item in parsed_docs
+            ],
+            root_path=corpus_id,
+            schema_def=schema_def,
+            with_langextract=effective_with_metadata,
+            langextract_profile=effective_profile,
+        )
+
+        indexed_files = 0
+        chunks_written = 0
+        all_chunk_records: list[ChunkRecord] = []
+        parsed_pages_updated = 0
+        image_placeholders_written = 0
+
+        for item in parsed_docs:
+            file_path = str(item["file_path"])
+            relative_path = str(item["relative_path"])
+            doc_id = str(item["doc_id"])
+            content = str(item["content"])
+            parsed_document = item["parsed_document"]
+            unit_offsets = list(item.get("unit_offsets") or [])
+            document_row = dict(item["document_row"])
+            chunks = self.chunker.chunk_text(content)
+            metadata = metadata_map.get(relative_path, {})
+            metadata_json = json.dumps(metadata, sort_keys=True)
+
+            stat = os.stat(file_path)
+            doc_record = DocumentRecord(
+                id=doc_id,
+                corpus_id=corpus_id,
+                relative_path=relative_path,
+                absolute_path=str(Path(file_path).resolve()),
+                content=content,
+                metadata_json=metadata_json,
+                file_mtime=float(stat.st_mtime),
+                file_size=int(stat.st_size),
+                content_sha256=str(item["file_sha256"]),
+                original_filename=str(
+                    document_row.get("original_filename") or relative_path
+                ),
+                object_key=str(document_row.get("object_key") or ""),
+                storage_uri=str(document_row.get("storage_uri") or ""),
+                content_type=document_row.get("content_type"),
+                upload_status="indexed",
+            )
+
+            chunk_records: list[ChunkRecord] = []
+            for chunk in chunks:
+                chunk_records.append(
+                    ChunkRecord(
+                        id=PostgresStorage.make_chunk_id(
+                            doc_id,
+                            chunk.position,
+                            chunk.start_char,
+                            chunk.end_char,
+                        ),
+                        doc_id=doc_id,
+                        text=chunk.text,
+                        position=chunk.position,
+                        source_unit_no=self._pick_chunk_unit_no(
+                            chunk_start=chunk.start_char,
+                            chunk_end=chunk.end_char,
+                            unit_offsets=unit_offsets,
+                        ),
+                        start_char=chunk.start_char,
+                        end_char=chunk.end_char,
+                    )
+                )
+
+            self.storage.upsert_document(doc_record, chunk_records)
+
+            if not bool(item["from_cache"]):
+                unit_records = [
+                    ParsedUnitRecord(
+                        document_id=doc_id,
+                        parser_name=parsed_document.parser_name,
+                        parser_version=parsed_document.parser_version,
+                        page_no=page.page_no,
+                        markdown=page.markdown,
+                        content_hash=page.content_hash,
+                        heading=page.heading,
+                        source_locator=page.source_locator,
+                        images_json=json.dumps(
+                            [
+                                {
+                                    "image_hash": image.image_hash,
+                                    "image_index": image.image_index,
+                                    "mime_type": image.mime_type,
+                                    "width": image.width,
+                                    "height": image.height,
+                                }
+                                for image in page.images
+                            ],
+                            sort_keys=True,
+                        ),
+                    )
+                    for page in parsed_document.pages
+                ]
+                sync_stats = self.storage.sync_parsed_units(
+                    document_id=doc_id,
+                    parser_name=parsed_document.parser_name,
+                    parser_version=parsed_document.parser_version,
+                    units=unit_records,
+                )
+                parsed_pages_updated += int(sync_stats["upserted"])
+
+                image_records = [
+                    ImageSemanticRecord(
+                        image_hash=image.image_hash,
+                        source_document_id=doc_id,
+                        source_page_no=image.page_no,
+                        source_image_index=image.image_index,
+                        mime_type=image.mime_type,
+                        width=image.width,
+                        height=image.height,
+                    )
+                    for page in parsed_document.pages
+                    for image in page.images
+                ]
+                image_placeholders_written += self.storage.upsert_image_semantics(
+                    images=image_records
+                )
+
+            all_chunk_records.extend(chunk_records)
+            indexed_files += 1
+            chunks_written += len(chunk_records)
+
+        embeddings_written = self._generate_and_store_embeddings(
+            corpus_id=corpus_id,
+            all_chunk_records=all_chunk_records,
+        )
+        active_documents = len(
+            self.storage.list_documents(corpus_id=corpus_id, include_deleted=False)
+        )
+
+        return IndexingResult(
+            corpus_id=corpus_id,
+            indexed_files=indexed_files,
+            skipped_files=skipped_files,
+            deleted_files=0,
+            chunks_written=chunks_written,
+            active_documents=active_documents,
+            schema_used=selected_schema_name,
+            embeddings_written=embeddings_written,
+            parsed_cache_hits=parsed_cache_hits,
+            parsed_pages_updated=parsed_pages_updated,
+            image_placeholders_written=image_placeholders_written,
+        )
+
     def _extract_metadata_batch(
         self,
         *,
@@ -357,11 +617,12 @@ class IndexingPipeline:
         return ParsedDocument(
             parser_name="compat_parse_file",
             parser_version=PARSER_VERSION,
-            pages=(
-                ParsedPage(
-                    page_no=1,
+            units=(
+                ParsedUnit(
+                    unit_no=1,
                     markdown=normalized,
                     content_hash=self._sha256(normalized),
+                    source_locator="unit-1",
                 ),
             ),
         )
@@ -376,6 +637,30 @@ class IndexingPipeline:
         with_metadata: bool,
         metadata_profile: dict[str, Any] | None,
     ) -> tuple[dict[str, Any] | None, str | None]:
+        root_exists = os.path.isdir(root)
+        if not root_exists and (discover_schema or with_metadata):
+            fallback_name = schema_name or f"auto_{corpus_id.split('_')[-1]}"
+            if with_metadata:
+                effective_profile = metadata_profile
+                base_schema: dict[str, Any] = {
+                    "name": fallback_name,
+                    "fields": [],
+                }
+                augmented_schema, _ = ensure_langextract_schema_fields(
+                    base_schema,
+                    effective_profile,
+                )
+                if effective_profile is not None:
+                    augmented_schema["metadata_profile"] = effective_profile
+                self.storage.save_schema(
+                    corpus_id=corpus_id,
+                    name=fallback_name,
+                    schema_def=augmented_schema,
+                    is_active=True,
+                )
+                return augmented_schema, fallback_name
+            return None, None
+
         if discover_schema:
             schema_def = SchemaDiscovery().discover_from_folder(
                 root,
@@ -527,6 +812,56 @@ class IndexingPipeline:
             self.storage.create_hnsw_index(corpus_id=corpus_id)
 
         return written
+
+    @staticmethod
+    def _join_units_with_offsets(
+        units: tuple[ParsedUnit, ...],
+    ) -> tuple[str, list[tuple[int, int, int]]]:
+        chunks: list[str] = []
+        offsets: list[tuple[int, int, int]] = []
+        cursor = 0
+        for unit in units:
+            text = unit.markdown.strip()
+            if not text:
+                continue
+            if chunks:
+                cursor += 2
+            start = cursor
+            chunks.append(text)
+            cursor += len(text)
+            offsets.append((unit.unit_no, start, cursor))
+        return "\n\n".join(chunks), offsets
+
+    @staticmethod
+    def _pick_chunk_unit_no(
+        *,
+        chunk_start: int,
+        chunk_end: int,
+        unit_offsets: list[tuple[int, int, int]],
+    ) -> int | None:
+        if not unit_offsets:
+            return None
+
+        best_unit: int | None = None
+        best_overlap = -1
+        best_distance = 10**9
+        for unit_no, unit_start, unit_end in unit_offsets:
+            overlap = max(0, min(chunk_end, unit_end) - max(chunk_start, unit_start))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_unit = unit_no
+                midpoint = (chunk_start + chunk_end) // 2
+                unit_mid = (unit_start + unit_end) // 2
+                best_distance = abs(midpoint - unit_mid)
+                continue
+            if overlap == best_overlap:
+                midpoint = (chunk_start + chunk_end) // 2
+                unit_mid = (unit_start + unit_end) // 2
+                distance = abs(midpoint - unit_mid)
+                if distance < best_distance:
+                    best_unit = unit_no
+                    best_distance = distance
+        return best_unit
 
     @staticmethod
     def _iter_supported_files(root: str) -> list[str]:

@@ -7,14 +7,18 @@ in the filesystem, including normalized page-aware document parsing.
 
 import os
 import re
+import locale
 import glob as glob_module
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .document_parsing import (
     DocumentParseError,
+    ParseSelector,
+    ParsedDocument,
     SUPPORTED_EXTENSIONS,
     parse_document,
+    select_parsed_document,
 )
 
 
@@ -36,7 +40,51 @@ DEFAULT_MAX_WORKERS = 4  # Thread pool size for parallel document scanning
 # =============================================================================
 
 # Cache for parsed documents to avoid re-parsing
-_DOCUMENT_CACHE: dict[str, str] = {}
+_DOCUMENT_CACHE: dict[str, ParsedDocument] = {}
+
+
+def _candidate_text_encodings() -> list[str]:
+    """Return a stable list of text encodings worth trying on local files."""
+    candidates = [
+        "utf-8",
+        "utf-8-sig",
+        locale.getpreferredencoding(False),
+        "cp936",
+        "gbk",
+        "gb18030",
+        "utf-16",
+        "latin-1",
+    ]
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for encoding in candidates:
+        normalized = str(encoding or "").strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def _read_text_with_fallbacks(file_path: str) -> str:
+    """Read text using UTF-8 first, then common Windows fallback encodings."""
+    last_error: UnicodeDecodeError | None = None
+    for encoding in _candidate_text_encodings():
+        try:
+            with open(file_path, "r", encoding=encoding) as handle:
+                return handle.read()
+        except UnicodeDecodeError as exc:
+            last_error = exc
+            continue
+
+    with open(file_path, "rb") as handle:
+        raw = handle.read()
+
+    fallback_encoding = locale.getpreferredencoding(False) or "utf-8"
+    try:
+        return raw.decode(fallback_encoding, errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
 
 
 def clear_document_cache() -> None:
@@ -44,7 +92,7 @@ def clear_document_cache() -> None:
     _DOCUMENT_CACHE.clear()
 
 
-def _get_cached_or_parse(file_path: str) -> str:
+def _get_cached_or_parse(file_path: str) -> ParsedDocument:
     """
     Get document content from cache or parse it.
     
@@ -54,7 +102,7 @@ def _get_cached_or_parse(file_path: str) -> str:
         file_path: Path to the document file.
     
     Returns:
-        The document content as markdown.
+        Parsed document units.
     
     Raises:
         Exception: If the document cannot be parsed.
@@ -63,7 +111,7 @@ def _get_cached_or_parse(file_path: str) -> str:
     cache_key = f"{abs_path}:{os.path.getmtime(abs_path)}"
     
     if cache_key not in _DOCUMENT_CACHE:
-        _DOCUMENT_CACHE[cache_key] = parse_document(file_path).markdown
+        _DOCUMENT_CACHE[cache_key] = parse_document(file_path)
     
     return _DOCUMENT_CACHE[cache_key]
 
@@ -130,9 +178,11 @@ def read_file(file_path: str) -> str:
     """
     if not os.path.exists(file_path) or not os.path.isfile(file_path):
         return f"No such file: {file_path}"
-    
-    with open(file_path, "r") as f:
-        return f.read()
+
+    try:
+        return _read_text_with_fallbacks(file_path)
+    except OSError as exc:
+        return f"Error reading {file_path}: {exc}"
 
 
 def grep_file_content(file_path: str, pattern: str) -> str:
@@ -149,9 +199,11 @@ def grep_file_content(file_path: str, pattern: str) -> str:
     """
     if not os.path.exists(file_path) or not os.path.isfile(file_path):
         return f"No such file: {file_path}"
-    
-    with open(file_path, "r") as f:
-        content = f.read()
+
+    try:
+        content = _read_text_with_fallbacks(file_path)
+    except OSError as exc:
+        return f"Error searching {file_path}: {exc}"
     
     regex = re.compile(pattern=pattern, flags=re.MULTILINE)
     matches = regex.findall(content)
@@ -214,7 +266,8 @@ def preview_file(file_path: str, max_chars: int = DEFAULT_PREVIEW_CHARS) -> str:
         )
 
     try:
-        full_content = _get_cached_or_parse(file_path)
+        parsed = _get_cached_or_parse(file_path)
+        full_content = parsed.markdown
         preview = full_content[:max_chars]
         
         total_len = len(full_content)
@@ -229,9 +282,15 @@ def preview_file(file_path: str, max_chars: int = DEFAULT_PREVIEW_CHARS) -> str:
         return f"Error previewing {file_path}: {e}"
 
 
-def parse_file(file_path: str) -> str:
+def parse_file(
+    file_path: str,
+    focus_hint: str | None = None,
+    anchor: int | None = None,
+    window: int = 1,
+    max_units: int | None = None,
+) -> str:
     """
-    Parse and return the complete content of a document file.
+    Parse and return document content, optionally focused around specific units.
     
     Use this after preview_file() confirms the document is relevant,
     or when you need to find cross-references to other documents.
@@ -255,7 +314,86 @@ def parse_file(file_path: str) -> str:
         )
 
     try:
-        return _get_cached_or_parse(file_path)
+        selector = (
+            ParseSelector(
+                query=focus_hint.strip() if focus_hint else None,
+                anchor=anchor,
+                window=max(window, 0),
+                max_units=max_units,
+            )
+            if (
+                (focus_hint is not None and focus_hint.strip())
+                or anchor is not None
+                or max_units is not None
+            )
+            else None
+        )
+
+        parsed: ParsedDocument | None = None
+        if selector is None or ext != ".pdf":
+            parsed = _get_cached_or_parse(file_path)
+
+        focused = parsed if parsed is not None else ParsedDocument(
+            parser_name="unknown",
+            parser_version="unknown",
+            units=(),
+        )
+        total_units_display: int | str = len(parsed.units) if parsed is not None else "?"
+        if selector is not None:
+            if ext == ".pdf":
+                focused = parse_document(file_path, selector=selector)
+                total_units_display = "?"
+            else:
+                assert parsed is not None
+                focused = select_parsed_document(parsed, selector)
+
+            focused = select_parsed_document(
+                focused,
+                selector,
+            )
+            if not focused.units:
+                # Fallback to progressively wider anchor windows when selector is too narrow.
+                if anchor is not None:
+                    for expand_window in (2, 4, 8):
+                        fallback_selector = ParseSelector(
+                            query=focus_hint.strip() if focus_hint else None,
+                            anchor=anchor,
+                            window=expand_window,
+                            max_units=max_units,
+                        )
+                        focused = (
+                            parse_document(file_path, selector=fallback_selector)
+                            if ext == ".pdf"
+                            else select_parsed_document(parsed, fallback_selector)
+                        )
+                        if focused.units:
+                            break
+                if not focused.units:
+                    if parsed is not None:
+                        focused = parsed
+                    elif ext == ".pdf":
+                        focused = parse_document(file_path)
+                        total_units_display = len(focused.units)
+
+        if focused is parsed:
+            return focused.markdown
+
+        lines: list[str] = [
+            f"=== FOCUSED PARSE of {file_path} ===",
+            (
+                f"Units returned: {len(focused.units)} / {total_units_display} "
+                f"(anchor={anchor}, window={window}, max_units={max_units})"
+            ),
+            "",
+        ]
+        for unit in focused.units:
+            lines.append(
+                f"[UNIT {unit.unit_no} | source={unit.source_locator or f'unit-{unit.unit_no}'}"
+                f" | heading={unit.heading or '-'}]"
+            )
+            lines.append(unit.markdown)
+            lines.append("")
+        return "\n".join(lines).strip()
     except DocumentParseError as exc:
         return f"Error parsing {file_path}: [{exc.code}] {exc.message}"
     except Exception as e:
@@ -279,7 +417,7 @@ def _preview_single_file(file_path: str, preview_chars: int) -> dict:
     """
     filename = os.path.basename(file_path)
     try:
-        content = _get_cached_or_parse(file_path)
+        content = _get_cached_or_parse(file_path).markdown
         preview = content[:preview_chars]
         return {
             "file": file_path,

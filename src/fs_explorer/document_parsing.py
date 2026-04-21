@@ -37,6 +37,9 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
     {".pdf", ".docx", ".doc", ".pptx", ".xlsx", ".html", ".md"}
 )
 
+LOGICAL_UNIT_TARGET_CHARS = 1600
+LOGICAL_UNIT_MIN_CHARS = 450
+
 
 class DocumentParseError(RuntimeError):
     """Raised when a document cannot be parsed into normalized markdown."""
@@ -46,6 +49,17 @@ class DocumentParseError(RuntimeError):
         self.code = code
         self.message = message
         super().__init__(f"{code}: {message}")
+
+
+@dataclass(frozen=True)
+class ParseSelector:
+    """Optional selector used to fetch focused parsed units."""
+
+    unit_nos: tuple[int, ...] | None = None
+    query: str | None = None
+    anchor: int | None = None
+    window: int = 1
+    max_units: int | None = None
 
 
 @dataclass(frozen=True)
@@ -61,43 +75,112 @@ class ParsedImage:
 
 
 @dataclass(frozen=True)
-class ParsedPage:
-    """A normalized parsed page unit."""
+class ParsedUnit:
+    """A normalized parsed unit (page for PDF, logical block for other formats)."""
 
-    page_no: int
+    unit_no: int
     markdown: str
     content_hash: str
+    heading: str | None = None
+    source_locator: str | None = None
     images: tuple[ParsedImage, ...] = ()
 
     @property
     def image_hashes(self) -> tuple[str, ...]:
         return tuple(image.image_hash for image in self.images)
 
+    # Compatibility aliases for existing page-oriented code.
+    @property
+    def page_no(self) -> int:
+        return self.unit_no
+
+    @property
+    def text(self) -> str:
+        return self.markdown
+
 
 @dataclass(frozen=True)
+class ParsedPage:
+    """Backward-compatible page-shaped parsed unit."""
+
+    page_no: int
+    markdown: str
+    content_hash: str
+    heading: str | None = None
+    source_locator: str | None = None
+    images: tuple[ParsedImage, ...] = ()
+
+    @property
+    def unit_no(self) -> int:
+        return self.page_no
+
+    @property
+    def text(self) -> str:
+        return self.markdown
+
+    @property
+    def image_hashes(self) -> tuple[str, ...]:
+        return tuple(image.image_hash for image in self.images)
+
+
+@dataclass(frozen=True, init=False)
 class ParsedDocument:
-    """A parsed document broken into page-like units."""
+    """A parsed document broken into units."""
 
     parser_name: str
     parser_version: str
-    pages: tuple[ParsedPage, ...]
+    units: tuple[ParsedUnit, ...]
+
+    def __init__(
+        self,
+        parser_name: str,
+        parser_version: str,
+        units: tuple[ParsedUnit | ParsedPage, ...] | None = None,
+        pages: tuple[ParsedUnit | ParsedPage, ...] | None = None,
+    ) -> None:
+        raw_units = units if units is not None else pages
+        coerced = tuple(_coerce_unit(item) for item in (raw_units or ()))
+        object.__setattr__(self, "parser_name", parser_name)
+        object.__setattr__(self, "parser_version", parser_version)
+        object.__setattr__(self, "units", coerced)
+
+    @property
+    def pages(self) -> tuple[ParsedUnit, ...]:
+        return self.units
 
     @property
     def markdown(self) -> str:
-        return "\n\n".join(page.markdown for page in self.pages if page.markdown.strip())
+        return "\n\n".join(unit.markdown for unit in self.units if unit.markdown.strip())
 
 
 @dataclass(frozen=True)
 class ParseCacheHit:
-    """A cached parsed document reconstructed from persistent page units."""
+    """A cached parsed document reconstructed from persistent units."""
 
     parser_name: str
     parser_version: str
-    pages: tuple[ParsedPage, ...]
+    units: tuple[ParsedUnit, ...]
+
+    @property
+    def pages(self) -> tuple[ParsedUnit, ...]:
+        return self.units
 
     @property
     def markdown(self) -> str:
-        return "\n\n".join(page.markdown for page in self.pages if page.markdown.strip())
+        return "\n\n".join(unit.markdown for unit in self.units if unit.markdown.strip())
+
+
+def _coerce_unit(item: ParsedUnit | ParsedPage) -> ParsedUnit:
+    if isinstance(item, ParsedUnit):
+        return item
+    return ParsedUnit(
+        unit_no=int(item.page_no),
+        markdown=str(item.markdown),
+        content_hash=str(item.content_hash),
+        heading=item.heading,
+        source_locator=item.source_locator,
+        images=item.images,
+    )
 
 
 class ImageSemanticEnhancer(Protocol):
@@ -124,9 +207,13 @@ def compute_file_sha256(file_path: str) -> str:
     return digest.hexdigest()
 
 
-def parse_document(file_path: str) -> ParsedDocument:
-    """Parse a document into normalized page units."""
+def parse_document(
+    file_path: str,
+    selector: ParseSelector | dict[str, object] | None = None,
+) -> ParsedDocument:
+    """Parse a document into normalized units, optionally selecting a focused subset."""
     resolved = str(Path(file_path).resolve())
+    effective_selector = _coerce_selector(selector)
     if not os.path.exists(resolved) or not os.path.isfile(resolved):
         raise DocumentParseError(
             file_path=resolved,
@@ -146,42 +233,113 @@ def parse_document(file_path: str) -> ParsedDocument:
         )
 
     if ext == ".pdf":
-        return _parse_pdf(resolved)
-    if ext == ".md":
-        return _single_page_document(
+        parsed = _parse_pdf(resolved, selector=effective_selector)
+    elif ext == ".md":
+        parsed = _single_markdown_document(
             parser_name="markdown",
             markdown=_read_text_file(resolved),
         )
-    if ext == ".html":
-        return _single_page_document(
+    elif ext == ".html":
+        parsed = _single_markdown_document(
             parser_name="html",
             markdown=_html_to_markdown(_read_text_file(resolved)),
         )
-    if ext == ".doc":
+    elif ext == ".doc":
         converted = _convert_doc_to_docx(resolved)
         try:
-            return _parse_with_docling(converted, parser_name="libreoffice+docling")
+            parsed = _parse_with_docling(converted, parser_name="libreoffice+docling")
         finally:
             try:
                 Path(converted).unlink(missing_ok=True)
             except OSError:
                 pass
-    return _parse_with_docling(resolved, parser_name="docling")
+    else:
+        parsed = _parse_with_docling(resolved, parser_name="docling")
+
+    return select_parsed_document(parsed, effective_selector)
+
+
+def select_parsed_document(
+    parsed_document: ParsedDocument,
+    selector: ParseSelector | dict[str, object] | None,
+) -> ParsedDocument:
+    """Apply an optional selector to a parsed document."""
+    effective_selector = _coerce_selector(selector)
+    if effective_selector is None:
+        return parsed_document
+
+    units = list(parsed_document.units)
+    if not units:
+        return parsed_document
+
+    score_by_unit = _query_scores(units, effective_selector.query)
+    selected_numbers: set[int] = set()
+
+    if effective_selector.unit_nos:
+        selected_numbers.update(
+            unit_no
+            for unit_no in effective_selector.unit_nos
+            if any(unit.unit_no == unit_no for unit in units)
+        )
+
+    if effective_selector.anchor is not None:
+        window = max(int(effective_selector.window), 0)
+        selected_numbers.update(
+            unit.unit_no
+            for unit in units
+            if abs(unit.unit_no - int(effective_selector.anchor)) <= window
+        )
+
+    if effective_selector.query and score_by_unit:
+        ranked = sorted(
+            score_by_unit.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+        query_pick = max(1, min(4, len(ranked)))
+        selected_numbers.update(unit_no for unit_no, _ in ranked[:query_pick])
+
+    if not selected_numbers:
+        selected_numbers = {unit.unit_no for unit in units}
+
+    selected = [unit for unit in units if unit.unit_no in selected_numbers]
+    if not selected:
+        selected = list(units)
+
+    if effective_selector.max_units is not None and effective_selector.max_units > 0:
+        anchor = effective_selector.anchor
+        selected.sort(
+            key=lambda unit: (
+                abs(unit.unit_no - anchor) if anchor is not None else 0,
+                -score_by_unit.get(unit.unit_no, 0),
+                unit.unit_no,
+            )
+        )
+        selected = selected[: int(effective_selector.max_units)]
+
+    selected.sort(key=lambda unit: unit.unit_no)
+    return ParsedDocument(
+        parser_name=parsed_document.parser_name,
+        parser_version=parsed_document.parser_version,
+        units=tuple(selected),
+    )
 
 
 def reconstruct_parsed_document(units: list[dict[str, object]]) -> ParseCacheHit | None:
-    """Rebuild a parsed document from persisted page units."""
+    """Rebuild a parsed document from persisted units."""
     if not units:
         return None
 
     ordered = sorted(units, key=lambda item: int(item["page_no"]))
     parser_name = str(ordered[0]["parser_name"])
     parser_version = str(ordered[0]["parser_version"])
-    pages = tuple(
-        ParsedPage(
-            page_no=int(unit["page_no"]),
+    rebuilt_units = tuple(
+        ParsedUnit(
+            unit_no=int(unit["page_no"]),
             markdown=str(unit["markdown"]),
             content_hash=str(unit["content_hash"]),
+            heading=_optional_str(unit.get("heading")) or _derive_heading(str(unit["markdown"])),
+            source_locator=_optional_str(unit.get("source_locator"))
+            or f"unit-{int(unit['page_no'])}",
             images=tuple(
                 ParsedImage(
                     image_hash=str(image["image_hash"]),
@@ -199,7 +357,7 @@ def reconstruct_parsed_document(units: list[dict[str, object]]) -> ParseCacheHit
     return ParseCacheHit(
         parser_name=parser_name,
         parser_version=parser_version,
-        pages=pages,
+        units=rebuilt_units,
     )
 
 
@@ -215,6 +373,7 @@ def enhance_page_image_semantics(
     units = storage.list_parsed_units(
         document_id=document_id,
         parser_version=parser_version,
+        unit_nos=[page_no],
     )
     target = next((unit for unit in units if int(unit["page_no"]) == page_no), None)
     if target is None:
@@ -229,8 +388,7 @@ def enhance_page_image_semantics(
     missing_hashes = [
         image_hash
         for image_hash in hashes
-        if image_hash not in semantics
-        or not semantics[image_hash].get("semantic_text")
+        if image_hash not in semantics or not semantics[image_hash].get("semantic_text")
     ]
     if not missing_hashes:
         return 0
@@ -268,17 +426,134 @@ def enhance_page_image_semantics(
     return enhanced
 
 
-def _single_page_document(*, parser_name: str, markdown: str) -> ParsedDocument:
-    normalized = _normalize_markdown(markdown)
-    page = ParsedPage(
-        page_no=1,
-        markdown=normalized,
-        content_hash=_text_sha256(normalized),
+def _coerce_selector(
+    selector: ParseSelector | dict[str, object] | None,
+) -> ParseSelector | None:
+    if selector is None:
+        return None
+    if isinstance(selector, ParseSelector):
+        return selector
+    if not isinstance(selector, dict):
+        return None
+
+    raw_unit_nos = selector.get("unit_nos")
+    unit_nos: tuple[int, ...] | None = None
+    if isinstance(raw_unit_nos, list):
+        cleaned = [int(v) for v in raw_unit_nos if _optional_int(v) is not None]
+        if cleaned:
+            unit_nos = tuple(sorted(set(cleaned)))
+
+    return ParseSelector(
+        unit_nos=unit_nos,
+        query=_optional_str(selector.get("query")),
+        anchor=_optional_int(selector.get("anchor")),
+        window=max(_optional_int(selector.get("window")) or 1, 0),
+        max_units=_optional_int(selector.get("max_units")),
     )
+
+
+def resolve_requested_unit_nos(
+    file_path: str,
+    selector: ParseSelector | dict[str, object] | None,
+) -> list[int] | None:
+    """Resolve the concrete 1-based unit numbers needed for a focused parse."""
+    effective_selector = _coerce_selector(selector)
+    if effective_selector is None:
+        return None
+
+    explicit = _explicit_requested_unit_nos(effective_selector)
+    if explicit:
+        return explicit
+
+    if not effective_selector.query:
+        return None
+
+    if Path(file_path).suffix.lower() != ".pdf" or fitz is None:
+        return None
+
+    max_candidates = max(1, min(int(effective_selector.max_units or 4), 8))
+    try:
+        with fitz.open(file_path) as document:
+            return _query_candidate_pdf_unit_nos(
+                document,
+                query=str(effective_selector.query),
+                max_candidates=max_candidates,
+            )
+    except Exception:
+        return None
+
+
+def _explicit_requested_unit_nos(selector: ParseSelector) -> list[int] | None:
+    requested: set[int] = set()
+    if selector.unit_nos:
+        requested.update(int(unit_no) for unit_no in selector.unit_nos if int(unit_no) > 0)
+    if selector.anchor is not None:
+        window = max(int(selector.window), 0)
+        anchor = int(selector.anchor)
+        requested.update(
+            unit_no for unit_no in range(anchor - window, anchor + window + 1) if unit_no > 0
+        )
+    if not requested:
+        return None
+    return sorted(requested)
+
+
+def _query_terms(query: str | None) -> list[str]:
+    if not query:
+        return []
+    lowered = query.strip().lower()
+    if not lowered:
+        return []
+    terms = re.findall(r"[\u4e00-\u9fff]{2,}|[a-zA-Z0-9_]{3,}", lowered)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        normalized = term.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def _query_scores(units: list[ParsedUnit], query: str | None) -> dict[int, int]:
+    if not query:
+        return {}
+    lowered = query.strip().lower()
+    if not lowered:
+        return {}
+    terms = _query_terms(lowered)
+    scores: dict[int, int] = {}
+    for unit in units:
+        haystack = unit.markdown.lower()
+        score = 0
+        if lowered in haystack:
+            score += 100
+        for term in terms:
+            if term in haystack:
+                score += max(1, min(len(term), 8))
+        if score > 0:
+            scores[unit.unit_no] = score
+    return scores
+
+
+def _single_markdown_document(*, parser_name: str, markdown: str) -> ParsedDocument:
+    units = _logical_units_from_markdown(markdown)
+    if not units:
+        normalized = _normalize_markdown(markdown)
+        units = [
+            ParsedUnit(
+                unit_no=1,
+                markdown=normalized,
+                content_hash=_text_sha256(normalized),
+                heading=_derive_heading(normalized),
+                source_locator="unit-1",
+            )
+        ]
     return ParsedDocument(
         parser_name=parser_name,
         parser_version=PARSER_VERSION,
-        pages=(page,),
+        units=tuple(units),
     )
 
 
@@ -298,33 +573,80 @@ def _parse_with_docling(file_path: str, *, parser_name: str) -> ParsedDocument:
             code="docling_parse_failed",
             message=str(exc),
         ) from exc
-    return _single_page_document(parser_name=parser_name, markdown=markdown)
+    return _single_markdown_document(parser_name=parser_name, markdown=markdown)
 
 
-def _parse_pdf(file_path: str) -> ParsedDocument:
+def _parse_pdf(
+    file_path: str,
+    *,
+    selector: ParseSelector | None = None,
+) -> ParsedDocument:
     chunks: list[tuple[int, str]] = []
     parser_name = "pymupdf4llm"
-    if pymupdf4llm is not None:
-        try:
-            payload = pymupdf4llm.to_markdown(file_path, page_chunks=True)
-            chunks = _extract_pdf_markdown_chunks(payload)
-        except Exception:
-            chunks = []
+    requested_pages = _requested_pdf_pages(selector)
+    document = None
+    try:
+        if fitz is not None:
+            try:
+                document = fitz.open(file_path)
+            except Exception:
+                document = None
+        if document is not None and requested_pages is None and selector is not None and selector.query:
+            candidate_unit_nos = _query_candidate_pdf_unit_nos(
+                document,
+                query=str(selector.query),
+                max_candidates=max(1, min(int(selector.max_units or 4), 8)),
+            )
+            if candidate_unit_nos is not None:
+                requested_pages = [int(unit_no) - 1 for unit_no in candidate_unit_nos]
+        if document is not None and requested_pages is not None:
+            requested_pages = [
+                page_no
+                for page_no in requested_pages
+                if 0 <= page_no < int(document.page_count)
+            ]
+        if requested_pages == []:
+            return ParsedDocument(
+                parser_name=parser_name,
+                parser_version=PARSER_VERSION,
+                units=(),
+            )
 
-    if not chunks and fitz is not None:
-        parser_name = "pymupdf"
-        try:
-            with fitz.open(file_path) as document:
+        if pymupdf4llm is not None:
+            try:
+                payload = pymupdf4llm.to_markdown(
+                    document if document is not None else file_path,
+                    pages=requested_pages,
+                    page_chunks=True,
+                )
+                chunks = _extract_pdf_markdown_chunks(payload)
+            except Exception:
+                chunks = []
+
+        if not chunks and document is not None:
+            parser_name = "pymupdf"
+            try:
+                page_indices = (
+                    requested_pages
+                    if requested_pages is not None
+                    else list(range(int(document.page_count)))
+                )
                 chunks = [
-                    (page.number + 1, page.get_text("markdown"))
-                    for page in document
+                    (
+                        int(page_index) + 1,
+                        document.load_page(int(page_index)).get_text("markdown"),
+                    )
+                    for page_index in page_indices
                 ]
-        except Exception as exc:  # pragma: no cover - exercised through error path
-            raise DocumentParseError(
-                file_path=file_path,
-                code="pdf_parse_failed",
-                message=str(exc),
-            ) from exc
+            except Exception as exc:  # pragma: no cover - exercised through error path
+                raise DocumentParseError(
+                    file_path=file_path,
+                    code="pdf_parse_failed",
+                    message=str(exc),
+                ) from exc
+    finally:
+        if document is not None:
+            document.close()
 
     if not chunks:
         raise DocumentParseError(
@@ -334,7 +656,7 @@ def _parse_pdf(file_path: str) -> ParsedDocument:
         )
 
     cleaned_chunks = _strip_pdf_headers_and_footers(chunks)
-    pages = []
+    units: list[ParsedUnit] = []
     for page_no, markdown in cleaned_chunks:
         normalized = _normalize_markdown(markdown)
         images = tuple(
@@ -348,11 +670,13 @@ def _parse_pdf(file_path: str) -> ParsedDocument:
             )
             for image in _extract_pdf_images(file_path, page_no=page_no)
         )
-        pages.append(
-            ParsedPage(
-                page_no=page_no,
+        units.append(
+            ParsedUnit(
+                unit_no=page_no,
                 markdown=normalized,
                 content_hash=_text_sha256(normalized),
+                heading=_derive_heading(normalized),
+                source_locator=f"page-{page_no}",
                 images=images,
             )
         )
@@ -360,8 +684,112 @@ def _parse_pdf(file_path: str) -> ParsedDocument:
     return ParsedDocument(
         parser_name=parser_name,
         parser_version=PARSER_VERSION,
-        pages=tuple(pages),
+        units=tuple(units),
     )
+
+
+def _requested_pdf_pages(selector: ParseSelector | None) -> list[int] | None:
+    """Translate a focused selector into 0-based PDF page numbers."""
+    if selector is None:
+        return None
+    requested_unit_nos = _explicit_requested_unit_nos(selector)
+    if not requested_unit_nos:
+        return None
+    return sorted(int(unit_no) - 1 for unit_no in requested_unit_nos if int(unit_no) > 0)
+
+
+def _query_candidate_pdf_unit_nos(
+    document,
+    *,
+    query: str,
+    max_candidates: int,
+) -> list[int] | None:
+    lowered = query.strip().lower()
+    if not lowered:
+        return None
+
+    terms = _query_terms(lowered)
+    scored_pages: list[tuple[int, int]] = []
+    for page_index in range(int(document.page_count)):
+        try:
+            haystack = document.load_page(page_index).get_text("text").lower()
+        except Exception:
+            continue
+        score = 0
+        if lowered in haystack:
+            score += 100
+        for term in terms:
+            if term in haystack:
+                score += max(1, min(len(term), 8))
+        if score > 0:
+            scored_pages.append((page_index + 1, score))
+
+    if not scored_pages:
+        return None
+
+    scored_pages.sort(key=lambda item: (-item[1], item[0]))
+    return sorted(page_no for page_no, _ in scored_pages[: max_candidates])
+
+
+def _logical_units_from_markdown(markdown: str) -> list[ParsedUnit]:
+    normalized = _normalize_markdown(markdown)
+    if not normalized:
+        return []
+
+    blocks = [block.strip() for block in re.split(r"\n{2,}", normalized) if block.strip()]
+    if not blocks:
+        return []
+
+    units: list[ParsedUnit] = []
+    current_blocks: list[str] = []
+    current_heading: str | None = None
+    current_len = 0
+    unit_no = 1
+
+    def flush() -> None:
+        nonlocal unit_no, current_blocks, current_heading, current_len
+        if not current_blocks:
+            return
+        text = _normalize_markdown("\n\n".join(current_blocks))
+        units.append(
+            ParsedUnit(
+                unit_no=unit_no,
+                markdown=text,
+                content_hash=_text_sha256(text),
+                heading=current_heading or _derive_heading(text),
+                source_locator=f"unit-{unit_no}",
+            )
+        )
+        unit_no += 1
+        current_blocks = []
+        current_heading = None
+        current_len = 0
+
+    for block in blocks:
+        block_heading = _derive_heading(block)
+        block_is_heading = block.lstrip().startswith("#")
+        block_len = len(block)
+
+        force_heading_boundary = block_is_heading and current_blocks
+        force_size_boundary = (
+            current_blocks
+            and current_len + block_len + 2 > LOGICAL_UNIT_TARGET_CHARS
+            and current_len >= LOGICAL_UNIT_MIN_CHARS
+        )
+        if force_heading_boundary or force_size_boundary:
+            flush()
+
+        if not current_blocks:
+            current_heading = block_heading
+            current_len = 0
+        elif current_heading is None and block_heading is not None:
+            current_heading = block_heading
+
+        current_blocks.append(block)
+        current_len += block_len + (2 if current_len > 0 else 0)
+
+    flush()
+    return units
 
 
 def _extract_pdf_markdown_chunks(payload: object) -> list[tuple[int, str]]:
@@ -425,7 +853,11 @@ def _strip_pdf_headers_and_footers(
             if first_index is not None and trimmed[first_index] in repeated_headers:
                 trimmed[first_index] = ""
             last_index = next(
-                (index for index in range(len(trimmed) - 1, -1, -1) if trimmed[index].strip()),
+                (
+                    index
+                    for index in range(len(trimmed) - 1, -1, -1)
+                    if trimmed[index].strip()
+                ),
                 None,
             )
             if last_index is not None and trimmed[last_index] in repeated_footers:
@@ -548,6 +980,19 @@ def _normalize_markdown(value: str) -> str:
     normalized = "\n".join(lines)
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
     return normalized.strip()
+
+
+def _derive_heading(value: str) -> str | None:
+    for line in value.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip() or None
+    first = value.splitlines()[0].strip() if value.splitlines() else ""
+    if first and len(first) <= 90:
+        return first
+    return None
 
 
 def _text_sha256(value: str) -> str:

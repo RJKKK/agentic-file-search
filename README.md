@@ -1,27 +1,33 @@
 # Agentic File Search
 
-一个面向文档目录问答的 Agent 检索系统。它会先解析本地文档，再把结构化内容、文本分块和检索索引写入 PostgreSQL，随后通过 Agent 工作流完成检索、追踪引用和回答生成。
+面向文档问答与探索的本地应用。当前主产品流程已经从“本地目录问答”切换为“统一上传文档库 + collection + 临时多选文档问答”。
 
-当前主执行路径已经以 `PostgreSQL + pgvector` 为中心，安装和开发流程统一使用系统 Python 直接安装，不使用虚拟环境，也不使用 `uv`。
+## 当前能力
 
-## 功能概览
+- 文档统一上传到共享文档库
+- 上传文件先写入对象存储抽象层
+  - 首版使用本地目录模拟对象存储
+- 问答范围由两部分组成
+  - 一个可选 collection
+  - 若干临时多选文档
+- 搜索、问答、解析、懒索引都只作用于本次选中的文档集合
+- 保留单文档详情、分页解析、metadata 编辑、SSE 会话流
 
-- 支持目录索引、关键词检索、语义检索和基于 Agent 的问答
-- 支持 `PDF / DOCX / DOC / PPTX / XLSX / HTML / Markdown`
-- PDF 解析按页落库，支持页级缓存和图片语义占位缓存
-- FastAPI 提供 Web UI 和 API
-- 保留 CLI 入口，便于本地调试和回归验证
+## 技术栈
+
+- 后端：FastAPI
+- 前端：Vue 3 + Vite
+- 索引存储：当前项目内置 `PostgresStorage` 抽象
+  - 本地测试场景可直接使用文件路径命名空间
+  - 生产可继续接 PostgreSQL / pgvector
+- 对象存储：`LocalBlobStore`
 
 ## 环境要求
 
 - Python 3.10+
-- PostgreSQL 15+，并安装 `pgvector`
-- 可选：LibreOffice
-  - 仅在需要解析 `.doc` 文件时使用，命令需要能找到 `soffice`
+- Node.js 20+
 
-## 直接安装
-
-以下命令默认直接安装到当前系统 Python 环境。
+## 安装
 
 ```bash
 git clone https://github.com/PromtEngineer/agentic-file-search.git
@@ -29,112 +35,130 @@ cd agentic-file-search
 
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install -e .
-```
-
-如果你在中国大陆网络环境下，建议直接使用清华镜像：
-
-```bash
-python -m pip install --upgrade pip setuptools wheel -i https://pypi.tuna.tsinghua.edu.cn/simple
-python -m pip install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple
-```
-
-安装开发依赖：
-
-```bash
 python -m pip install -e ".[dev]"
 ```
 
-## PostgreSQL 准备
-
-项目运行前需要准备数据库，并确保目标库可创建 `vector` 扩展。
-
-```sql
-CREATE DATABASE fs_explorer;
-\c fs_explorer
-CREATE EXTENSION IF NOT EXISTS vector;
-```
-
-默认连接串：
-
-```text
-postgresql://fs_explorer:devpassword@127.0.0.1:5432/fs_explorer
-```
-
-也可以通过环境变量覆盖：
+首次构建前端：
 
 ```bash
-FS_EXPLORER_DB_DSN=postgresql://user:password@127.0.0.1:5432/fs_explorer
+cd frontend
+npm install
+npm run build
+cd ..
 ```
-
-仓库里也提供了 `docker/docker-compose.yml` 作为本地 PostgreSQL/pgvector 的启动参考。
 
 ## 配置
 
 在项目根目录创建 `.env`：
 
 ```bash
-GOOGLE_API_KEY=your_api_key_here
+TEXT_MODEL_NAME=gpt-4o-mini
+TEXT_API_KEY=your_api_key_here
+
+# 可选：向量检索 / 图片语义增强
+# EMBEDDING_MODEL_NAME=text-embedding-3-small
+# EMBEDDING_API_KEY=your_embedding_api_key_here
+# VISION_MODEL_NAME=gpt-4o-mini
+# VISION_API_KEY=your_vision_api_key_here
+
+# 可选：索引数据库
 FS_EXPLORER_DB_DSN=postgresql://fs_explorer:devpassword@127.0.0.1:5432/fs_explorer
+
+# 可选：本地对象存储目录
+FS_EXPLORER_OBJECT_STORE_DIR=data/object_store
 ```
 
-如果需要语义检索或后续视觉增强能力，建议同时准备兼容的模型配置。
+说明：
+
+- `FS_EXPLORER_OBJECT_STORE_DIR` 默认为 `data/object_store`
+- 上传后的原始文件会写入：
+  - `documents/{doc_id}/{sanitized_filename}`
 
 ## 启动方式
 
-### 1. Web UI
+### 推荐：单端口启动前后端
+
+先构建前端：
 
 ```bash
-python -m uvicorn fs_explorer.server:app --host 127.0.0.1 --port 8000
+cd frontend
+npm run build
+cd ..
 ```
 
-浏览器打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。
-
-### 2. CLI
+再启动 FastAPI：
 
 ```bash
-python -m fs_explorer.main --help
+python -c "from fs_explorer.server import run_server; run_server()"
 ```
 
-示例：
+默认访问：
+
+- Web UI: [http://127.0.0.1:8000](http://127.0.0.1:8000)
+- API: `http://127.0.0.1:8000/api/...`
+- SSE: `http://127.0.0.1:8000/api/explore/sessions/{id}/events`
+
+当前开发环境下，前端和后端走同一个端口 `8000`。FastAPI 会优先托管 `frontend/dist/`，因此浏览器只需要访问一个地址。
+
+### 显式指定地址和端口
 
 ```bash
-python -m fs_explorer.main index data/test_acquisition --discover-schema
-python -m fs_explorer.main query --task "Look in data/test_acquisition/. What is the adjusted purchase price?"
+python -c "from fs_explorer.server import run_server; run_server(host='127.0.0.1', port=8000)"
 ```
 
-如果你的环境已经安装了 entry point，也可以直接使用：
+### 可选：直接使用 `uvicorn`
+
+如果你的环境已经能直接调用 `uvicorn`，可以这样启动：
 
 ```bash
-explore --task "Look in data/test_acquisition/. Who is the CTO?"
-explore-ui
+uvicorn --app-dir src fs_explorer.server:app --host 127.0.0.1 --port 8000
 ```
 
-## 开发检查
+README 不再使用 `python -m uvicorn`。
+
+## 当前 UI 工作流
+
+启动后页面分为三栏：
+
+- 左侧：文档库列表、搜索、上传
+- 中间：单文档详情、metadata、分页解析
+- 右侧：collection 管理、临时多选文档、问答面板、SSE 时间线
+
+问答请求体语义：
+
+- `document_ids`
+- `collection_id`
+
+实际作用域为：
+
+- `document_ids ∪ collection.documents`
+
+如果两者都不传，会返回 `400`。
+
+## 常用开发命令
+
+运行后端测试：
 
 ```bash
 python -m pytest
-python -m ruff check .
 ```
 
-## M2 相关实现说明
+仅构建前端：
 
-当前仓库已经开始落地解析链路升级，重点包括：
+```bash
+npm --prefix frontend run build
+```
 
-- PDF 按页解析并清理重复页眉页脚
-- `parsed_units` 表缓存页级 Markdown
-- 基于内容 hash 的重复索引复用
-- `image_semantics` 表缓存图片基础信息，语义字段支持后续懒增强
-- 检索命中相关页时可触发图片语义增强，`get_document` 会展示已缓存语义
-
-这部分仍会继续向 API 和前端状态可视化延伸，详细拆分见 [docs/revamp/IMPLEMENTATION_TASK_BREAKDOWN.md](docs/revamp/IMPLEMENTATION_TASK_BREAKDOWN.md)。
-
-## 目录结构
+## 目录
 
 ```text
+frontend/
 src/fs_explorer/
   agent.py
+  blob_store.py
+  document_cache.py
+  document_library.py
   document_parsing.py
-  fs.py
   server.py
   workflow.py
   indexing/
@@ -142,14 +166,13 @@ src/fs_explorer/
   storage/
 tests/
 docs/revamp/
-docker/
 ```
 
-## 参考文档
+## 参考
 
+- [docs/revamp/IMPLEMENTATION_TASK_BREAKDOWN.md](docs/revamp/IMPLEMENTATION_TASK_BREAKDOWN.md)
 - [ARCHITECTURE.md](ARCHITECTURE.md)
 - [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)
-- [docs/revamp/IMPLEMENTATION_TASK_BREAKDOWN.md](docs/revamp/IMPLEMENTATION_TASK_BREAKDOWN.md)
 
 ## License
 

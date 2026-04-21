@@ -553,7 +553,7 @@ def index_command(
         bool,
         Option(
             "--with-embeddings",
-            help="Generate vector embeddings for indexed chunks (requires GOOGLE_API_KEY).",
+            help="Generate vector embeddings for indexed chunks (requires EMBEDDING_API_KEY or compatible TEXT_API_KEY).",
         ),
     ] = False,
 ) -> None:

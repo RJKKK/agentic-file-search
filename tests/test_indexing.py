@@ -330,7 +330,7 @@ def test_auto_discover_profile_with_mock_llm(
         "parse_file",
         lambda file_path: Path(file_path).read_text(),
     )
-    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    monkeypatch.setenv("TEXT_API_KEY", "fake-key")
 
     llm_response_json = json.dumps(
         {
@@ -392,7 +392,7 @@ def test_auto_discover_profile_falls_back_on_error(
         "parse_file",
         lambda file_path: Path(file_path).read_text(),
     )
-    monkeypatch.setenv("GOOGLE_API_KEY", "fake-key")
+    monkeypatch.setenv("TEXT_API_KEY", "fake-key")
 
     with patch(
         "fs_explorer.indexing.metadata._get_genai_client",
@@ -421,6 +421,8 @@ def test_auto_discover_profile_falls_back_without_api_key(
         "parse_file",
         lambda file_path: Path(file_path).read_text(),
     )
+    monkeypatch.delenv("TEXT_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
 
     profile = auto_discover_profile(str(corpus))

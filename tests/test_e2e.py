@@ -6,8 +6,9 @@ from workflows.testing import WorkflowTestRunner
 
 
 SKIP_IF, SKIP_REASON = (
-    not os.getenv("RUN_REAL_E2E_TESTS") or not os.getenv("GOOGLE_API_KEY"),
-    "Set RUN_REAL_E2E_TESTS=1 and GOOGLE_API_KEY to enable the real end-to-end workflow test.",
+    not os.getenv("RUN_REAL_E2E_TESTS")
+    or not (os.getenv("TEXT_API_KEY") or os.getenv("OPENAI_API_KEY")),
+    "Set RUN_REAL_E2E_TESTS=1 and TEXT_API_KEY/OPENAI_API_KEY to enable the real end-to-end workflow test.",
 )
 
 

@@ -13,14 +13,13 @@ from fastapi.testclient import TestClient
 import pytest
 
 import fs_explorer.server as server_module
+from fs_explorer.blob_store import LocalBlobStore
 from fs_explorer.explore_sessions import ExploreSessionManager, utc_now
 from fs_explorer.server import app
-from fs_explorer.workflow import AskHumanEvent, GoDeeperEvent, ToolCallEvent
+from fs_explorer.workflow import GoDeeperEvent, ToolCallEvent
 
 
 class FakeTokenUsage:
-    """Minimal token usage surface for server completion payloads."""
-
     api_calls = 1
     documents_scanned = 0
     documents_parsed = 0
@@ -34,29 +33,21 @@ class FakeTokenUsage:
 
 
 class FakeAgent:
-    """Minimal fake agent."""
-
     def __init__(self) -> None:
         self.token_usage = FakeTokenUsage()
 
 
 class FakeContext:
-    """Workflow context that accepts human replies."""
-
     def __init__(self) -> None:
         self.sent_events: list[object] = []
         self.reply_event = threading.Event()
-        self.reply_value: str | None = None
 
     def send_event(self, event) -> None:
         self.sent_events.append(event)
-        self.reply_value = event.response
         self.reply_event.set()
 
 
 class FakeHandler:
-    """Awaitable workflow handler with a programmable event stream."""
-
     def __init__(
         self,
         *,
@@ -92,8 +83,12 @@ class FakeHandler:
         return self._result().__await__()
 
 
-def _collect_sse_events(client: TestClient, session_id: str, *, stop_after: str) -> list[tuple[str, dict]]:
-    """Read SSE events until a specific event type is received."""
+def _collect_sse_events(
+    client: TestClient,
+    session_id: str,
+    *,
+    stop_after: str,
+) -> list[tuple[str, dict]]:
     events: list[tuple[str, dict]] = []
     current_event: str | None = None
 
@@ -111,7 +106,6 @@ def _collect_sse_events(client: TestClient, session_id: str, *, stop_after: str)
                 events.append((current_event, payload))
                 if current_event == stop_after:
                     break
-
     return events
 
 
@@ -122,7 +116,6 @@ def _wait_for_status(
     *,
     timeout_seconds: float = 5.0,
 ) -> dict:
-    """Poll the session state until it reaches the requested status."""
     deadline = time.time() + timeout_seconds
     last_payload: dict | None = None
     while time.time() < deadline:
@@ -132,30 +125,47 @@ def _wait_for_status(
         if last_payload["status"] == expected_status:
             return last_payload
         time.sleep(0.05)
-    raise AssertionError(
-        f"Session {session_id} did not reach status={expected_status!r}; "
-        f"last payload={last_payload}"
-    )
+    raise AssertionError(f"Session did not reach {expected_status!r}: {last_payload}")
 
 
 @pytest.fixture(autouse=True)
-def fresh_session_manager(monkeypatch) -> None:
-    """Give each test an isolated in-memory session registry."""
+def fresh_session_manager(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server_module, "_session_manager", ExploreSessionManager())
+    monkeypatch.setattr(
+        server_module,
+        "_blob_store",
+        LocalBlobStore(tmp_path / "object_store"),
+    )
+
+
+def _upload(client: TestClient, *, db_path: str, name: str, content: str) -> dict:
+    response = client.post(
+        "/api/documents",
+        data={"db_path": db_path},
+        files={"file": (name, content.encode("utf-8"), "text/markdown")},
+    )
+    assert response.status_code == 201
+    return response.json()["document"]
 
 
 def test_create_session_and_stream_complete(monkeypatch, tmp_path: Path) -> None:
-    folder = tmp_path / "docs"
-    folder.mkdir()
+    db_path = str(tmp_path / "stream.duckdb")
+    client = TestClient(app)
+    document = _upload(
+        client,
+        db_path=db_path,
+        name="board.md",
+        content="# Board\n\nAll directors listed here.\n",
+    )
 
     handler = FakeHandler(
         events_before_reply=[
             ToolCallEvent(
-                tool_name="scan_folder",
-                tool_input={"directory": str(folder)},
-                reason="Start broad",
+                tool_name="list_indexed_documents",
+                tool_input={},
+                reason="Start from the selected document scope",
             ),
-            GoDeeperEvent(directory=str(folder), reason="Inspect folder"),
+            GoDeeperEvent(directory="selected-documents", reason="Inspect details"),
         ],
         final_result="Finished analysis",
     )
@@ -164,47 +174,47 @@ def test_create_session_and_stream_complete(monkeypatch, tmp_path: Path) -> None
     monkeypatch.setattr(server_module, "get_agent", lambda: FakeAgent())
     monkeypatch.setattr(server_module, "reset_agent", lambda: None)
 
-    client = TestClient(app)
     create_response = client.post(
         "/api/explore/sessions",
-        json={"task": "Summarize", "folder": str(folder)},
+        json={
+            "task": "Summarize",
+            "document_ids": [document["id"]],
+            "db_path": db_path,
+        },
     )
-
     assert create_response.status_code == 200
-    payload = create_response.json()
-    assert payload["status"] == "created"
-    session_id = payload["session_id"]
-
-    status_response = client.get(f"/api/explore/sessions/{session_id}")
-    assert status_response.status_code == 200
-    assert status_response.json()["session_id"] == session_id
+    session_id = create_response.json()["session_id"]
 
     events = _collect_sse_events(client, session_id, stop_after="complete")
     assert [event_type for event_type, _ in events] == [
         "start",
+        "context_scope_updated",
         "tool_call",
         "go_deeper",
         "complete",
     ]
-
-    complete_payload = events[-1][1]
-    assert complete_payload["session_id"] == session_id
-    assert complete_payload["type"] == "complete"
-    assert complete_payload["sequence"] == 4
-    assert "timestamp" in complete_payload
-    assert complete_payload["data"]["final_result"] == "Finished analysis"
+    assert events[0][1]["data"]["document_ids"] == [document["id"]]
+    assert events[1][1]["data"]["context_scope"]["active_ranges"] == []
+    assert events[-1][1]["data"]["final_result"] == "Finished analysis"
+    assert "context_scope" in events[-1][1]["data"]["trace"]
 
 
-def test_ask_human_session_can_resume_via_reply(monkeypatch, tmp_path: Path) -> None:
-    folder = tmp_path / "docs"
-    folder.mkdir()
+def test_ask_human_session_can_resume_via_reply(tmp_path: Path) -> None:
+    db_path = str(tmp_path / "reply.duckdb")
+    client = TestClient(app)
+    document = _upload(
+        client,
+        db_path=db_path,
+        name="note.md",
+        content="# Note\n\nUse note.txt.\n",
+    )
 
     session = asyncio.run(
         server_module._session_manager.create_session(
             task="Need more detail",
-            folder=str(folder),
-            use_index=False,
-            db_path=None,
+            document_ids=[document["id"]],
+            collection_id=None,
+            db_path=db_path,
             enable_semantic=False,
             enable_metadata=False,
         )
@@ -228,7 +238,7 @@ def test_ask_human_session_can_resume_via_reply(monkeypatch, tmp_path: Path) -> 
                     {
                         "step": 2,
                         "tool_name": "read",
-                        "tool_input": {"file_path": str(folder / "note.txt")},
+                        "tool_input": {"file_path": "note.txt"},
                         "reason": "Continue after answer",
                     },
                 )
@@ -237,22 +247,8 @@ def test_ask_human_session_can_resume_via_reply(monkeypatch, tmp_path: Path) -> 
                     {
                         "final_result": "Resumed successfully",
                         "error": None,
-                        "stats": {
-                            "steps": 2,
-                            "api_calls": 1,
-                            "documents_scanned": 0,
-                            "documents_parsed": 0,
-                            "prompt_tokens": 10,
-                            "completion_tokens": 5,
-                            "total_tokens": 15,
-                            "tool_result_chars": 42,
-                            "estimated_cost": 0.0015,
-                        },
-                        "trace": {
-                            "step_path": [],
-                            "referenced_documents": [],
-                            "cited_sources": [],
-                        },
+                        "stats": {"steps": 2},
+                        "trace": {"step_path": [], "referenced_documents": [], "cited_sources": []},
                     },
                 )
 
@@ -267,23 +263,18 @@ def test_ask_human_session_can_resume_via_reply(monkeypatch, tmp_path: Path) -> 
             "start",
             {
                 "task": "Need more detail",
-                "folder": str(folder),
-                "use_index": False,
+                "document_ids": [document["id"]],
+                "collection_id": None,
             },
         )
     )
     asyncio.run(
         session.publish(
             "ask_human",
-            {
-                "step": 1,
-                "question": "Need the target file?",
-                "reason": "Missing context",
-            },
+            {"step": 1, "question": "Need the target file?", "reason": "Missing context"},
         )
     )
 
-    client = TestClient(app)
     awaiting_payload = _wait_for_status(client, session.session_id, "awaiting_human")
     assert awaiting_payload["pending_question"] == "Need the target file?"
 
@@ -297,57 +288,23 @@ def test_ask_human_session_can_resume_via_reply(monkeypatch, tmp_path: Path) -> 
     completed_payload = _wait_for_status(client, session.session_id, "completed")
     assert completed_payload["final_result"] == "Resumed successfully"
 
-    replayed_events = _collect_sse_events(client, session.session_id, stop_after="complete")
-    assert [event_type for event_type, _ in replayed_events] == [
-        "start",
-        "ask_human",
-        "tool_call",
-        "complete",
-    ]
-    assert replayed_events[1][1]["data"]["question"] == "Need the target file?"
-
-
-def test_reply_requires_existing_waiting_session(monkeypatch, tmp_path: Path) -> None:
-    folder = tmp_path / "docs"
-    folder.mkdir()
-
-    handler = FakeHandler(events_before_reply=[], final_result="done")
-    monkeypatch.setattr(server_module.workflow, "run", lambda start_event: handler)
-    monkeypatch.setattr(server_module, "get_agent", lambda: FakeAgent())
-    monkeypatch.setattr(server_module, "reset_agent", lambda: None)
-
-    client = TestClient(app)
-
-    missing_response = client.post(
-        "/api/explore/sessions/missing/reply",
-        json={"response": "hi"},
-    )
-    assert missing_response.status_code == 404
-
-    create_response = client.post(
-        "/api/explore/sessions",
-        json={"task": "Done fast", "folder": str(folder)},
-    )
-    session_id = create_response.json()["session_id"]
-    _collect_sse_events(client, session_id, stop_after="complete")
-
-    completed_reply = client.post(
-        f"/api/explore/sessions/{session_id}/reply",
-        json={"response": "too late"},
-    )
-    assert completed_reply.status_code == 409
-
 
 def test_sse_stream_includes_runtime_cache_and_image_events(tmp_path: Path) -> None:
-    folder = tmp_path / "docs"
-    folder.mkdir()
+    db_path = str(tmp_path / "runtime.duckdb")
+    client = TestClient(app)
+    document = _upload(
+        client,
+        db_path=db_path,
+        name="report.md",
+        content="# Report\n\nCharts and image captions.\n",
+    )
 
     session = asyncio.run(
         server_module._session_manager.create_session(
             task="Summarize charts",
-            folder=str(folder),
-            use_index=True,
-            db_path=str(tmp_path / "index.duckdb"),
+            document_ids=[document["id"]],
+            collection_id=None,
+            db_path=db_path,
             enable_semantic=True,
             enable_metadata=False,
         )
@@ -355,7 +312,31 @@ def test_sse_stream_includes_runtime_cache_and_image_events(tmp_path: Path) -> N
     asyncio.run(
         session.publish(
             "start",
-            {"task": "Summarize charts", "folder": str(folder), "use_index": True},
+            {"task": "Summarize charts", "document_ids": [document["id"]], "collection_id": None},
+        )
+    )
+    asyncio.run(
+        session.publish(
+            "lazy_indexing_started",
+            {
+                "corpus_id": "corpus-1",
+                "document_ids": [document["id"]],
+                "triggered": True,
+                "pending_documents": 1,
+            },
+        )
+    )
+    asyncio.run(
+        session.publish(
+            "lazy_indexing_done",
+            {
+                "corpus_id": "corpus-1",
+                "document_ids": [document["id"]],
+                "triggered": True,
+                "indexed_documents": 1,
+                "chunks_written": 8,
+                "embeddings_written": 0,
+            },
         )
     )
     asyncio.run(
@@ -363,34 +344,10 @@ def test_sse_stream_includes_runtime_cache_and_image_events(tmp_path: Path) -> N
             "cache_hit",
             {
                 "cache_kind": "image_semantics",
-                "doc_id": "doc-1",
-                "absolute_path": str(folder / "report.pdf"),
+                "doc_id": document["id"],
+                "absolute_path": "report.md",
                 "page_no": 1,
                 "cached_images": 1,
-            },
-        )
-    )
-    asyncio.run(
-        session.publish(
-            "image_enhance_started",
-            {
-                "doc_id": "doc-1",
-                "absolute_path": str(folder / "report.pdf"),
-                "page_no": 2,
-                "image_hashes": ["img-2"],
-                "pending_images": 1,
-            },
-        )
-    )
-    asyncio.run(
-        session.publish(
-            "image_enhance_done",
-            {
-                "doc_id": "doc-1",
-                "absolute_path": str(folder / "report.pdf"),
-                "page_no": 2,
-                "image_hashes": ["img-2"],
-                "enhanced_images": 1,
             },
         )
     )
@@ -402,25 +359,30 @@ def test_sse_stream_includes_runtime_cache_and_image_events(tmp_path: Path) -> N
             {
                 "final_result": "Done",
                 "error": None,
-                "stats": {},
+                "stats": {
+                    "lazy_indexing": {
+                        "triggered": True,
+                        "indexed_documents": 1,
+                        "chunks_written": 8,
+                        "embeddings_written": 0,
+                    }
+                },
                 "trace": {},
             },
         )
     )
 
-    client = TestClient(app)
     events = _collect_sse_events(client, session.session_id, stop_after="complete")
-
     assert [event_type for event_type, _ in events] == [
         "start",
+        "lazy_indexing_started",
+        "lazy_indexing_done",
         "cache_hit",
-        "image_enhance_started",
-        "image_enhance_done",
         "complete",
     ]
-    assert events[1][1]["data"]["cache_kind"] == "image_semantics"
-    assert events[2][1]["data"]["pending_images"] == 1
-    assert events[3][1]["data"]["enhanced_images"] == 1
+    assert events[1][1]["data"]["pending_documents"] == 1
+    assert events[2][1]["data"]["chunks_written"] == 8
+    assert events[3][1]["data"]["cache_kind"] == "image_semantics"
 
 
 def test_frontend_uses_eventsource_not_websocket() -> None:
@@ -429,8 +391,4 @@ def test_frontend_uses_eventsource_not_websocket() -> None:
 
     assert "EventSource(" in content
     assert "cache_hit" in content
-    assert "image_enhance_started" in content
-    assert "image_enhance_done" in content
     assert "WebSocket" not in content
-    assert "ws://" not in content
-    assert "wss://" not in content

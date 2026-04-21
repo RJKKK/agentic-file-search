@@ -1,8 +1,5 @@
 """
-Embedding provider for vector-based semantic search.
-
-Wraps the Google GenAI embedding API for batch and single-query embedding
-with configurable model, dimensions, and batch size.
+Embedding provider for OpenAI-compatible semantic search.
 """
 
 from __future__ import annotations
@@ -10,45 +7,80 @@ from __future__ import annotations
 import os
 from typing import Any
 
-_DEFAULT_MODEL = "gemini-embedding-001"
+from openai import OpenAI
+
+from .model_config import resolve_embedding_config
+
 _DEFAULT_DIM = 768
 _DEFAULT_BATCH_SIZE = 50
 
 
 class EmbeddingProvider:
-    """Generate text embeddings via Google GenAI."""
+    """Generate text embeddings via an OpenAI-compatible embeddings API."""
 
     def __init__(
         self,
         *,
         api_key: str | None = None,
         model: str | None = None,
+        base_url: str | None = None,
         dim: int | None = None,
         batch_size: int | None = None,
         client: Any | None = None,
     ) -> None:
-        self.model = model or os.getenv("FS_EXPLORER_EMBEDDING_MODEL", _DEFAULT_MODEL)
-        self.dim = dim or int(os.getenv("FS_EXPLORER_EMBEDDING_DIM", str(_DEFAULT_DIM)))
+        config = resolve_embedding_config(
+            api_key=api_key,
+            model_name=model,
+            base_url=base_url,
+        )
+        self.model = config.model_name
+        self.base_url = config.base_url
+        self.dim = dim or int(os.getenv("EMBEDDING_DIM", os.getenv("FS_EXPLORER_EMBEDDING_DIM", str(_DEFAULT_DIM))))
         self.batch_size = batch_size or int(
-            os.getenv("FS_EXPLORER_EMBEDDING_BATCH_SIZE", str(_DEFAULT_BATCH_SIZE))
+            os.getenv(
+                "EMBEDDING_BATCH_SIZE",
+                os.getenv("FS_EXPLORER_EMBEDDING_BATCH_SIZE", str(_DEFAULT_BATCH_SIZE)),
+            )
         )
 
         if client is not None:
             self._client = client
         else:
-            resolved_key = api_key or os.getenv("GOOGLE_API_KEY")
-            if resolved_key is None:
+            if config.api_key is None:
                 raise ValueError(
-                    "GOOGLE_API_KEY not found. "
-                    "Provide api_key or set the environment variable."
+                    "Embedding model is not configured. Set EMBEDDING_API_KEY "
+                    "(or TEXT_API_KEY / OPENAI_API_KEY) and optionally EMBEDDING_BASE_URL."
                 )
-            try:
-                from google.genai import Client as GenAIClient
-            except ImportError as exc:  # pragma: no cover - depends on local env
-                raise ValueError(
-                    "google-genai is not installed. Run `python -m pip install -e .` first."
-                ) from exc
-            self._client = GenAIClient(api_key=resolved_key)
+            client_kwargs = {"api_key": config.api_key}
+            if config.base_url:
+                client_kwargs["base_url"] = config.base_url
+            self._client = OpenAI(**client_kwargs)
+
+    def _embed_with_legacy_client(
+        self,
+        texts: list[str],
+        *,
+        task_type: str,
+    ) -> list[list[float]]:
+        result = self._client.models.embed_content(
+            model=self.model,
+            contents=texts,
+            config={
+                "task_type": task_type,
+                "output_dimensionality": self.dim,
+            },
+        )
+        return [list(emb.values) for emb in result.embeddings]
+
+    def _embed_with_openai_client(self, texts: list[str]) -> list[list[float]]:
+        request: dict[str, Any] = {
+            "model": self.model,
+            "input": texts,
+        }
+        if self.dim:
+            request["dimensions"] = self.dim
+        response = self._client.embeddings.create(**request)
+        return [list(item.embedding) for item in response.data]
 
     def embed_texts(
         self,
@@ -56,33 +88,18 @@ class EmbeddingProvider:
         *,
         task_type: str = "RETRIEVAL_DOCUMENT",
     ) -> list[list[float]]:
-        """Embed a list of texts in batches.
-
-        Returns a list of embedding vectors in the same order as *texts*.
-        """
+        """Embed a list of texts in batches."""
         all_embeddings: list[list[float]] = []
         for start in range(0, len(texts), self.batch_size):
             batch = texts[start : start + self.batch_size]
-            result = self._client.models.embed_content(
-                model=self.model,
-                contents=batch,
-                config={
-                    "task_type": task_type,
-                    "output_dimensionality": self.dim,
-                },
-            )
-            for emb in result.embeddings:
-                all_embeddings.append(list(emb.values))
+            if hasattr(self._client, "models") and hasattr(self._client.models, "embed_content"):
+                batch_embeddings = self._embed_with_legacy_client(batch, task_type=task_type)
+            else:
+                batch_embeddings = self._embed_with_openai_client(batch)
+            all_embeddings.extend(batch_embeddings)
         return all_embeddings
 
     def embed_query(self, query: str) -> list[float]:
         """Embed a single query text for retrieval."""
-        result = self._client.models.embed_content(
-            model=self.model,
-            contents=[query],
-            config={
-                "task_type": "RETRIEVAL_QUERY",
-                "output_dimensionality": self.dim,
-            },
-        )
-        return list(result.embeddings[0].values)
+        embeddings = self.embed_texts([query], task_type="RETRIEVAL_QUERY")
+        return embeddings[0]

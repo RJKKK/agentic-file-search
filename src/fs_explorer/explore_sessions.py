@@ -48,8 +48,8 @@ class ExploreSession:
 
     session_id: str
     task: str
-    folder: str
-    use_index: bool
+    document_ids: list[str]
+    collection_id: str | None
     db_path: str | None
     enable_semantic: bool
     enable_metadata: bool
@@ -57,6 +57,17 @@ class ExploreSession:
     pending_question: str | None = None
     final_result: str | None = None
     error: str | None = None
+    last_focus_anchor: dict[str, Any] | None = None
+    context_budget_stats: dict[str, Any] = field(default_factory=dict)
+    context_state_snapshot: dict[str, Any] = field(default_factory=dict)
+    lazy_indexing_stats: dict[str, Any] = field(
+        default_factory=lambda: {
+            "triggered": False,
+            "indexed_documents": 0,
+            "chunks_written": 0,
+            "embeddings_written": 0,
+        }
+    )
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
     history: list[ExploreStreamEvent] = field(default_factory=list)
@@ -75,9 +86,13 @@ class ExploreSession:
             "pending_question": self.pending_question,
             "final_result": self.final_result,
             "error": self.error,
+            "last_focus_anchor": self.last_focus_anchor,
+            "context_budget_stats": self.context_budget_stats,
+            "context_state_snapshot": self.context_state_snapshot,
+            "lazy_indexing_stats": self.lazy_indexing_stats,
             "task": self.task,
-            "folder": self.folder,
-            "use_index": self.use_index,
+            "document_ids": list(self.document_ids),
+            "collection_id": self.collection_id,
             "db_path": self.db_path,
             "enable_semantic": self.enable_semantic,
             "enable_metadata": self.enable_metadata,
@@ -120,8 +135,8 @@ class ExploreSessionManager:
         self,
         *,
         task: str,
-        folder: str,
-        use_index: bool,
+        document_ids: list[str],
+        collection_id: str | None,
         db_path: str | None,
         enable_semantic: bool,
         enable_metadata: bool,
@@ -131,8 +146,8 @@ class ExploreSessionManager:
         session = ExploreSession(
             session_id=uuid4().hex,
             task=task,
-            folder=folder,
-            use_index=use_index,
+            document_ids=list(document_ids),
+            collection_id=collection_id,
             db_path=db_path,
             enable_semantic=enable_semantic,
             enable_metadata=enable_metadata,

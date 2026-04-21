@@ -2,10 +2,10 @@
 
 import pytest
 import os
+from types import SimpleNamespace
+from pathlib import Path
 
 from unittest.mock import patch
-from google.genai import Client as GenAIClient
-from google.genai.types import HttpOptions
 
 import fs_explorer.agent as agent_module
 from fs_explorer.agent import (
@@ -13,6 +13,7 @@ from fs_explorer.agent import (
     SYSTEM_PROMPT,
     TokenUsage,
     _build_system_prompt,
+    _parse_action_response,
     get_document,
     semantic_search,
     set_search_flags,
@@ -21,7 +22,8 @@ from fs_explorer.agent import (
     get_search_flags,
     clear_index_context,
 )
-from fs_explorer.models import Action, StopAction
+from fs_explorer.models import Action, StopAction, ToolCallAction
+from google.genai.types import Content, Part
 from fs_explorer.storage import (
     ChunkRecord,
     DocumentRecord,
@@ -32,38 +34,72 @@ from fs_explorer.storage import (
 from .conftest import MockGenAIClient
 
 
+def _mock_action_response(text: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        text=text,
+        candidates=[
+            SimpleNamespace(
+                content=Content(role="model", parts=[Part.from_text(text=text)])
+            )
+        ],
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=10,
+            candidates_token_count=5,
+            total_token_count=15,
+        ),
+    )
+
+
+class _SequenceModels:
+    def __init__(self, texts: list[str]) -> None:
+        self._texts = list(texts)
+        self.calls = 0
+
+    async def generate_content(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        self.calls += 1
+        if not self._texts:
+            raise AssertionError("No more mock model responses configured")
+        return _mock_action_response(self._texts.pop(0))
+
+
+class _SequenceClient:
+    def __init__(self, texts: list[str]) -> None:
+        self.aio = SimpleNamespace(models=_SequenceModels(texts))
+
+
 class TestAgentInitialization:
     """Tests for agent initialization."""
     
-    @patch.dict(os.environ, {"GOOGLE_API_KEY": "test-api-key"})
+    @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
     def test_agent_init_with_env_key(self) -> None:
         """Test agent initialization with API key from environment."""
         agent = FsExplorerAgent()
-        assert isinstance(agent._client, GenAIClient)
+        assert hasattr(agent._client, "aio")
         assert len(agent._chat_history) == 0  # No system prompt in history
         assert isinstance(agent.token_usage, TokenUsage)
 
     def test_agent_init_with_explicit_key(self) -> None:
         """Test agent initialization with explicit API key."""
         agent = FsExplorerAgent(api_key="explicit-test-key")
-        assert isinstance(agent._client, GenAIClient)
+        assert hasattr(agent._client, "aio")
 
     def test_agent_init_without_key_raises(self) -> None:
         """Test that initialization without API key raises ValueError."""
         # Ensure no key in environment
         env = os.environ.copy()
-        if "GOOGLE_API_KEY" in env:
-            del env["GOOGLE_API_KEY"]
+        env.pop("TEXT_API_KEY", None)
+        env.pop("OPENAI_API_KEY", None)
+        env.pop("GOOGLE_API_KEY", None)
         
         with patch.dict(os.environ, env, clear=True):
-            with pytest.raises(ValueError, match="GOOGLE_API_KEY not found"):
+            with pytest.raises(ValueError, match="Text model is not configured"):
                 FsExplorerAgent()
 
 
 class TestAgentConfiguration:
     """Tests for agent task configuration."""
     
-    @patch.dict(os.environ, {"GOOGLE_API_KEY": "test-api-key"})
+    @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
     def test_configure_task_adds_to_history(self) -> None:
         """Test that configure_task adds message to chat history."""
         agent = FsExplorerAgent()
@@ -73,7 +109,7 @@ class TestAgentConfiguration:
         assert agent._chat_history[0].role == "user"
         assert agent._chat_history[0].parts[0].text == "this is a task"
 
-    @patch.dict(os.environ, {"GOOGLE_API_KEY": "test-api-key"})
+    @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
     def test_multiple_configure_task_calls(self) -> None:
         """Test that multiple configure_task calls accumulate."""
         agent = FsExplorerAgent()
@@ -89,15 +125,12 @@ class TestAgentActions:
     """Tests for agent action handling."""
     
     @pytest.mark.asyncio
-    @patch.dict(os.environ, {"GOOGLE_API_KEY": "test-api-key"})
+    @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
     async def test_take_action_returns_action(self) -> None:
         """Test that take_action returns an action from the model."""
         agent = FsExplorerAgent()
         agent.configure_task("this is a task")
-        agent._client = MockGenAIClient(
-            api_key="test", 
-            http_options=HttpOptions(api_version="v1beta")
-        )
+        agent._client = MockGenAIClient()
         
         result = await agent.take_action()
         
@@ -109,7 +142,7 @@ class TestAgentActions:
         assert action.reason == "I am done"
         assert action_type == "stop"
 
-    @patch.dict(os.environ, {"GOOGLE_API_KEY": "test-api-key"})
+    @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
     def test_reset_clears_history(self) -> None:
         """Test that reset clears chat history and token usage."""
         agent = FsExplorerAgent()
@@ -120,6 +153,167 @@ class TestAgentActions:
         
         assert len(agent._chat_history) == 0
         assert agent.token_usage.api_calls == 0
+
+    def test_parse_action_response_accepts_fenced_json(self) -> None:
+        raw = """
+我先整理一下。
+
+```json
+{"action":{"final_result":"董事会成员有 Alice 和 Bob。"},"reason":"已经找到答案"}
+```
+"""
+        action = _parse_action_response(raw)
+
+        assert action is not None
+        assert isinstance(action, Action)
+        assert isinstance(action.action, StopAction)
+        assert action.action.final_result == "董事会成员有 Alice 和 Bob。"
+
+    def test_parse_action_response_accepts_compact_tool_json(self) -> None:
+        raw = """
+{
+  "action": "semantic_search",
+  "parameters": {
+    "query": "董事会成员名单 董事 监事 高级管理人员",
+    "filters": null,
+    "limit": 10
+  },
+  "reason": "先定位相关章节"
+}
+"""
+        action = _parse_action_response(raw)
+
+        assert action is not None
+        assert isinstance(action.action, ToolCallAction)
+        assert action.action.tool_name == "semantic_search"
+        assert action.action.to_fn_args() == {
+            "query": "董事会成员名单 董事 监事 高级管理人员",
+            "filters": None,
+            "limit": 10,
+        }
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
+    async def test_take_action_accepts_compact_tool_json(self) -> None:
+        agent = FsExplorerAgent()
+        agent.configure_task("请输出所有董事会成员")
+        agent._client = _SequenceClient(
+            [
+                '{"action":"semantic_search","parameters":{"query":"董事会成员名单","limit":10},"reason":"先查找相关章节"}',
+            ]
+        )
+
+        result = await agent.take_action()
+
+        assert result is not None
+        action, action_type = result
+        assert action_type == "toolcall"
+        assert isinstance(action.action, ToolCallAction)
+        assert action.action.tool_name == "semantic_search"
+        assert action.action.to_fn_args() == {
+            "query": "董事会成员名单",
+            "limit": 10,
+        }
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
+    async def test_take_action_repairs_non_json_reply(self) -> None:
+        agent = FsExplorerAgent()
+        agent.configure_task("请输出所有董事会成员")
+        agent._client = _SequenceClient(
+            [
+                "我来分析一下这个问题，然后去目录里查找相关信息。",
+                '{"action":{"final_result":"董事会成员包括 Alice、Bob。"},"reason":"修复为合法 JSON"}',
+            ]
+        )
+
+        result = await agent.take_action()
+
+        assert result is not None
+        action, action_type = result
+        assert action_type == "stop"
+        assert isinstance(action.action, StopAction)
+        assert action.action.final_result == "董事会成员包括 Alice、Bob。"
+        assert agent._client.aio.models.calls == 2
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
+    async def test_take_action_falls_back_to_stop_for_unstructured_text(self) -> None:
+        raw_text = "我来分析一下这个目录，并输出所有董事会成员。"
+        agent = FsExplorerAgent()
+        agent.configure_task("请输出所有董事会成员")
+        agent._client = _SequenceClient([raw_text, raw_text])
+
+        result = await agent.take_action()
+
+        assert result is not None
+        action, action_type = result
+        assert action_type == "stop"
+        assert isinstance(action.action, StopAction)
+        assert action.action.final_result == raw_text
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
+    async def test_take_action_blocks_repeated_identical_toolcall(self) -> None:
+        repeated_tool = (
+            '{"action":{"tool_name":"glob","tool_input":'
+            '[{"parameter_name":"directory","parameter_value":"tests"},'
+            '{"parameter_name":"pattern","parameter_value":"*.py"}]},'
+            '"reason":"Search the test directory"}'
+        )
+        stop_after_guard = (
+            '{"action":{"final_result":"Best-effort answer after avoiding a loop."},'
+            '"reason":"Changed strategy after the loop guard warning."}'
+        )
+
+        agent = FsExplorerAgent()
+        agent.configure_task("Avoid repeating the same tool call")
+        agent._client = _SequenceClient(
+            [
+                repeated_tool,
+                repeated_tool,
+                stop_after_guard,
+            ]
+        )
+
+        first_result = await agent.take_action()
+        assert first_result is not None
+        assert first_result[1] == "toolcall"
+
+        second_result = await agent.take_action()
+        assert second_result is not None
+        action, action_type = second_result
+        assert action_type == "stop"
+        assert isinstance(action.action, StopAction)
+        assert action.action.final_result == "Best-effort answer after avoiding a loop."
+        assert agent._client.aio.models.calls == 3
+
+    @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
+    def test_parse_file_auto_anchor_is_consumed_after_one_default(self) -> None:
+        agent = FsExplorerAgent()
+        captured_inputs: list[dict[str, object]] = []
+
+        def fake_parse_file_with_cache(**kwargs):  # noqa: ANN003
+            captured_inputs.append(dict(kwargs))
+            return "focused parse"
+
+        agent._parse_file_with_cache = fake_parse_file_with_cache  # type: ignore[method-assign]
+        agent_module._LAST_FOCUS_ANCHOR_VAR.set(
+            {
+                "doc_id": "doc-1",
+                "absolute_path": str(Path("report.pdf").resolve()),
+                "source_unit_no": 48,
+                "query": "董事会成员",
+                "auto_inject_allowed": True,
+            }
+        )
+
+        agent.call_tool("parse_file", {"file_path": str(Path("report.pdf").resolve())})
+        agent.call_tool("parse_file", {"file_path": str(Path("report.pdf").resolve())})
+
+        assert captured_inputs[0]["anchor"] == 48
+        assert captured_inputs[0]["focus_hint"] == "董事会成员"
+        assert "anchor" not in captured_inputs[1]
 
 
 class TestTokenUsage:
@@ -229,7 +423,7 @@ class TestSearchFlags:
         prompt = _build_system_prompt(True, True)
         assert "Semantic + Metadata" in prompt
 
-    @patch.dict(os.environ, {"GOOGLE_API_KEY": "test-api-key"})
+    @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
     def test_all_tools_always_available(self) -> None:
         """Filesystem and indexed tools are never blocked."""
         set_search_flags(enable_semantic=False, enable_metadata=False)

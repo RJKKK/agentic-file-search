@@ -18,6 +18,7 @@ class RankedDocument:
     text: str
     semantic_score: float
     metadata_score: int
+    source_unit_no: int | None = None
 
     @property
     def combined_score(self) -> float:

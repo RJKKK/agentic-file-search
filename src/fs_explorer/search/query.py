@@ -1,17 +1,38 @@
-"""
-Indexed query helpers for agent tools.
-"""
+"""Indexed query helpers for agent tools."""
 
 from __future__ import annotations
 
+import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from ..embeddings import EmbeddingProvider
+from ..indexing import IndexingPipeline
 from ..storage import PostgresStorage, StorageBackend
 from .filters import MetadataFilter, parse_metadata_filters
 from .ranker import RankedDocument, rank_documents
+
+_LAZY_INDEX_LOCKS: dict[str, threading.Lock] = {}
+
+
+@dataclass(frozen=True)
+class LazyIndexingStats:
+    """Observable stats for on-demand indexing triggered by search."""
+
+    triggered: bool = False
+    indexed_documents: int = 0
+    chunks_written: int = 0
+    embeddings_written: int = 0
+
+    def as_dict(self) -> dict[str, int | bool]:
+        return {
+            "triggered": self.triggered,
+            "indexed_documents": self.indexed_documents,
+            "chunks_written": self.chunks_written,
+            "embeddings_written": self.embeddings_written,
+        }
 
 
 @dataclass(frozen=True)
@@ -22,6 +43,7 @@ class SearchHit:
     relative_path: str
     absolute_path: str
     position: int | None
+    source_unit_no: int | None
     text: str
     semantic_score: float
     metadata_score: int
@@ -36,20 +58,30 @@ class IndexedQueryEngine:
         self,
         storage: StorageBackend,
         embedding_provider: EmbeddingProvider | None = None,
+        runtime_event_callback: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.storage = storage
         self.embedding_provider = embedding_provider
+        self.runtime_event_callback = runtime_event_callback
+        self._last_lazy_indexing_stats = LazyIndexingStats()
 
     def search(
         self,
         *,
         corpus_id: str,
         query: str,
+        document_ids: list[str] | None = None,
         filters: str | None = None,
         limit: int = 5,
         enable_semantic: bool = True,
         enable_metadata: bool = True,
     ) -> list[SearchHit]:
+        self._last_lazy_indexing_stats = LazyIndexingStats()
+        self._ensure_lazy_index_ready(
+            corpus_id=corpus_id,
+            document_ids=document_ids,
+            filters=filters,
+        )
         normalized_limit = max(limit, 1)
         parsed_filters = self._parse_filters(corpus_id=corpus_id, filters=filters)
         semantic_limit = max(normalized_limit * 4, normalized_limit)
@@ -64,6 +96,7 @@ class IndexedQueryEngine:
             semantic_rows, metadata_rows = self._search_parallel(
                 corpus_id=corpus_id,
                 query=query,
+                document_ids=document_ids,
                 metadata_filters=parsed_filters,
                 semantic_limit=semantic_limit,
                 metadata_limit=metadata_limit,
@@ -72,6 +105,7 @@ class IndexedQueryEngine:
             semantic_rows = self._semantic_query(
                 corpus_id=corpus_id,
                 query=query,
+                document_ids=document_ids,
                 limit=semantic_limit,
             )
             metadata_rows = []
@@ -79,6 +113,7 @@ class IndexedQueryEngine:
             semantic_rows = []
             metadata_rows = self._metadata_query(
                 corpus_id=corpus_id,
+                document_ids=document_ids,
                 metadata_filters=parsed_filters,
                 limit=metadata_limit,
             )
@@ -96,6 +131,7 @@ class IndexedQueryEngine:
                 relative_path=doc.relative_path,
                 absolute_path=doc.absolute_path,
                 position=doc.position,
+                source_unit_no=doc.source_unit_no,
                 text=doc.text,
                 semantic_score=doc.semantic_score,
                 metadata_score=doc.metadata_score,
@@ -104,6 +140,10 @@ class IndexedQueryEngine:
             )
             for doc in ranked
         ]
+
+    def get_last_lazy_indexing_stats(self) -> dict[str, int | bool]:
+        """Return lazy-indexing stats for the most recent search call."""
+        return self._last_lazy_indexing_stats.as_dict()
 
     def _parse_filters(
         self, *, corpus_id: str, filters: str | None
@@ -133,6 +173,7 @@ class IndexedQueryEngine:
         *,
         corpus_id: str,
         query: str,
+        document_ids: list[str] | None,
         metadata_filters: list[MetadataFilter],
         semantic_limit: int,
         metadata_limit: int,
@@ -142,11 +183,13 @@ class IndexedQueryEngine:
                 self._semantic_query,
                 corpus_id=corpus_id,
                 query=query,
+                document_ids=document_ids,
                 limit=semantic_limit,
             )
             metadata_future = executor.submit(
                 self._metadata_query,
                 corpus_id=corpus_id,
+                document_ids=document_ids,
                 metadata_filters=metadata_filters,
                 limit=metadata_limit,
             )
@@ -159,6 +202,7 @@ class IndexedQueryEngine:
         *,
         corpus_id: str,
         query: str,
+        document_ids: list[str] | None,
         limit: int,
     ) -> list[dict[str, Any]]:
         scoped_storage, cleanup = self._acquire_query_storage()
@@ -171,11 +215,15 @@ class IndexedQueryEngine:
                     corpus_id=corpus_id,
                     query_embedding=query_embedding,
                     limit=limit,
+                    document_ids=document_ids,
                 )
                 if semantic_rows:
                     return semantic_rows
             return scoped_storage.search_chunks(
-                corpus_id=corpus_id, query=query, limit=limit
+                corpus_id=corpus_id,
+                query=query,
+                limit=limit,
+                document_ids=document_ids,
             )
         finally:
             cleanup()
@@ -184,6 +232,7 @@ class IndexedQueryEngine:
         self,
         *,
         corpus_id: str,
+        document_ids: list[str] | None,
         metadata_filters: list[MetadataFilter],
         limit: int,
     ) -> list[dict[str, Any]]:
@@ -193,9 +242,121 @@ class IndexedQueryEngine:
                 corpus_id=corpus_id,
                 filters=[flt.to_storage_dict() for flt in metadata_filters],
                 limit=limit,
+                document_ids=document_ids,
             )
         finally:
             cleanup()
+
+    def _ensure_lazy_index_ready(
+        self,
+        *,
+        corpus_id: str,
+        document_ids: list[str] | None,
+        filters: str | None,
+    ) -> None:
+        if not isinstance(self.storage, PostgresStorage):
+            return
+
+        active_documents = (
+            self.storage.list_documents_by_ids(
+                doc_ids=document_ids or [],
+                include_deleted=False,
+            )
+            if document_ids
+            else self.storage.list_documents(
+                corpus_id=corpus_id,
+                include_deleted=False,
+            )
+        )
+        if not active_documents:
+            return
+
+        needs_refresh = any(self._document_needs_refresh(document) for document in active_documents)
+        if not needs_refresh:
+            return
+
+        lock_key = ":".join(sorted(str(document["id"]) for document in active_documents))
+        lock = _LAZY_INDEX_LOCKS.setdefault(lock_key, threading.Lock())
+        with lock:
+            writable_storage = PostgresStorage(self.storage.db_path)
+            try:
+                refreshed_docs = writable_storage.list_documents_by_ids(
+                    doc_ids=[str(document["id"]) for document in active_documents],
+                    include_deleted=False,
+                )
+                refreshed_needs_refresh = any(
+                    self._document_needs_refresh(document) for document in refreshed_docs
+                )
+                if not refreshed_needs_refresh:
+                    return
+
+                active_schema = writable_storage.get_active_schema(corpus_id=corpus_id)
+                with_metadata = bool((filters or "").strip())
+                if (
+                    active_schema is not None
+                    and active_schema.schema_def.get("metadata_profile") is not None
+                ):
+                    with_metadata = True
+
+                if self.runtime_event_callback is not None:
+                    self.runtime_event_callback(
+                        "lazy_indexing_started",
+                        {
+                            "corpus_id": corpus_id,
+                            "document_ids": [str(document["id"]) for document in refreshed_docs],
+                            "triggered": True,
+                            "pending_documents": len(refreshed_docs),
+                        },
+                    )
+                pipeline = IndexingPipeline(
+                    storage=writable_storage,
+                    embedding_provider=self.embedding_provider,
+                )
+                result = pipeline.index_documents(
+                    refreshed_docs,
+                    corpus_id=corpus_id,
+                    discover_schema=with_metadata and active_schema is None,
+                    with_metadata=with_metadata,
+                    schema_name=active_schema.name if active_schema is not None else None,
+                )
+                self._last_lazy_indexing_stats = LazyIndexingStats(
+                    triggered=True,
+                    indexed_documents=int(result.indexed_files),
+                    chunks_written=int(result.chunks_written),
+                    embeddings_written=int(result.embeddings_written),
+                )
+                if self.runtime_event_callback is not None:
+                    self.runtime_event_callback(
+                        "lazy_indexing_done",
+                        {
+                            "corpus_id": corpus_id,
+                            "document_ids": [str(document["id"]) for document in refreshed_docs],
+                            **self._last_lazy_indexing_stats.as_dict(),
+                        },
+                    )
+            finally:
+                writable_storage.close()
+
+    @staticmethod
+    def _document_needs_refresh(document: dict[str, Any]) -> bool:
+        indexed_hash = str(document.get("content_sha256", "") or "").strip()
+        if not indexed_hash:
+            return True
+        absolute_path = str(document.get("absolute_path", "") or "")
+        if not absolute_path or not os.path.exists(absolute_path):
+            # Already-indexed documents can still be searched from stored chunks even if
+            # the source file is currently unavailable or not materialized locally.
+            return False
+        try:
+            stat = os.stat(absolute_path)
+        except OSError:
+            return False
+        stored_mtime = float(document.get("file_mtime", 0.0) or 0.0)
+        stored_size = int(document.get("file_size", 0) or 0)
+        return (
+            abs(float(stat.st_mtime) - stored_mtime) > 1e-6
+            or int(stat.st_size) != stored_size
+        )
 
     def _acquire_query_storage(self) -> tuple[StorageBackend, Callable[[], None]]:
         if isinstance(self.storage, PostgresStorage):
@@ -228,6 +389,7 @@ class IndexedQueryEngine:
                     "relative_path": str(row["relative_path"]),
                     "absolute_path": str(row["absolute_path"]),
                     "position": position,
+                    "source_unit_no": row.get("source_unit_no"),
                     "text": str(row["text"]),
                     "semantic_score": 0.0,
                     "metadata_score": 0,
@@ -236,6 +398,7 @@ class IndexedQueryEngine:
             if score > float(entry["semantic_score"]):
                 entry["semantic_score"] = score
                 entry["position"] = position
+                entry["source_unit_no"] = row.get("source_unit_no")
                 entry["text"] = str(row["text"])
 
         for row in metadata_rows:
@@ -247,6 +410,7 @@ class IndexedQueryEngine:
                     "relative_path": str(row["relative_path"]),
                     "absolute_path": str(row["absolute_path"]),
                     "position": None,
+                    "source_unit_no": None,
                     "text": str(row.get("preview_text", "")),
                     "semantic_score": 0.0,
                     "metadata_score": 0,
@@ -270,6 +434,9 @@ class IndexedQueryEngine:
                 text=str(entry["text"]),
                 semantic_score=float(entry["semantic_score"]),
                 metadata_score=int(entry["metadata_score"]),
+                source_unit_no=int(entry["source_unit_no"])
+                if entry["source_unit_no"] is not None
+                else None,
             )
             for entry in merged.values()
         ]

@@ -1,8 +1,5 @@
 """
 Pytest fixtures and mocks for FsExplorer tests.
-
-Provides mock implementations of the Google GenAI client for unit testing
-without making actual API calls.
 """
 
 from google.genai.types import (
@@ -63,7 +60,7 @@ class MockGenAIClient:
     Provides predictable responses for testing without API calls.
     """
     
-    def __init__(self, api_key: str, http_options: HttpOptions) -> None:
+    def __init__(self, api_key: str | None = None, http_options: HttpOptions | None = None) -> None:
         """Initialize mock client (ignores parameters)."""
         pass
 

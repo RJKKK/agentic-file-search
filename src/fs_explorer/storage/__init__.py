@@ -2,6 +2,7 @@
 
 from .base import (
     ChunkRecord,
+    CollectionRecord,
     DocumentRecord,
     ImageSemanticRecord,
     ParsedUnitRecord,
@@ -15,6 +16,7 @@ DuckDBStorage = PostgresStorage
 
 __all__ = [
     "ChunkRecord",
+    "CollectionRecord",
     "DocumentRecord",
     "ParsedUnitRecord",
     "ImageSemanticRecord",

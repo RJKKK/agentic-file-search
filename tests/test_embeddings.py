@@ -108,14 +108,18 @@ def test_env_overrides(monkeypatch) -> None:
 
 
 def test_missing_api_key_raises(monkeypatch) -> None:
+    monkeypatch.delenv("EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("TEXT_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
-    with pytest.raises(ValueError, match="GOOGLE_API_KEY"):
+    with pytest.raises(ValueError, match="Embedding model is not configured"):
         EmbeddingProvider(api_key=None, client=None)
 
 
 @pytest.mark.skipif(
-    not os.getenv("RUN_REAL_EMBEDDING_TESTS") or not os.getenv("GOOGLE_API_KEY"),
-    reason="Set RUN_REAL_EMBEDDING_TESTS=1 and GOOGLE_API_KEY to enable the real embedding test.",
+    not os.getenv("RUN_REAL_EMBEDDING_TESTS")
+    or not (os.getenv("EMBEDDING_API_KEY") or os.getenv("TEXT_API_KEY") or os.getenv("OPENAI_API_KEY")),
+    reason="Set RUN_REAL_EMBEDDING_TESTS=1 and EMBEDDING_API_KEY/TEXT_API_KEY to enable the real embedding test.",
 )
 def test_real_embedding_api() -> None:
     provider = EmbeddingProvider(dim=128)
