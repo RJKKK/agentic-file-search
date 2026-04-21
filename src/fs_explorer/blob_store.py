@@ -46,6 +46,12 @@ class BlobStore(Protocol):
     def head(self, *, object_key: str) -> BlobHead | None:
         """Return blob metadata if present."""
 
+    def delete_prefix(self, *, prefix: str) -> int:
+        """Best-effort delete for all blobs under a prefix."""
+
+    def list_prefix(self, *, prefix: str) -> list[BlobHead]:
+        """List blobs under one prefix."""
+
 
 def resolve_object_store_dir() -> Path:
     """Resolve the configured local object-store root."""
@@ -84,6 +90,15 @@ class LocalBlobStore:
             absolute_path=str(target),
         )
 
+    def _prune_empty_parents(self, start: Path) -> None:
+        current = start
+        while current != self.root_dir:
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            current = current.parent
+
     def put(
         self,
         *,
@@ -110,6 +125,7 @@ class LocalBlobStore:
         if not target.exists():
             return False
         target.unlink(missing_ok=True)
+        self._prune_empty_parents(target.parent)
         return True
 
     def head(self, *, object_key: str) -> BlobHead | None:
@@ -117,3 +133,35 @@ class LocalBlobStore:
         if not target.exists() or not target.is_file():
             return None
         return self._head_for_path(object_key, target)
+
+    def delete_prefix(self, *, prefix: str) -> int:
+        target = self._resolve_key_path(prefix.rstrip("/"))
+        if not target.exists():
+            return 0
+        deleted = 0
+        if target.is_file():
+            target.unlink(missing_ok=True)
+            return 1
+        for child in sorted(target.rglob("*"), reverse=True):
+            if child.is_file():
+                child.unlink(missing_ok=True)
+                deleted += 1
+            elif child.is_dir():
+                child.rmdir()
+        target.rmdir()
+        self._prune_empty_parents(target.parent)
+        return deleted
+
+    def list_prefix(self, *, prefix: str) -> list[BlobHead]:
+        target = self._resolve_key_path(prefix.rstrip("/"))
+        if not target.exists():
+            return []
+        if target.is_file():
+            return [self._head_for_path(prefix.rstrip("/"), target)]
+        results: list[BlobHead] = []
+        for child in sorted(target.rglob("*")):
+            if not child.is_file():
+                continue
+            object_key = str(child.relative_to(self.root_dir)).replace("\\", "/")
+            results.append(self._head_for_path(object_key, child))
+        return results

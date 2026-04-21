@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -32,13 +33,14 @@ from .agent import (
 from .blob_store import LocalBlobStore
 from .document_library import (
     build_document_object_key,
+    build_document_pages_key_prefix,
     ensure_library_corpus,
     get_library_corpus_id,
     materialize_document,
     resolve_document_scope,
 )
-from .document_parsing import PARSER_VERSION, ParseSelector
-from .document_cache import get_or_parse_document_units
+from .document_pages import load_document_pages, page_record_from_manifest
+from .document_parsing import PARSER_VERSION, ParseSelector, compute_file_sha256, parse_document
 from .embeddings import EmbeddingProvider
 from .exploration_trace import ExplorationTrace, extract_cited_sources
 from .explore_sessions import (
@@ -50,8 +52,9 @@ from .explore_sessions import (
 from .index_config import resolve_db_path
 from .indexing import IndexingPipeline
 from .indexing.metadata import auto_discover_profile
-from .search import IndexedQueryEngine
-from .storage import CollectionRecord, DocumentRecord, PostgresStorage
+from .search import MetadataFilterParseError, parse_metadata_filters
+from .storage import CollectionRecord, DocumentPageRecord, DocumentRecord, PostgresStorage
+from .page_store import persist_document_pages, validate_storage_filename
 from .workflow import (
     AskHumanEvent,
     GoDeeperEvent,
@@ -308,18 +311,16 @@ def _parse_metadata_json(raw: str | dict[str, Any] | None) -> dict[str, Any]:
 def _serialize_document_summary(
     document: dict[str, Any],
     *,
-    parsed_units_count: int | None = None,
+    page_count: int | None = None,
 ) -> dict[str, Any]:
     metadata = _parse_metadata_json(document.get("metadata_json"))
-    indexed_hash = str(document.get("content_sha256", "") or "")
-    parsed_hash = document.get("parsed_content_sha256")
-    parsed_complete = bool(document.get("parsed_is_complete", False))
+    resolved_page_count = int(
+        page_count
+        if page_count is not None
+        else document.get("page_count", 0) or 0
+    )
     if bool(document.get("is_deleted", False)):
         status = "deleted"
-    elif indexed_hash:
-        status = "indexed"
-    elif parsed_hash:
-        status = "parsed_complete" if parsed_complete else "parsed_partial"
     else:
         status = str(document.get("upload_status") or "uploaded")
     payload = {
@@ -331,22 +332,25 @@ def _serialize_document_summary(
             document.get("original_filename") or document.get("relative_path") or ""
         ),
         "object_key": str(document.get("object_key") or ""),
+        "source_object_key": str(
+            document.get("source_object_key") or document.get("object_key") or ""
+        ),
+        "pages_prefix": str(document.get("pages_prefix") or ""),
         "storage_uri": str(document.get("storage_uri") or ""),
         "content_type": document.get("content_type"),
         "upload_status": str(document.get("upload_status") or "uploaded"),
+        "page_count": resolved_page_count,
         "file_size": int(document.get("file_size", 0) or 0),
         "file_mtime": float(document.get("file_mtime", 0.0) or 0.0),
-        "content_sha256": indexed_hash,
-        "parsed_content_sha256": parsed_hash,
-        "parsed_is_complete": parsed_complete,
+        "content_sha256": str(document.get("content_sha256", "") or ""),
+        "parsed_content_sha256": document.get("parsed_content_sha256"),
+        "parsed_is_complete": bool(document.get("parsed_is_complete", False)),
         "is_deleted": bool(document.get("is_deleted", False)),
         "status": status,
         "metadata": metadata,
     }
     if "last_indexed_at" in document:
         payload["last_indexed_at"] = document["last_indexed_at"]
-    if parsed_units_count is not None:
-        payload["parsed_units_count"] = int(parsed_units_count)
     return payload
 
 
@@ -360,48 +364,154 @@ def _serialize_collection(collection: CollectionRecord) -> dict[str, Any]:
     }
 
 
-def _serialize_parsed_unit(unit: dict[str, Any]) -> dict[str, Any]:
+def _serialize_document_page(unit: dict[str, Any]) -> dict[str, Any]:
     return {
         "unit_no": int(unit["page_no"]),
         "page_no": int(unit["page_no"]),
-        "parser_name": str(unit["parser_name"]),
-        "parser_version": str(unit["parser_version"]),
         "heading": unit.get("heading"),
         "source_locator": unit.get("source_locator"),
         "content_hash": str(unit["content_hash"]),
         "markdown": str(unit["markdown"]),
-        "images": list(unit.get("images") or []),
+        "char_count": int(unit.get("char_count", 0) or 0),
+        "page_label": str(unit.get("page_label") or unit["page_no"]),
+        "is_synthetic_page": bool(unit.get("is_synthetic_page", False)),
     }
 
 
-def _sync_document_parse(
+def _search_terms(query: str) -> list[str]:
+    normalized = " ".join(str(query or "").split()).strip()
+    if not normalized:
+        return []
+    terms = [normalized.lower()]
+    for token in re.findall(r"[\w\u4e00-\u9fff]{2,}", normalized.lower()):
+        if token not in terms:
+            terms.append(token)
+        if len(terms) >= 8:
+            break
+    return terms
+
+
+def _build_search_snippet(markdown: str, *, match_start: int | None, window: int = 180) -> str:
+    body = str(markdown or "").strip()
+    if not body:
+        return ""
+    if match_start is None:
+        excerpt = body[: window * 2]
+    else:
+        start = max(match_start - window, 0)
+        end = min(match_start + window, len(body))
+        excerpt = body[start:end]
+        if start > 0:
+            excerpt = "..." + excerpt
+        if end < len(body):
+            excerpt = excerpt + "..."
+    return re.sub(r"\s+", " ", excerpt).strip()
+
+
+def _active_filter_fields(storage: PostgresStorage, *, corpus_id: str) -> set[str] | None:
+    active_schema = storage.get_active_schema(corpus_id=corpus_id)
+    if active_schema is None:
+        return None
+    fields = active_schema.schema_def.get("fields")
+    if not isinstance(fields, list):
+        return None
+    allowed: set[str] = set()
+    for field in fields:
+        if isinstance(field, dict) and isinstance(field.get("name"), str):
+            allowed.add(str(field["name"]))
+    return allowed or None
+
+
+def _page_matches_query(
+    *,
+    query: str,
+    markdown: str,
+    heading: str | None,
+) -> tuple[float, int, int | None]:
+    terms = _search_terms(query)
+    if not terms:
+        return 0.0, 0, None
+    body = str(markdown or "")
+    body_lower = body.lower()
+    heading_lower = str(heading or "").lower()
+    score = 0.0
+    match_count = 0
+    first_match_start: int | None = None
+    for index, term in enumerate(terms):
+        matches = list(re.finditer(re.escape(term), body_lower))
+        heading_hits = len(re.findall(re.escape(term), heading_lower))
+        if not matches and heading_hits == 0:
+            continue
+        match_count += len(matches) + heading_hits
+        weight = 12.0 if index == 0 else 3.0
+        score += len(matches) * weight
+        score += heading_hits * (weight + 2.0)
+        if first_match_start is None and matches:
+            first_match_start = matches[0].start()
+    return score, match_count, first_match_start
+
+
+def _sync_document_pages(
     *,
     storage: PostgresStorage,
     document: dict[str, Any],
-    selector: ParseSelector | None = None,
     force: bool,
 ) -> dict[str, Any]:
-    parse_result = get_or_parse_document_units(
-        storage=storage,
-        document=document,
-        blob_store=_blob_store,
-        selector=selector,
-        force=force,
+    source_object_key = str(
+        document.get("source_object_key") or document.get("object_key") or ""
     )
-    refreshed_units = storage.list_parsed_units(
+    if not source_object_key:
+        raise ValueError("Document source object key is missing.")
+    source_path = _blob_store.materialize(object_key=source_object_key)
+    source_hash = compute_file_sha256(source_path)
+    if (
+        not force
+        and str(document.get("parsed_content_sha256") or "") == source_hash
+        and int(document.get("page_count") or 0) > 0
+    ):
+        loaded_pages = load_document_pages(
+            storage=storage,
+            blob_store=_blob_store,
+            document_id=str(document["id"]),
+        )
+        return {
+            "pages": loaded_pages,
+            "page_count": len(loaded_pages),
+            "pages_updated": 0,
+            "from_cache": True,
+        }
+
+    parsed_document = parse_document(source_path)
+    stored_pages = persist_document_pages(
+        blob_store=_blob_store,
         document_id=str(document["id"]),
-        parser_version=PARSER_VERSION,
+        original_filename=str(document.get("original_filename") or document["relative_path"]),
+        content_type=document.get("content_type"),
+        parsed_document=parsed_document,
+        synthetic_pages=Path(source_path).suffix.lower() != ".pdf",
+    )
+    storage.sync_document_pages(
+        document_id=str(document["id"]),
+        pages=[
+            page_record_from_manifest(page, document_id=str(document["id"]))
+            for page in stored_pages
+        ],
+    )
+    storage.update_document_parse_state(
+        doc_id=str(document["id"]),
+        parsed_content_sha256=source_hash,
+        parsed_is_complete=True,
+    )
+    loaded_pages = load_document_pages(
+        storage=storage,
+        blob_store=_blob_store,
+        document_id=str(document["id"]),
     )
     return {
-        "parsed_units": refreshed_units,
-        "selected_units": parse_result.selected_document.units,
-        "selected_total_units": parse_result.total_units,
-        "cache_hits": parse_result.cache_hits,
-        "parsed_units_updated": parse_result.parsed_units_updated,
-        "images_detected": parse_result.images_detected,
-        "search_index_stale": parse_result.search_index_stale,
-        "from_cache": parse_result.from_cache,
-        "parsed_is_complete": parse_result.parsed_is_complete,
+        "pages": loaded_pages,
+        "page_count": len(loaded_pages),
+        "pages_updated": len(stored_pages),
+        "from_cache": False,
     }
 
 
@@ -411,8 +521,24 @@ async def _run_exploration_session(session: ExploreSession) -> None:
     trace = ExplorationTrace(root_directory=str(_PROJECT_ROOT))
     step_number = 0
     loop = asyncio.get_running_loop()
+    candidate_pages: list[dict[str, Any]] = []
+    read_pages: list[dict[str, Any]] = []
+    stale_page_ranges: list[dict[str, Any]] = []
+    page_query_history: list[dict[str, Any]] = []
 
     def runtime_event_callback(event_type: str, data: dict[str, Any]) -> None:
+        if event_type == "candidate_pages_found":
+            candidate_pages.append(dict(data))
+            page_query_history.append(
+                {
+                    "document_id": data.get("document_id"),
+                    "candidate_pages": data.get("candidate_pages", []),
+                }
+            )
+        elif event_type == "pages_read":
+            read_pages.append(dict(data))
+        elif event_type == "stale_page_range_detected":
+            stale_page_ranges.append(dict(data))
         loop.create_task(session.publish(event_type, data))
 
     try:
@@ -435,7 +561,12 @@ async def _run_exploration_session(session: ExploreSession) -> None:
             for document in scope.documents
         ]
         document_names = [
-            str(document.get("original_filename") or document.get("relative_path") or document["id"])
+            (
+                f"{document.get('original_filename') or document.get('relative_path') or document['id']} | "
+                f"source={document.get('absolute_path')} | "
+                f"pages_dir={str((_blob_store.root_dir / str(document.get('pages_prefix') or '')).resolve())} | "
+                f"page_count={int(document.get('page_count') or 0)}"
+            )
             for document in scoped_documents
         ]
         initialize_context_state(
@@ -610,6 +741,8 @@ async def _run_exploration_session(session: ExploreSession) -> None:
                     "context_budget": context_budget_stats,
                     "context_scope": context_state_snapshot.get("context_scope", {}),
                     "lazy_indexing": lazy_indexing_stats,
+                    "candidate_pages": candidate_pages,
+                    "read_pages": read_pages,
                 },
                 "trace": {
                     "step_path": trace.step_path,
@@ -619,6 +752,11 @@ async def _run_exploration_session(session: ExploreSession) -> None:
                     "coverage_by_document": context_state_snapshot.get("coverage_by_document", {}),
                     "compaction_actions": context_state_snapshot.get("compaction_actions", []),
                     "active_ranges": context_state_snapshot.get("context_scope", {}).get("active_ranges", []),
+                    "candidate_pages": candidate_pages,
+                    "read_pages": read_pages,
+                    "active_page_ranges": context_state_snapshot.get("context_scope", {}).get("active_ranges", []),
+                    "stale_page_ranges": stale_page_ranges,
+                    "page_query_history": page_query_history,
                     "promoted_evidence_units": context_state_snapshot.get("promoted_evidence_units", []),
                 },
             },
@@ -809,78 +947,147 @@ async def build_index(request: IndexRequest):
 @app.post("/api/search")
 async def search_index(request: SearchRequest):
     """Search the selected document scope and return ranked hits."""
+    storage: PostgresStorage | None = None
     try:
         resolved_db_path = resolve_db_path(request.db_path)
-        storage = PostgresStorage(resolved_db_path)
+        storage = PostgresStorage(resolved_db_path, read_only=True, initialize=False)
         scope = resolve_document_scope(
             storage=storage,
             document_ids=request.document_ids,
             collection_id=request.collection_id,
         )
         if scope.is_empty:
-            storage.close()
             return JSONResponse(
                 {"error": "At least one document or one collection must be selected."},
                 status_code=400,
             )
-        materialized_scope = [
-            materialize_document(
-                storage=storage,
-                blob_store=_blob_store,
-                document=document,
+        query = str(request.query or "").strip()
+        if not query:
+            return JSONResponse({"error": "Query must not be empty."}, status_code=400)
+
+        parsed_filters = []
+        if request.filters and request.filters.strip():
+            try:
+                parsed_filters = parse_metadata_filters(
+                    request.filters,
+                    allowed_fields=_active_filter_fields(storage, corpus_id=scope.corpus_id),
+                )
+            except MetadataFilterParseError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+
+        metadata_scores: dict[str, int] = {}
+        if parsed_filters:
+            metadata_hits = storage.search_documents_by_metadata(
+                corpus_id=scope.corpus_id,
+                filters=[
+                    {
+                        "field": flt.field,
+                        "operator": flt.operator,
+                        "value": flt.value,
+                    }
+                    for flt in parsed_filters
+                ],
+                limit=max(len(scope.document_ids), max(int(request.limit), 1)),
+                document_ids=scope.document_ids,
             )
+            metadata_scores = {
+                str(item["doc_id"]): int(item.get("metadata_score", len(parsed_filters)) or 0)
+                for item in metadata_hits
+            }
+
+        scoped_documents = [
+            document
             for document in scope.documents
+            if not parsed_filters or str(document["id"]) in metadata_scores
         ]
 
-        embedding_provider: EmbeddingProvider | None = None
-        if storage.has_embeddings(corpus_id=scope.corpus_id):
-            try:
-                embedding_provider = EmbeddingProvider()
-            except ValueError:
-                pass
-
-        engine = IndexedQueryEngine(storage, embedding_provider=embedding_provider)
-        hits = engine.search(
-            corpus_id=scope.corpus_id,
-            query=request.query,
-            document_ids=scope.document_ids,
-            filters=request.filters,
-            limit=request.limit,
-        )
-        storage.close()
-        document_names = {
-            str(document["id"]): str(
+        hits: list[dict[str, Any]] = []
+        normalized_limit = max(int(request.limit), 1)
+        for document in scoped_documents:
+            doc_id = str(document["id"])
+            original_filename = str(
                 document.get("original_filename")
                 or document.get("relative_path")
                 or document["id"]
             )
-            for document in materialized_scope
-        }
+            for page in load_document_pages(
+                storage=storage,
+                blob_store=_blob_store,
+                document_id=doc_id,
+            ):
+                semantic_score, match_count, match_start = _page_matches_query(
+                    query=query,
+                    markdown=str(page.get("markdown") or ""),
+                    heading=page.get("heading"),
+                )
+                if semantic_score <= 0:
+                    continue
+                metadata_score = metadata_scores.get(doc_id, 0)
+                hits.append(
+                    {
+                        "doc_id": doc_id,
+                        "original_filename": original_filename,
+                        "relative_path": str(document.get("relative_path") or original_filename),
+                        "absolute_path": str(page.get("file_path") or document.get("absolute_path") or ""),
+                        "position": int(page["page_no"]),
+                        "source_unit_no": int(page["page_no"]),
+                        "text": _build_search_snippet(
+                            str(page.get("markdown") or ""),
+                            match_start=match_start,
+                        ),
+                        "semantic_score": round(float(semantic_score), 4),
+                        "metadata_score": metadata_score,
+                        "score": round(float(semantic_score + metadata_score), 4),
+                        "matched_by": (
+                            "page_content+metadata"
+                            if metadata_score > 0
+                            else "page_content"
+                        ),
+                        "heading": page.get("heading"),
+                        "match_count": match_count,
+                    }
+                )
 
+        hits.sort(
+            key=lambda item: (
+                -float(item["score"]),
+                -int(item["match_count"]),
+                str(item["original_filename"]).lower(),
+                int(item["source_unit_no"]),
+            )
+        )
         return {
-            "query": request.query,
+            "query": query,
             "document_ids": list(scope.document_ids),
             "collection_id": request.collection_id,
-            "lazy_indexing": engine.get_last_lazy_indexing_stats(),
+            "lazy_indexing": {
+                "triggered": False,
+                "indexed_documents": 0,
+                "chunks_written": 0,
+                "embeddings_written": 0,
+            },
             "hits": [
                 {
-                    "doc_id": hit.doc_id,
-                    "original_filename": document_names.get(hit.doc_id, hit.relative_path),
-                    "relative_path": hit.relative_path,
-                    "absolute_path": hit.absolute_path,
-                    "position": hit.position,
-                    "source_unit_no": hit.source_unit_no,
-                    "text": hit.text,
-                    "semantic_score": hit.semantic_score,
-                    "metadata_score": hit.metadata_score,
-                    "score": hit.score,
-                    "matched_by": hit.matched_by,
+                    "doc_id": hit["doc_id"],
+                    "original_filename": hit["original_filename"],
+                    "relative_path": hit["relative_path"],
+                    "absolute_path": hit["absolute_path"],
+                    "position": hit["position"],
+                    "source_unit_no": hit["source_unit_no"],
+                    "text": hit["text"],
+                    "semantic_score": hit["semantic_score"],
+                    "metadata_score": hit["metadata_score"],
+                    "score": hit["score"],
+                    "matched_by": hit["matched_by"],
                 }
-                for hit in hits
+                for hit in hits[:normalized_limit]
             ],
         }
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
+    finally:
+        if storage is not None:
+            storage.close()
 
 
 @app.get("/api/documents")
@@ -972,15 +1179,18 @@ async def upload_document_api(
     with_metadata: bool = Form(default=False),
     with_embeddings: bool = Form(default=False),
 ):
-    """Upload a document into the shared library without eager parsing or indexing."""
+    """Upload a document into the shared library and materialize page files."""
     trace_id = _make_trace_id()
     _ = (overwrite, discover_schema, with_metadata, with_embeddings)
-    filename = Path(file.filename or "").name
-    if not filename:
+    source_object_key = ""
+    pages_prefix = ""
+    try:
+        filename = validate_storage_filename(file.filename or "")
+    except ValueError as exc:
         return _error_response(
             status_code=400,
-            error_code="missing_filename",
-            message="Uploaded file must include a filename.",
+            error_code="invalid_filename",
+            message=str(exc),
             trace_id=trace_id,
         )
 
@@ -991,31 +1201,65 @@ async def upload_document_api(
             storage = PostgresStorage(resolved_db_path)
             try:
                 corpus_id = ensure_library_corpus(storage)
+                existing = storage.list_documents(corpus_id=corpus_id, include_deleted=False)
+                normalized_filename = filename.casefold()
+                if any(
+                    str(item.get("original_filename") or "").casefold() == normalized_filename
+                    for item in existing
+                ):
+                    return _error_response(
+                        status_code=409,
+                        error_code="duplicate_filename",
+                        message="A document with the same filename already exists.",
+                        trace_id=trace_id,
+                    )
                 doc_id = uuid4().hex
-                object_key = build_document_object_key(doc_id, filename)
-                blob_head = _blob_store.put(object_key=object_key, data=file.file)
+                source_object_key = build_document_object_key(doc_id, filename)
+                pages_prefix = build_document_pages_key_prefix(filename)
+                blob_head = _blob_store.put(object_key=source_object_key, data=file.file)
+                source_hash = compute_file_sha256(blob_head.absolute_path)
+                parsed_document = parse_document(blob_head.absolute_path)
+                stored_pages = persist_document_pages(
+                    blob_store=_blob_store,
+                    document_id=doc_id,
+                    original_filename=filename,
+                    content_type=file.content_type,
+                    parsed_document=parsed_document,
+                    synthetic_pages=Path(blob_head.absolute_path).suffix.lower() != ".pdf",
+                )
                 document_record = DocumentRecord(
                     id=doc_id,
                     corpus_id=corpus_id,
-                    relative_path=object_key,
+                    relative_path=filename,
                     absolute_path=blob_head.absolute_path,
                     content="",
                     metadata_json="{}",
                     file_mtime=float(Path(blob_head.absolute_path).stat().st_mtime),
                     file_size=int(blob_head.size),
-                    content_sha256="",
+                    content_sha256=source_hash,
                     original_filename=filename,
-                    object_key=object_key,
+                    object_key=source_object_key,
+                    source_object_key=source_object_key,
+                    pages_prefix=pages_prefix,
                     storage_uri=blob_head.storage_uri,
                     content_type=file.content_type,
-                    upload_status="uploaded",
+                    upload_status="pages_ready",
+                    page_count=len(stored_pages),
                 )
                 storage.upsert_document_stub(document_record)
-                document = _load_document_or_404(storage=storage, doc_id=doc_id)
-                parsed_units = storage.list_parsed_units(
+                storage.sync_document_pages(
                     document_id=doc_id,
-                    parser_version=PARSER_VERSION,
+                    pages=[
+                        page_record_from_manifest(page, document_id=doc_id)
+                        for page in stored_pages
+                    ],
                 )
+                storage.update_document_parse_state(
+                    doc_id=doc_id,
+                    parsed_content_sha256=source_hash,
+                    parsed_is_complete=True,
+                )
+                document = _load_document_or_404(storage=storage, doc_id=doc_id)
             finally:
                 storage.close()
 
@@ -1023,19 +1267,29 @@ async def upload_document_api(
             {
                 "document": _serialize_document_summary(
                     document,
-                    parsed_units_count=len(parsed_units),
+                    page_count=len(stored_pages),
                 ),
                 "upload_result": {
                     "corpus_id": document["corpus_id"],
                     "storage_uri": document.get("storage_uri"),
-                    "parsed_on_upload": False,
-                    "indexed_on_upload": False,
+                    "pages_generated": len(stored_pages),
+                    "page_count": len(stored_pages),
+                    "page_naming_scheme": "page-0001.md",
                 },
             },
             status_code=201,
             trace_id=trace_id,
         )
     except Exception as exc:
+        # Keep upload atomic from the product perspective: if DB persistence fails
+        # after writing source/pages blobs, clean them up best-effort.
+        try:
+            if pages_prefix:
+                _blob_store.delete_prefix(prefix=pages_prefix)
+            if source_object_key:
+                _blob_store.delete(object_key=source_object_key)
+        except Exception:
+            pass
         return _error_response(
             status_code=500,
             error_code="document_upload_failed",
@@ -1048,38 +1302,37 @@ async def upload_document_api(
 
 @app.get("/api/documents/{doc_id}")
 async def get_document_api(doc_id: str, db_path: str | None = None):
-    """Return detail for one indexed document, including parse summary."""
+    """Return detail for one indexed document, including page summary."""
     trace_id = _make_trace_id()
     try:
         resolved_db_path = resolve_db_path(db_path)
         storage = PostgresStorage(resolved_db_path, read_only=True, initialize=False)
         try:
             document = _load_document_or_404(storage=storage, doc_id=doc_id)
-            parsed_units = storage.list_parsed_units(
-                document_id=doc_id,
-                parser_version=PARSER_VERSION,
-            )
+            pages = storage.list_document_pages(document_id=doc_id)
         finally:
             storage.close()
 
+        page_summary = {
+            "page_count": len(pages),
+            "latest_page_no": (
+                max(int(unit["page_no"]) for unit in pages)
+                if pages
+                else 0
+            ),
+            "synthetic_pages": sum(
+                1 for unit in pages if bool(unit.get("is_synthetic_page", False))
+            ),
+            "pages_prefix": str(document.get("pages_prefix") or ""),
+        }
         return _json_with_trace(
             {
                 "document": _serialize_document_summary(
                     document,
-                    parsed_units_count=len(parsed_units),
+                    page_count=len(pages),
                 ),
-                "parse_summary": {
-                    "parser_version": PARSER_VERSION,
-                    "parsed_units_count": len(parsed_units),
-                    "latest_unit_no": (
-                        max(int(unit["page_no"]) for unit in parsed_units)
-                        if parsed_units
-                        else 0
-                    ),
-                    "images_detected": sum(
-                        len(unit.get("images") or []) for unit in parsed_units
-                    ),
-                },
+                "page_summary": page_summary,
+                "parse_summary": page_summary,
             },
             trace_id=trace_id,
         )
@@ -1150,9 +1403,14 @@ async def delete_document_api(doc_id: str, db_path: str | None = None):
             document = _load_document_or_404(storage=storage, doc_id=doc_id)
             storage.remove_document_from_all_collections(doc_id=doc_id)
             updated = storage.set_document_deleted(doc_id=doc_id, is_deleted=True)
-            object_key = str(document.get("object_key") or "")
-            if object_key:
-                _blob_store.delete(object_key=object_key)
+            pages_prefix = str(document.get("pages_prefix") or "")
+            if pages_prefix:
+                _blob_store.delete_prefix(prefix=pages_prefix)
+            source_object_key = str(
+                document.get("source_object_key") or document.get("object_key") or ""
+            )
+            if source_object_key:
+                _blob_store.delete(object_key=source_object_key)
         finally:
             storage.close()
 
@@ -1186,7 +1444,7 @@ async def parse_document_api(
     request: DocumentParseRequest,
     db_path: str | None = None,
 ):
-    """Refresh parsed-unit cache for a specific indexed document."""
+    """Rebuild page files for a specific indexed document."""
     trace_id = _make_trace_id()
     if request.mode not in {"incremental", "full"}:
         return _error_response(
@@ -1201,21 +1459,9 @@ async def parse_document_api(
         storage = PostgresStorage(resolved_db_path)
         try:
             document = _load_document_or_404(storage=storage, doc_id=doc_id)
-            parse_result = _sync_document_parse(
+            parse_result = _sync_document_pages(
                 storage=storage,
                 document=document,
-                selector=ParseSelector(
-                    query=request.focus_hint.strip() if request.focus_hint else None,
-                    anchor=request.anchor,
-                    window=max(request.window, 0),
-                    max_units=request.max_units,
-                )
-                if (
-                    request.focus_hint
-                    or request.anchor is not None
-                    or request.max_units is not None
-                )
-                else None,
                 force=bool(request.force or request.mode == "full"),
             )
         finally:
@@ -1224,14 +1470,12 @@ async def parse_document_api(
         return _json_with_trace(
             {
                 "document_id": doc_id,
-                "parser_version": PARSER_VERSION,
-                "parsed_units": len(parse_result["parsed_units"]),
-                "parsed_units_updated": parse_result["parsed_units_updated"],
-                "cache_hits": parse_result["cache_hits"],
-                "images_detected": parse_result["images_detected"],
-                "search_index_stale": parse_result["search_index_stale"],
+                "page_count": parse_result["page_count"],
+                "pages_updated": parse_result["pages_updated"],
                 "from_cache": parse_result["from_cache"],
-                "parsed_is_complete": parse_result["parsed_is_complete"],
+                "page_naming_scheme": "page-0001.md",
+                "parsed_units": parse_result["page_count"],
+                "parsed_units_updated": parse_result["pages_updated"],
             },
             trace_id=trace_id,
         )
@@ -1258,7 +1502,7 @@ async def list_document_pages_api(
     page: int = 1,
     page_size: int = 20,
 ):
-    """Return paginated parsed units for a document."""
+    """Return paginated stored page blobs for a document."""
     trace_id = _make_trace_id()
     if page < 1 or page_size < 1:
         return _error_response(
@@ -1273,25 +1517,25 @@ async def list_document_pages_api(
         storage = PostgresStorage(resolved_db_path, read_only=True, initialize=False)
         try:
             _load_document_or_404(storage=storage, doc_id=doc_id)
-            parsed_units = storage.list_parsed_units(
+            document_pages = load_document_pages(
+                storage=storage,
+                blob_store=_blob_store,
                 document_id=doc_id,
-                parser_version=PARSER_VERSION,
             )
         finally:
             storage.close()
 
-        total = len(parsed_units)
+        total = len(document_pages)
         start = (page - 1) * page_size
         end = start + page_size
-        page_items = parsed_units[start:end]
+        page_items = document_pages[start:end]
         return _json_with_trace(
             {
                 "document_id": doc_id,
-                "parser_version": PARSER_VERSION,
                 "page": page,
                 "page_size": page_size,
                 "total": total,
-                "items": [_serialize_parsed_unit(unit) for unit in page_items],
+                "items": [_serialize_document_page(unit) for unit in page_items],
             },
             trace_id=trace_id,
         )

@@ -54,7 +54,7 @@ const parseForm = reactive({
 
 const askForm = reactive({
   task: "",
-  enableSemantic: true,
+  enableSemantic: false,
   enableMetadata: false,
 });
 
@@ -86,7 +86,7 @@ const selectedScopeCount = computed(() => {
 });
 
 const pageRangeLabel = computed(() => {
-  if (!detailState.pagesTotal) return "No parsed pages yet";
+  if (!detailState.pagesTotal) return "No pages generated yet";
   const start = (detailState.pagesPage - 1) * detailState.pagesPageSize + 1;
   const end = Math.min(
     detailState.pagesTotal,
@@ -235,7 +235,7 @@ async function loadDocumentDetail(docId = activeDocumentId.value) {
       `/api/documents/${encodeURIComponent(docId)}${suffix ? `?${suffix}` : ""}`,
     );
     detailState.document = payload.document;
-    detailState.parseSummary = payload.parse_summary;
+    detailState.parseSummary = payload.page_summary;
     detailState.metadataDraft = JSON.stringify(payload.document.metadata || {}, null, 2);
   } catch (error) {
     notify("error", error.message);
@@ -323,7 +323,7 @@ async function parseDocumentUnits() {
         }),
       },
     );
-    notify("success", "Parsed units refreshed.");
+    notify("success", "Page files rebuilt.");
     await Promise.all([loadDocumentDetail(), loadDocumentPages(activeDocumentId.value, 1), refreshDocuments(documentList.page)]);
   } catch (error) {
     notify("error", error.message);
@@ -504,6 +504,11 @@ function openEventStream(sessionId) {
     "evidence_added",
     "context_compacted",
     "coverage_gap_detected",
+    "page_scope_resolved",
+    "candidate_pages_found",
+    "pages_read",
+    "page_context_compacted",
+    "stale_page_range_detected",
     "cache_hit",
     "image_enhance_started",
     "image_enhance_done",
@@ -687,8 +692,8 @@ function escapeHtml(value) {
               <strong>{{ activeDocument.storage_uri }}</strong>
             </div>
             <div class="detail-stat">
-              <span class="metric-label">Parsed Units</span>
-              <strong>{{ detailState.parseSummary?.parsed_units_count || 0 }}</strong>
+              <span class="metric-label">Pages</span>
+              <strong>{{ detailState.parseSummary?.page_count || 0 }}</strong>
             </div>
             <div class="detail-stat">
               <span class="metric-label">File Size</span>
@@ -699,10 +704,10 @@ function escapeHtml(value) {
           <div class="field-grid">
             <label class="field">
               <span class="field-label">Focus Hint</span>
-              <input v-model="parseForm.focusHint" class="input" placeholder="Optional hint for focused parsing" />
+              <input v-model="parseForm.focusHint" class="input" placeholder="Optional note for rebuild history" />
             </label>
             <label class="field">
-              <span class="field-label">Anchor Unit</span>
+              <span class="field-label">Anchor Page</span>
               <input v-model="parseForm.anchor" class="input" placeholder="1" />
             </label>
             <label class="field">
@@ -710,13 +715,13 @@ function escapeHtml(value) {
               <input v-model="parseForm.window" class="input" type="number" min="0" />
             </label>
             <label class="field">
-              <span class="field-label">Max Units</span>
+              <span class="field-label">Max Pages</span>
               <input v-model="parseForm.maxUnits" class="input" placeholder="Optional" />
             </label>
           </div>
 
           <div class="upload-row">
-            <button class="button button--primary" @click="parseDocumentUnits">Refresh Parse</button>
+            <button class="button button--primary" @click="parseDocumentUnits">Rebuild Pages</button>
             <button class="button button--ghost" @click="saveMetadata">Save Metadata</button>
             <button class="button button--danger" @click="deleteDocument">Delete Document</button>
           </div>
@@ -727,12 +732,12 @@ function escapeHtml(value) {
           </label>
 
           <div class="panel-head panel-head--compact">
-            <h3>Parsed Pages</h3>
+            <h3>Stored Pages</h3>
             <span class="support-copy">{{ pageRangeLabel }}</span>
           </div>
           <div class="page-grid">
             <article v-for="page in detailState.pages" :key="`${page.page_no}-${page.content_hash}`" class="page-card">
-              <div class="page-card__meta">Unit {{ page.unit_no }} · {{ page.heading || "Untitled" }}</div>
+              <div class="page-card__meta">Page {{ page.page_no }} · {{ page.heading || "Untitled" }}</div>
               <pre class="page-card__body">{{ page.markdown }}</pre>
             </article>
           </div>
@@ -740,7 +745,7 @@ function escapeHtml(value) {
 
         <div v-else class="empty-card">
           <strong>Select one uploaded document.</strong>
-          <p>We’ll show parse state, pages, and editable metadata here.</p>
+          <p>We’ll show stored page files, page summary, and editable metadata here.</p>
         </div>
       </main>
 
@@ -815,7 +820,7 @@ function escapeHtml(value) {
           <div class="checkbox-wrap">
             <label class="checkbox-line">
               <input v-model="askForm.enableSemantic" type="checkbox" />
-              <span>Enable semantic retrieval</span>
+              <span>Enable legacy semantic retrieval</span>
             </label>
             <label class="checkbox-line">
               <input v-model="askForm.enableMetadata" type="checkbox" />

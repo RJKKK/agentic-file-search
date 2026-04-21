@@ -24,6 +24,7 @@ from .base import (
     ChunkRecord,
     CollectionRecord,
     DocumentRecord,
+    DocumentPageRecord,
     ImageSemanticRecord,
     ParsedUnitRecord,
     SchemaRecord,
@@ -41,6 +42,7 @@ class _LocalStorageState:
     chunks: dict[str, dict[str, Any]] = field(default_factory=dict)
     schemas: dict[str, dict[str, Any]] = field(default_factory=dict)
     parsed_units: dict[tuple[str, str, int], dict[str, Any]] = field(default_factory=dict)
+    document_pages: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict)
     image_semantics: dict[str, dict[str, Any]] = field(default_factory=dict)
     chunk_embeddings: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -199,9 +201,12 @@ class PostgresStorage:
                     absolute_path TEXT NOT NULL,
                     original_filename TEXT NOT NULL DEFAULT '',
                     object_key TEXT NOT NULL DEFAULT '',
+                    source_object_key TEXT NOT NULL DEFAULT '',
+                    pages_prefix TEXT NOT NULL DEFAULT '',
                     storage_uri TEXT NOT NULL DEFAULT '',
                     content_type TEXT,
                     upload_status TEXT NOT NULL DEFAULT 'indexed',
+                    page_count INTEGER NOT NULL DEFAULT 0,
                     content TEXT NOT NULL,
                     metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                     file_mtime DOUBLE PRECISION NOT NULL,
@@ -242,6 +247,18 @@ class PostgresStorage:
             cur.execute(
                 """
                 ALTER TABLE documents
+                ADD COLUMN IF NOT EXISTS source_object_key TEXT NOT NULL DEFAULT ''
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE documents
+                ADD COLUMN IF NOT EXISTS pages_prefix TEXT NOT NULL DEFAULT ''
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE documents
                 ADD COLUMN IF NOT EXISTS storage_uri TEXT NOT NULL DEFAULT ''
                 """
             )
@@ -249,6 +266,12 @@ class PostgresStorage:
                 """
                 ALTER TABLE documents
                 ADD COLUMN IF NOT EXISTS content_type TEXT
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE documents
+                ADD COLUMN IF NOT EXISTS page_count INTEGER NOT NULL DEFAULT 0
                 """
             )
             cur.execute(
@@ -290,6 +313,22 @@ class PostgresStorage:
                     images_json JSONB NOT NULL DEFAULT '[]'::jsonb,
                     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (document_id, page_no, parser_version)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS document_pages (
+                    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                    page_no INTEGER NOT NULL,
+                    object_key TEXT NOT NULL,
+                    heading TEXT,
+                    source_locator TEXT,
+                    content_hash TEXT NOT NULL,
+                    char_count INTEGER NOT NULL DEFAULT 0,
+                    is_synthetic_page BOOLEAN NOT NULL DEFAULT FALSE,
+                    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (document_id, page_no)
                 )
                 """
             )
@@ -390,6 +429,18 @@ class PostgresStorage:
             )
             cur.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_documents_source_object_key
+                ON documents (source_object_key)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_documents_pages_prefix
+                ON documents (pages_prefix)
+                """
+            )
+            cur.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_chunks_doc_position
                 ON chunks (doc_id, position)
                 """
@@ -404,6 +455,12 @@ class PostgresStorage:
                 """
                 CREATE INDEX IF NOT EXISTS idx_parsed_units_document_version
                 ON parsed_units (document_id, parser_version, page_no)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_document_pages_document
+                ON document_pages (document_id, page_no)
                 """
             )
             cur.execute(
@@ -628,9 +685,12 @@ class PostgresStorage:
                 "absolute_path": document.absolute_path,
                 "original_filename": document.original_filename or document.relative_path,
                 "object_key": document.object_key,
+                "source_object_key": document.source_object_key or document.object_key,
+                "pages_prefix": document.pages_prefix,
                 "storage_uri": document.storage_uri,
                 "content_type": document.content_type,
                 "upload_status": document.upload_status or "indexed",
+                "page_count": int(document.page_count),
                 "content": document.content,
                 "metadata_json": document.metadata_json,
                 "file_mtime": document.file_mtime,
@@ -674,20 +734,24 @@ class PostgresStorage:
                 """
                 INSERT INTO documents (
                     id, corpus_id, relative_path, absolute_path, original_filename,
-                    object_key, storage_uri, content_type, upload_status, content, metadata_json,
+                    object_key, source_object_key, pages_prefix, storage_uri, content_type,
+                    upload_status, page_count, content, metadata_json,
                     file_mtime, file_size, content_sha256,
                     parsed_content_sha256, parsed_is_complete, is_deleted
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, TRUE, FALSE)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, TRUE, FALSE)
                 ON CONFLICT(id) DO UPDATE SET
                     corpus_id = EXCLUDED.corpus_id,
                     relative_path = EXCLUDED.relative_path,
                     absolute_path = EXCLUDED.absolute_path,
                     original_filename = EXCLUDED.original_filename,
                     object_key = EXCLUDED.object_key,
+                    source_object_key = EXCLUDED.source_object_key,
+                    pages_prefix = EXCLUDED.pages_prefix,
                     storage_uri = EXCLUDED.storage_uri,
                     content_type = EXCLUDED.content_type,
                     upload_status = EXCLUDED.upload_status,
+                    page_count = EXCLUDED.page_count,
                     content = EXCLUDED.content,
                     metadata_json = EXCLUDED.metadata_json,
                     file_mtime = EXCLUDED.file_mtime,
@@ -705,9 +769,12 @@ class PostgresStorage:
                     document.absolute_path,
                     document.original_filename or document.relative_path,
                     document.object_key,
+                    document.source_object_key or document.object_key,
+                    document.pages_prefix,
                     document.storage_uri,
                     document.content_type,
                     document.upload_status or "indexed",
+                    int(document.page_count),
                     document.content,
                     document.metadata_json,
                     document.file_mtime,
@@ -749,14 +816,17 @@ class PostgresStorage:
                 "absolute_path": document.absolute_path,
                 "original_filename": document.original_filename or document.relative_path,
                 "object_key": document.object_key,
+                "source_object_key": document.source_object_key or document.object_key,
+                "pages_prefix": document.pages_prefix,
                 "storage_uri": document.storage_uri,
                 "content_type": document.content_type,
                 "upload_status": document.upload_status or "uploaded",
+                "page_count": int(document.page_count),
                 "content": "",
                 "metadata_json": document.metadata_json,
                 "file_mtime": document.file_mtime,
                 "file_size": document.file_size,
-                "content_sha256": "",
+                "content_sha256": document.content_sha256,
                 "parsed_content_sha256": None,
                 "parsed_is_complete": False,
                 "last_indexed_at": _utcnow_iso(),
@@ -775,6 +845,11 @@ class PostgresStorage:
             ]
             for key in stale_parsed_keys:
                 state.parsed_units.pop(key, None)
+            stale_page_keys = [
+                key for key in list(state.document_pages) if key[0] == document.id
+            ]
+            for key in stale_page_keys:
+                state.document_pages.pop(key, None)
             stale_image_hashes = [
                 image_hash
                 for image_hash, item in list(state.image_semantics.items())
@@ -794,6 +869,7 @@ class PostgresStorage:
             )
             cur.execute("DELETE FROM chunks WHERE doc_id = %s", (document.id,))
             cur.execute("DELETE FROM parsed_units WHERE document_id = %s", (document.id,))
+            cur.execute("DELETE FROM document_pages WHERE document_id = %s", (document.id,))
             cur.execute(
                 "DELETE FROM image_semantics WHERE source_document_id = %s",
                 (document.id,),
@@ -802,25 +878,29 @@ class PostgresStorage:
                 """
                 INSERT INTO documents (
                     id, corpus_id, relative_path, absolute_path, original_filename,
-                    object_key, storage_uri, content_type, upload_status, content, metadata_json,
+                    object_key, source_object_key, pages_prefix, storage_uri, content_type,
+                    upload_status, page_count, content, metadata_json,
                     file_mtime, file_size, content_sha256,
                     parsed_content_sha256, parsed_is_complete, is_deleted
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, '', %s::jsonb, %s, %s, '', NULL, FALSE, FALSE)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, '', %s::jsonb, %s, %s, %s, NULL, FALSE, FALSE)
                 ON CONFLICT(id) DO UPDATE SET
                     corpus_id = EXCLUDED.corpus_id,
                     relative_path = EXCLUDED.relative_path,
                     absolute_path = EXCLUDED.absolute_path,
                     original_filename = EXCLUDED.original_filename,
                     object_key = EXCLUDED.object_key,
+                    source_object_key = EXCLUDED.source_object_key,
+                    pages_prefix = EXCLUDED.pages_prefix,
                     storage_uri = EXCLUDED.storage_uri,
                     content_type = EXCLUDED.content_type,
                     upload_status = EXCLUDED.upload_status,
+                    page_count = EXCLUDED.page_count,
                     content = '',
                     metadata_json = EXCLUDED.metadata_json,
                     file_mtime = EXCLUDED.file_mtime,
                     file_size = EXCLUDED.file_size,
-                    content_sha256 = '',
+                    content_sha256 = EXCLUDED.content_sha256,
                     parsed_content_sha256 = NULL,
                     parsed_is_complete = FALSE,
                     last_indexed_at = CURRENT_TIMESTAMP,
@@ -833,12 +913,16 @@ class PostgresStorage:
                     document.absolute_path,
                     document.original_filename or document.relative_path,
                     document.object_key,
+                    document.source_object_key or document.object_key,
+                    document.pages_prefix,
                     document.storage_uri,
                     document.content_type,
                     document.upload_status or "uploaded",
+                    int(document.page_count),
                     document.metadata_json,
                     document.file_mtime,
                     document.file_size,
+                    document.content_sha256,
                 ),
             )
 
@@ -909,9 +993,12 @@ class PostgresStorage:
                     "absolute_path": str(document["absolute_path"]),
                     "original_filename": str(document.get("original_filename") or document["relative_path"]),
                     "object_key": str(document.get("object_key") or ""),
+                    "source_object_key": str(document.get("source_object_key") or document.get("object_key") or ""),
+                    "pages_prefix": str(document.get("pages_prefix") or ""),
                     "storage_uri": str(document.get("storage_uri") or ""),
                     "content_type": document.get("content_type"),
                     "upload_status": str(document.get("upload_status") or "uploaded"),
+                    "page_count": int(document.get("page_count") or 0),
                     "file_size": int(document["file_size"]),
                     "file_mtime": float(document["file_mtime"]),
                     "metadata_json": str(document["metadata_json"]),
@@ -934,9 +1021,12 @@ class PostgresStorage:
                 absolute_path,
                 original_filename,
                 object_key,
+                source_object_key,
+                pages_prefix,
                 storage_uri,
                 content_type,
                 upload_status,
+                page_count,
                 file_size,
                 file_mtime,
                 metadata_json,
@@ -959,7 +1049,7 @@ class PostgresStorage:
 
         results: list[dict[str, Any]] = []
         for row in rows:
-            metadata_json_obj = row[11]
+            metadata_json_obj = row[14]
             if isinstance(metadata_json_obj, str):
                 metadata_json = metadata_json_obj
             else:
@@ -972,19 +1062,22 @@ class PostgresStorage:
                     "absolute_path": str(row[3]),
                     "original_filename": str(row[4] or row[2]),
                     "object_key": str(row[5] or ""),
-                    "storage_uri": str(row[6] or ""),
-                    "content_type": row[7],
-                    "upload_status": str(row[8] or "uploaded"),
-                    "file_size": int(row[9]),
-                    "file_mtime": float(row[10]),
+                    "source_object_key": str(row[6] or row[5] or ""),
+                    "pages_prefix": str(row[7] or ""),
+                    "storage_uri": str(row[8] or ""),
+                    "content_type": row[9],
+                    "upload_status": str(row[10] or "uploaded"),
+                    "page_count": int(row[11] or 0),
+                    "file_size": int(row[12]),
+                    "file_mtime": float(row[13]),
                     "metadata_json": metadata_json,
-                    "content_sha256": str(row[12]),
-                    "parsed_content_sha256": row[13],
-                    "parsed_is_complete": bool(row[14]),
-                    "last_indexed_at": row[15].isoformat()
-                    if hasattr(row[15], "isoformat")
-                    else str(row[15]),
-                    "is_deleted": bool(row[16]),
+                    "content_sha256": str(row[15]),
+                    "parsed_content_sha256": row[16],
+                    "parsed_is_complete": bool(row[17]),
+                    "last_indexed_at": row[18].isoformat()
+                    if hasattr(row[18], "isoformat")
+                    else str(row[18]),
+                    "is_deleted": bool(row[19]),
                 }
             )
         return results
@@ -1012,9 +1105,12 @@ class PostgresStorage:
                 absolute_path,
                 original_filename,
                 object_key,
+                source_object_key,
+                pages_prefix,
                 storage_uri,
                 content_type,
                 upload_status,
+                page_count,
                 file_size,
                 file_mtime,
                 metadata_json,
@@ -1036,7 +1132,7 @@ class PostgresStorage:
 
         results: list[dict[str, Any]] = []
         for row in rows:
-            metadata_json_obj = row[11]
+            metadata_json_obj = row[14]
             if isinstance(metadata_json_obj, str):
                 metadata_json = metadata_json_obj
             else:
@@ -1049,19 +1145,22 @@ class PostgresStorage:
                     "absolute_path": str(row[3]),
                     "original_filename": str(row[4] or row[2]),
                     "object_key": str(row[5] or ""),
-                    "storage_uri": str(row[6] or ""),
-                    "content_type": row[7],
-                    "upload_status": str(row[8] or "uploaded"),
-                    "file_size": int(row[9]),
-                    "file_mtime": float(row[10]),
+                    "source_object_key": str(row[6] or row[5] or ""),
+                    "pages_prefix": str(row[7] or ""),
+                    "storage_uri": str(row[8] or ""),
+                    "content_type": row[9],
+                    "upload_status": str(row[10] or "uploaded"),
+                    "page_count": int(row[11] or 0),
+                    "file_size": int(row[12]),
+                    "file_mtime": float(row[13]),
                     "metadata_json": metadata_json,
-                    "content_sha256": str(row[12]),
-                    "parsed_content_sha256": row[13],
-                    "parsed_is_complete": bool(row[14]),
-                    "last_indexed_at": row[15].isoformat()
-                    if hasattr(row[15], "isoformat")
-                    else str(row[15]),
-                    "is_deleted": bool(row[16]),
+                    "content_sha256": str(row[15]),
+                    "parsed_content_sha256": row[16],
+                    "parsed_is_complete": bool(row[17]),
+                    "last_indexed_at": row[18].isoformat()
+                    if hasattr(row[18], "isoformat")
+                    else str(row[18]),
+                    "is_deleted": bool(row[19]),
                 }
             )
         return results
@@ -1278,8 +1377,8 @@ class PostgresStorage:
                 """
                 SELECT
                     id, corpus_id, relative_path, absolute_path, original_filename,
-                    object_key, storage_uri, content_type, upload_status, content, metadata_json,
-                    file_size, file_mtime, content_sha256,
+                    object_key, source_object_key, pages_prefix, storage_uri, content_type,
+                    upload_status, page_count, content, metadata_json, file_size, file_mtime, content_sha256,
                     parsed_content_sha256, parsed_is_complete, last_indexed_at, is_deleted
                 FROM documents
                 WHERE id = %s
@@ -1290,7 +1389,7 @@ class PostgresStorage:
             row = cur.fetchone()
         if row is None:
             return None
-        metadata_json_obj = row[10]
+        metadata_json_obj = row[13]
         if isinstance(metadata_json_obj, str):
             metadata_json = metadata_json_obj
         else:
@@ -1302,20 +1401,23 @@ class PostgresStorage:
             "absolute_path": str(row[3]),
             "original_filename": str(row[4] or row[2]),
             "object_key": str(row[5] or ""),
-            "storage_uri": str(row[6] or ""),
-            "content_type": row[7],
-            "upload_status": str(row[8] or "uploaded"),
-            "content": str(row[9]),
+            "source_object_key": str(row[6] or row[5] or ""),
+            "pages_prefix": str(row[7] or ""),
+            "storage_uri": str(row[8] or ""),
+            "content_type": row[9],
+            "upload_status": str(row[10] or "uploaded"),
+            "page_count": int(row[11] or 0),
+            "content": str(row[12]),
             "metadata_json": metadata_json,
-            "file_size": int(row[11]),
-            "file_mtime": float(row[12]),
-            "content_sha256": str(row[13]),
-            "parsed_content_sha256": row[14],
-            "parsed_is_complete": bool(row[15]),
-            "last_indexed_at": row[16].isoformat()
-            if hasattr(row[16], "isoformat")
-            else str(row[16]),
-            "is_deleted": bool(row[17]),
+            "file_size": int(row[14]),
+            "file_mtime": float(row[15]),
+            "content_sha256": str(row[16]),
+            "parsed_content_sha256": row[17],
+            "parsed_is_complete": bool(row[18]),
+            "last_indexed_at": row[19].isoformat()
+            if hasattr(row[19], "isoformat")
+            else str(row[19]),
+            "is_deleted": bool(row[20]),
         }
 
     def update_document_metadata(
@@ -1502,6 +1604,183 @@ class PostgresStorage:
                 }
             )
         return results
+
+    def list_document_pages(
+        self,
+        *,
+        document_id: str,
+        page_nos: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        if page_nos is not None and len(page_nos) == 0:
+            return []
+        if self._use_local:
+            allowed_pages = set(page_nos) if page_nos is not None else None
+            result = []
+            for (doc_id, page_no), item in self._local().document_pages.items():
+                if doc_id != document_id:
+                    continue
+                if allowed_pages is not None and page_no not in allowed_pages:
+                    continue
+                result.append(copy.deepcopy(item))
+            result.sort(key=lambda item: int(item["page_no"]))
+            return result
+        sql = """
+            SELECT
+                document_id, page_no, object_key, heading, source_locator,
+                content_hash, char_count, is_synthetic_page
+            FROM document_pages
+            WHERE document_id = %s
+        """
+        params: list[Any] = [document_id]
+        if page_nos:
+            placeholders = ", ".join(["%s"] * len(page_nos))
+            sql += f" AND page_no IN ({placeholders})"
+            params.extend(sorted(set(page_nos)))
+        sql += " ORDER BY page_no ASC"
+        with self._conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        return [
+            {
+                "document_id": str(row[0]),
+                "page_no": int(row[1]),
+                "object_key": str(row[2]),
+                "heading": row[3],
+                "source_locator": row[4],
+                "content_hash": str(row[5]),
+                "char_count": int(row[6] or 0),
+                "is_synthetic_page": bool(row[7]),
+            }
+            for row in rows
+        ]
+
+    def sync_document_pages(
+        self,
+        *,
+        document_id: str,
+        pages: list[DocumentPageRecord],
+    ) -> dict[str, int]:
+        if self._use_local:
+            state = self._local()
+            existing = {
+                int(item["page_no"]): item
+                for item in self.list_document_pages(document_id=document_id)
+            }
+            upserted = 0
+            untouched = 0
+            desired_pages = {page.page_no for page in pages}
+            for page in pages:
+                current = {
+                    "document_id": document_id,
+                    "page_no": page.page_no,
+                    "object_key": page.object_key,
+                    "heading": page.heading,
+                    "source_locator": page.source_locator,
+                    "content_hash": page.content_hash,
+                    "char_count": page.char_count,
+                    "is_synthetic_page": page.is_synthetic_page,
+                }
+                if existing.get(page.page_no) == current:
+                    untouched += 1
+                else:
+                    upserted += 1
+                state.document_pages[(document_id, page.page_no)] = current
+            deleted = 0
+            stale_keys = [
+                key
+                for key in list(state.document_pages)
+                if key[0] == document_id and key[1] not in desired_pages
+            ]
+            for key in stale_keys:
+                state.document_pages.pop(key, None)
+                deleted += 1
+            document = state.documents.get(document_id)
+            if document is not None:
+                document["page_count"] = len(pages)
+            return {"upserted": upserted, "untouched": untouched, "deleted": deleted}
+
+        existing = {
+            int(item["page_no"]): item
+            for item in self.list_document_pages(document_id=document_id)
+        }
+        upserted = 0
+        untouched = 0
+        desired_pages = {page.page_no for page in pages}
+        with self._conn.cursor() as cur:
+            for page in pages:
+                previous = existing.get(page.page_no)
+                current = {
+                    "object_key": page.object_key,
+                    "heading": page.heading,
+                    "source_locator": page.source_locator,
+                    "content_hash": page.content_hash,
+                    "char_count": page.char_count,
+                    "is_synthetic_page": page.is_synthetic_page,
+                }
+                if previous is not None and {
+                    "object_key": previous.get("object_key"),
+                    "heading": previous.get("heading"),
+                    "source_locator": previous.get("source_locator"),
+                    "content_hash": previous.get("content_hash"),
+                    "char_count": previous.get("char_count"),
+                    "is_synthetic_page": previous.get("is_synthetic_page"),
+                } == current:
+                    untouched += 1
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO document_pages (
+                        document_id, page_no, object_key, heading, source_locator,
+                        content_hash, char_count, is_synthetic_page, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT(document_id, page_no) DO UPDATE SET
+                        object_key = EXCLUDED.object_key,
+                        heading = EXCLUDED.heading,
+                        source_locator = EXCLUDED.source_locator,
+                        content_hash = EXCLUDED.content_hash,
+                        char_count = EXCLUDED.char_count,
+                        is_synthetic_page = EXCLUDED.is_synthetic_page,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        document_id,
+                        page.page_no,
+                        page.object_key,
+                        page.heading,
+                        page.source_locator,
+                        page.content_hash,
+                        page.char_count,
+                        page.is_synthetic_page,
+                    ),
+                )
+                upserted += 1
+            if desired_pages:
+                placeholders = ", ".join(["%s"] * len(desired_pages))
+                cur.execute(
+                    f"""
+                    DELETE FROM document_pages
+                    WHERE document_id = %s
+                      AND page_no NOT IN ({placeholders})
+                    """,
+                    (document_id, *sorted(desired_pages)),
+                )
+            else:
+                cur.execute(
+                    "DELETE FROM document_pages WHERE document_id = %s",
+                    (document_id,),
+                )
+            deleted = cur.rowcount if cur.rowcount is not None else 0
+            cur.execute(
+                """
+                UPDATE documents
+                SET page_count = %s,
+                    last_indexed_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """,
+                (len(pages), document_id),
+            )
+        return {"upserted": upserted, "untouched": untouched, "deleted": int(deleted)}
 
     def sync_parsed_units(
         self,

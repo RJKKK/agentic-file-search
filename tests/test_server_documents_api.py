@@ -64,7 +64,7 @@ def test_document_library_list_parse_and_delete(
     payload = list_response.json()
     assert payload["total"] == 1
     assert payload["items"][0]["original_filename"] == "alpha.md"
-    assert payload["items"][0]["status"] == "uploaded"
+    assert payload["items"][0]["status"] == "pages_ready"
 
     parse_response = client_with_store.post(
         f"/api/documents/{alpha['id']}/parse",
@@ -194,3 +194,33 @@ def test_collection_crud_and_document_membership(
     )
     assert delete_response.status_code == 200
     assert delete_response.json()["deleted"] is True
+
+
+def test_upload_failure_cleans_written_blobs(
+    client_with_store: TestClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = str(tmp_path / "broken.duckdb")
+    original_upsert = server_module.PostgresStorage.upsert_document_stub
+
+    def _boom(self, document):  # noqa: ANN001
+        raise RuntimeError("simulated insert failure")
+
+    monkeypatch.setattr(server_module.PostgresStorage, "upsert_document_stub", _boom)
+    try:
+        response = client_with_store.post(
+            "/api/documents",
+            data={"db_path": db_path},
+            files={"file": ("alpha.md", b"# Alpha\n\nhello\n", "text/markdown")},
+        )
+    finally:
+        monkeypatch.setattr(
+            server_module.PostgresStorage,
+            "upsert_document_stub",
+            original_upsert,
+        )
+
+    assert response.status_code == 500
+    object_store_root = tmp_path / "object_store"
+    assert not (object_store_root / "documents" / "alpha.md").exists()

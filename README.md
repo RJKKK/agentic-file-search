@@ -149,6 +149,24 @@ python -m pytest
 npm --prefix frontend run build
 ```
 
+## Database Migration
+
+如果 `fs_explorer` 数据库是空库，先执行一次显式迁移命令：
+
+```bash
+python -m fs_explorer migrate
+```
+
+如果你想指定 DSN：
+
+```bash
+python -m fs_explorer migrate --db-path "postgresql://postgres:root@127.0.0.1:5432/fs_explorer"
+```
+
+如果你的环境已经安装了 console script，也可以使用 `explore migrate`。
+
+这个命令会调用项目内置的 schema bootstrap，按幂等方式执行 `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE`，适合空库初始化和升级现有库结构。
+
 ## 目录
 
 ```text

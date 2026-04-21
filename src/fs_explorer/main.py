@@ -626,6 +626,38 @@ def index_command(
     console.print(Panel(summary, title="📦 Index Complete", border_style="bold green"))
 
 
+@app.command("migrate")
+def migrate_command(
+    db_path: Annotated[
+        str | None,
+        Option("--db-path", help="PostgreSQL DSN for index storage."),
+    ] = None,
+) -> None:
+    """Initialize or migrate the FsExplorer database schema."""
+    console = Console()
+    resolved_db_path = resolve_db_path(db_path)
+    storage = PostgresStorage(resolved_db_path)
+    try:
+        summary = Table.grid(padding=(0, 2))
+        summary.add_column(style="bold", justify="right")
+        summary.add_column()
+        summary.add_row("DB Path:", resolved_db_path)
+        summary.add_row("Schema Status:", "initialized")
+        summary.add_row(
+            "Migration Mode:",
+            "idempotent CREATE TABLE / ALTER TABLE bootstrap",
+        )
+        console.print(
+            Panel(
+                summary,
+                title="Database Migration Complete",
+                border_style="bold green",
+            )
+        )
+    finally:
+        storage.close()
+
+
 @app.command("query")
 def query_command(
     task: Annotated[

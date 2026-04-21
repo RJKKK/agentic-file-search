@@ -90,17 +90,19 @@ def test_search_supports_document_ids_collection_and_union(
     )
     assert by_doc.status_code == 200
     by_doc_payload = by_doc.json()
-    assert by_doc_payload["lazy_indexing"]["triggered"] is True
+    assert by_doc_payload["lazy_indexing"]["triggered"] is False
     assert by_doc_payload["hits"]
     assert by_doc_payload["hits"][0]["doc_id"] == alpha["id"]
+    assert by_doc_payload["hits"][0]["source_unit_no"] == 1
+    assert by_doc_payload["hits"][0]["absolute_path"].endswith("page-0001.md")
 
     library_after_first_search = client_with_store.get(
         "/api/documents",
         params={"db_path": db_path},
     ).json()["items"]
     statuses = {item["id"]: item["status"] for item in library_after_first_search}
-    assert statuses[alpha["id"]] == "indexed"
-    assert statuses[beta["id"]] == "uploaded"
+    assert statuses[alpha["id"]] == "pages_ready"
+    assert statuses[beta["id"]] == "pages_ready"
 
     by_collection = client_with_store.post(
         "/api/search",

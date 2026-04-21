@@ -37,9 +37,12 @@ class DocumentRecord:
     content_sha256: str
     original_filename: str = ""
     object_key: str = ""
+    source_object_key: str = ""
+    pages_prefix: str = ""
     storage_uri: str = ""
     content_type: str | None = None
     upload_status: str = "indexed"
+    page_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,20 @@ class ParsedUnitRecord:
     markdown: str
     content_hash: str
     images_json: str
+    heading: str | None = None
+    source_locator: str | None = None
+
+
+@dataclass(frozen=True)
+class DocumentPageRecord:
+    """A page manifest entry backed by object storage content."""
+
+    document_id: str
+    page_no: int
+    object_key: str
+    content_hash: str
+    char_count: int
+    is_synthetic_page: bool
     heading: str | None = None
     source_locator: str | None = None
 
@@ -236,6 +253,22 @@ class StorageBackend(Protocol):
         images: list[ImageSemanticRecord],
     ) -> int:
         """Insert image semantic placeholders for extracted images."""
+
+    def sync_document_pages(
+        self,
+        *,
+        document_id: str,
+        pages: list[DocumentPageRecord],
+    ) -> dict[str, int]:
+        """Upsert page manifest rows and delete stale pages."""
+
+    def list_document_pages(
+        self,
+        *,
+        document_id: str,
+        page_nos: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return stored page manifest rows for a document."""
 
     def get_image_semantics(
         self,

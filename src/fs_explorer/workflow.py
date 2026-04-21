@@ -238,23 +238,10 @@ class FsExplorerWorkflow(Workflow):
             else "selected documents"
         )
         document_summary = "\n".join(f"- {label}" for label in ev.document_labels) or "- (none)"
-        if ev.enable_semantic and ev.enable_metadata:
-            index_hint = (
-                "Use `semantic_search` first, optionally with metadata filters, "
-                "then use `get_document` or focused `parse_file` on the returned files."
-            )
-        elif ev.enable_semantic:
-            index_hint = (
-                "Use `semantic_search` first for similarity retrieval, then drill in."
-            )
-        elif ev.enable_metadata:
-            index_hint = (
-                "Use `semantic_search` with filters first, then drill in."
-            )
-        else:
-            index_hint = (
-                "Only work inside the selected document set and prefer focused reads."
-            )
+        index_hint = (
+            "Only work inside the selected document set. Start with `glob` to inspect page files, "
+            "then `grep` to find candidate pages, then `read` a few page files."
+        )
         agent.configure_task(
             f"You can only access the current {scope_name}. The available documents are:\n\n"
             f"```text\n{document_summary}\n```\n\n"

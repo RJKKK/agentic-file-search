@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .blob_store import BlobStore, sanitize_filename
+from .blob_store import BlobStore
+from .page_store import (
+    build_document_pages_prefix,
+    build_document_source_key,
+    validate_storage_filename,
+)
 from .storage import CollectionRecord, PostgresStorage
 
 LIBRARY_CORPUS_ROOT = "blob://library/default"
@@ -48,7 +53,9 @@ def materialize_document(
     document: dict[str, Any],
 ) -> dict[str, Any]:
     """Ensure the document has a local readable path and persist it when changed."""
-    object_key = str(document.get("object_key") or "").strip()
+    object_key = str(
+        document.get("source_object_key") or document.get("object_key") or ""
+    ).strip()
     if not object_key:
         return document
     materialized_path = blob_store.materialize(object_key=object_key)
@@ -66,8 +73,14 @@ def materialize_document(
 
 
 def build_document_object_key(doc_id: str, filename: str) -> str:
-    """Build the canonical object key for one uploaded document."""
-    return f"documents/{doc_id}/{sanitize_filename(filename)}"
+    """Build the canonical source object key for one uploaded document."""
+    _ = doc_id
+    return build_document_source_key(filename)
+
+
+def build_document_pages_key_prefix(filename: str) -> str:
+    """Build the canonical pages prefix for one uploaded document."""
+    return build_document_pages_prefix(validate_storage_filename(filename))
 
 
 def resolve_document_scope(

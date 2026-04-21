@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -15,6 +16,32 @@ from .filters import MetadataFilter, parse_metadata_filters
 from .ranker import RankedDocument, rank_documents
 
 _LAZY_INDEX_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _supports_document_ids(method: Callable[..., Any]) -> bool:
+    """Return whether one storage method accepts a document_ids keyword."""
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return True
+    for parameter in signature.parameters.values():
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+    return "document_ids" in signature.parameters
+
+
+def _call_storage_method(
+    method: Callable[..., Any],
+    *,
+    corpus_id: str,
+    document_ids: list[str] | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Call one storage method, passing document_ids only when supported."""
+    call_kwargs = {"corpus_id": corpus_id, **kwargs}
+    if document_ids is not None and _supports_document_ids(method):
+        call_kwargs["document_ids"] = document_ids
+    return method(**call_kwargs)
 
 
 @dataclass(frozen=True)
@@ -211,7 +238,8 @@ class IndexedQueryEngine:
                 corpus_id=corpus_id
             ):
                 query_embedding = self.embedding_provider.embed_query(query)
-                semantic_rows = scoped_storage.search_chunks_semantic(
+                semantic_rows = _call_storage_method(
+                    scoped_storage.search_chunks_semantic,
                     corpus_id=corpus_id,
                     query_embedding=query_embedding,
                     limit=limit,
@@ -219,7 +247,8 @@ class IndexedQueryEngine:
                 )
                 if semantic_rows:
                     return semantic_rows
-            return scoped_storage.search_chunks(
+            return _call_storage_method(
+                scoped_storage.search_chunks,
                 corpus_id=corpus_id,
                 query=query,
                 limit=limit,
@@ -238,7 +267,8 @@ class IndexedQueryEngine:
     ) -> list[dict[str, Any]]:
         scoped_storage, cleanup = self._acquire_query_storage()
         try:
-            return scoped_storage.search_documents_by_metadata(
+            return _call_storage_method(
+                scoped_storage.search_documents_by_metadata,
                 corpus_id=corpus_id,
                 filters=[flt.to_storage_dict() for flt in metadata_filters],
                 limit=limit,

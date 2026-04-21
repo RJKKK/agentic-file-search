@@ -35,11 +35,16 @@ class EmbeddingProvider:
         )
         self.model = config.model_name
         self.base_url = config.base_url
-        self.dim = dim or int(os.getenv("EMBEDDING_DIM", os.getenv("FS_EXPLORER_EMBEDDING_DIM", str(_DEFAULT_DIM))))
+        self.dim = dim or int(
+            os.getenv(
+                "FS_EXPLORER_EMBEDDING_DIM",
+                os.getenv("EMBEDDING_DIM", str(_DEFAULT_DIM)),
+            )
+        )
         self.batch_size = batch_size or int(
             os.getenv(
-                "EMBEDDING_BATCH_SIZE",
-                os.getenv("FS_EXPLORER_EMBEDDING_BATCH_SIZE", str(_DEFAULT_BATCH_SIZE)),
+                "FS_EXPLORER_EMBEDDING_BATCH_SIZE",
+                os.getenv("EMBEDDING_BATCH_SIZE", str(_DEFAULT_BATCH_SIZE)),
             )
         )
 

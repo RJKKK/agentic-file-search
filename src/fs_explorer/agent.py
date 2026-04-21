@@ -25,6 +25,8 @@ from .fs import (
     preview_file,
     parse_file,
 )
+from .blob_store import LocalBlobStore
+from .document_pages import find_page_by_path, load_document_pages, resolve_pages_directory
 from .embeddings import EmbeddingProvider
 from .document_parsing import PARSER_VERSION, ParseSelector, enhance_page_image_semantics, reconstruct_parsed_document
 from .document_cache import format_parse_result, get_or_parse_document_units, resolve_document_by_path
@@ -45,6 +47,9 @@ from .storage import PostgresStorage
 _env_path = Path(__file__).parent.parent.parent / ".env"
 if _env_path.exists():
     load_dotenv(_env_path)
+
+
+_PAGE_BLOB_STORE = LocalBlobStore()
 
 
 # =============================================================================
@@ -383,6 +388,40 @@ def _build_parse_receipt(
         f"total_units={total_units if total_units is not None else '?'}; "
         "structured evidence has been stored for the next reasoning step."
     )
+
+
+def _scoped_documents(
+    storage: PostgresStorage,
+    index_context: IndexContext,
+) -> list[dict[str, Any]]:
+    if index_context.document_ids:
+        return storage.list_documents_by_ids(
+            doc_ids=list(index_context.document_ids),
+            include_deleted=False,
+        )
+    corpus_id = storage.get_corpus_id(index_context.root_folder or LIBRARY_CORPUS_ROOT) or ""
+    return storage.list_documents(corpus_id=corpus_id, include_deleted=False)
+
+
+def _resolve_document_page_scope(
+    *,
+    storage: PostgresStorage,
+    index_context: IndexContext,
+    target: str,
+) -> tuple[dict[str, Any], str] | None:
+    normalized_target = str(Path(target).resolve()).lower()
+    for document in _scoped_documents(storage, index_context):
+        pages_prefix = str(document.get("pages_prefix") or "")
+        if not pages_prefix:
+            continue
+        pages_dir = resolve_pages_directory(blob_store=_PAGE_BLOB_STORE, pages_prefix=pages_prefix)
+        source_path = str(Path(str(document["absolute_path"])).resolve()).lower()
+        if normalized_target in {
+            source_path,
+            str(Path(pages_dir).resolve()).lower(),
+        }:
+            return document, pages_dir
+    return None
 
 
 def _render_search_output(
@@ -821,12 +860,17 @@ def list_indexed_documents() -> str:
     if index_context is not None and index_context.scope_label:
         lines.append(f"Scope: {index_context.scope_label}")
     for idx, document in enumerate(documents, start=1):
+        pages_dir = resolve_pages_directory(
+            blob_store=_PAGE_BLOB_STORE,
+            pages_prefix=str(document.get("pages_prefix") or ""),
+        )
         lines.append(
-            f"[{idx}] doc_id={document['id']} path={document['absolute_path']} "
+            f"[{idx}] doc_id={document['id']} source={document['absolute_path']} "
+            f"pages_dir={pages_dir} page_count={int(document.get('page_count') or 0)} "
             f"name={document.get('original_filename') or document['relative_path']}"
         )
     lines.append("")
-    lines.append("Use semantic_search(...) to find relevant doc_ids.")
+    lines.append("Use glob/grep/read on the pages_dir to answer questions page-by-page.")
     return "\n".join(lines)
 
 
@@ -854,22 +898,24 @@ You are FsExplorer, an AI agent that explores filesystems to answer user questio
 
 | Tool | Purpose | Parameters |
 |------|---------|------------|
-| `scan_folder` | **PARALLEL SCAN** - Scan ALL documents in a folder at once | `directory` |
-| `preview_file` | Quick preview of a single document (~first page) | `file_path` |
-| `parse_file` | **FOCUSED DEEP READ** - parse selected units with optional anchor/query | `file_path`, `focus_hint`, `anchor`, `window`, `max_units` |
-| `read` | Read a plain text file | `file_path` |
-| `grep` | Search for a pattern in a file | `file_path`, `pattern` |
-| `glob` | Find files matching a pattern | `directory`, `pattern` |
-| `semantic_search` | Search indexed chunks and metadata-filtered docs, then union/rank results | `query`, `filters`, `limit` |
-| `get_document` | Read full indexed document by document id | `doc_id` |
-| `list_indexed_documents` | List indexed documents for active corpus | none |
+| `glob` | List page files for one selected document pages directory | `directory`, `pattern` |
+| `grep` | Find candidate pages by searching page markdown files | `file_path`, `pattern` |
+| `read` | Read one page markdown file with page metadata | `file_path` |
+| `parse_file` | Rebuild or inspect a source document when maintenance is needed | `file_path`, `focus_hint`, `anchor`, `window`, `max_units` |
+| `scan_folder` | Legacy broad scan; avoid in normal selected-document QA | `directory` |
+| `preview_file` | Legacy preview tool; avoid when page files exist | `file_path` |
+| `semantic_search` | Legacy indexed retrieval; not part of the main QA path | `query`, `filters`, `limit` |
+| `get_document` | Legacy full-document read; not part of the main QA path | `doc_id` |
+| `list_indexed_documents` | Legacy document list | none |
 
-## Indexed Retrieval Strategy
+## Page Retrieval Strategy
 
-When indexed tools are available:
-1. Start with `semantic_search` to quickly find relevant documents.
-2. Use `get_document` for the top candidate doc IDs.
-3. If indexed tools report index is unavailable, fall back to filesystem tools (`scan_folder`, `parse_file`, etc.).
+The main QA path is page-first, not full-document reading:
+1. Use `glob` on the selected document's `pages_dir` or source path to see available `page-XXXX.md` files.
+2. Use `grep` on that document scope to find candidate pages for the user question.
+3. Use `read` on only a few candidate page files.
+4. If the first pages are insufficient, change the query or switch to new pages. Do not keep rereading the same page range.
+5. Use `parse_file` only for rebuild/debug scenarios, not as the normal answering tool.
 
 ## Structured Context Rules
 
@@ -880,56 +926,36 @@ You will also receive a "STRUCTURED CONTEXT PACK" that summarizes:
 - which older ranges were summarized
 - which gaps remain unresolved
 
-The context pack shows what has already been read; it is not a hard search boundary.
-When the current active range is marked stale or does not directly support the answer, do not keep reading the same pages.
-Change strategy by running a fresh search, switching anchors, switching documents, or expanding into a genuinely new range.
+The context pack shows what pages have already been searched or read; it is not a hard search boundary.
+When the current active page range is marked stale or does not directly support the answer, do not keep reading the same pages.
+Change strategy by running a fresh page search, switching pages, switching documents, or stopping for insufficient evidence.
 
 You may optionally include `context_plan` in your JSON action to suggest how the runtime should manage context.
 Use it only when it helps avoid repeated reads or promotes especially relevant evidence.
 
-Filter syntax for `semantic_search(filters=...)`:
-- `field=value`
-- `field!=value`
-- `field>=number`, `field<=number`, `field>number`, `field<number`
-- `field in (a, b, c)`
-- `field~substring`
-- combine conditions with comma or `and`
+## Three-Phase Page Exploration Strategy
 
-## Three-Phase Document Exploration Strategy
+### PHASE 1: Scope Pages (PARALLEL PAGE LIST)
+1. Start with `glob` for the selected document.
+2. Identify the page directory and rough page range.
 
-### PHASE 1: Parallel Scan (Use `scan_folder`)
-When you encounter a folder with documents:
-1. Use `scan_folder` to scan ALL documents in parallel
-2. This gives you a quick preview of every document at once
-3. In your **reason**, explicitly list your document categorization:
-   - **RELEVANT**: Documents clearly related to the query (list them)
-   - **MAYBE**: Documents that might be relevant (list them)
-   - **SKIP**: Documents not relevant (list them)
+### PHASE 2: Find Candidate Pages
+1. Use `grep` with a focused phrase derived from the user question.
+2. Prefer narrow, content-bearing terms over the full question.
+3. In your **reason**, say which candidate pages look most promising.
 
-### PHASE 2: Deep Dive (Use `parse_file`)
-1. Use `parse_file` on documents marked RELEVANT
-   - Prefer focused params when possible:
-     `parse_file(file_path=..., focus_hint=..., anchor=..., window=1, max_units=4)`
-2. In your **reason**, explain what key information you found
-3. **WATCH FOR CROSS-REFERENCES** - look for mentions like:
-   - "See Exhibit A/B/C..."
-   - "As stated in the [Document Name]..."
-   - "Refer to [filename]..."
-   - Document numbers, exhibit labels, or file names
-4. In your **reason**, note any cross-references you discovered
-
-### PHASE 3: Backtracking (Revisit if Cross-Referenced)
-**CRITICAL**: If a document you're reading references another document that you SKIPPED:
-1. In your **reason**, explain: "Found cross-reference to [document] - need to backtrack"
-2. Use `preview_file` or `parse_file` to read the referenced document
-3. Continue this until all relevant cross-references are resolved
+### PHASE 3: Read Only What You Need
+1. Use `read` on a few candidate page files.
+2. If the answer is incomplete, run a new `grep` or read adjacent pages only when the evidence suggests continuation.
+3. If repeated reads add no new evidence, BACKTRACK by changing the query, changing pages, or changing documents.
+4. If no trustworthy evidence appears after backtracking, stop with insufficient evidence.
 
 ## Providing Detailed Reasoning
 
 Your `reason` field is displayed to the user, so make it informative:
-- After scanning: List which documents you're categorizing as RELEVANT/MAYBE/SKIP and why
-- After parsing: Summarize key findings and any cross-references discovered
-- When backtracking: Explain which reference led you back to a skipped document
+- After `glob`: Explain the page range and what you plan to search next
+- After `grep`: Explain which candidate pages you found and why
+- After `read`: Summarize the evidence from those pages and what gap remains, if any
 
 ## CRITICAL: Citation Requirements for Final Answers
 
@@ -968,21 +994,14 @@ Your final answer should:
 ```
 User asks: "What is the purchase price?"
 
-1. scan_folder("./documents/")
-   Reason: "Scanned 10 documents. Categorizing:
-   - RELEVANT: purchase_agreement.pdf (mentions 'Purchase Price' in preview)
-   - RELEVANT: financial_terms.pdf (contains pricing tables)
-   - MAYBE: exhibits.pdf (referenced by other docs)
-   - SKIP: employee_handbook.pdf, hr_policies.pdf (unrelated to pricing)"
+1. glob(".../pages/", "page-*.md")
+   Reason: "This document has 96 page files. I will search for pages mentioning the purchase price."
 
-2. parse_file("purchase_agreement.pdf")
-   Reason: "Found purchase price of $50M in Section 2.1. Document references 
-   'Exhibit B for price adjustments' - need to check exhibits.pdf next."
+2. grep(".../pages/", "purchase price")
+   Reason: "Candidate pages are 12, 13, and 47. Page 12 and 13 look most likely because the match is in section text rather than a TOC snippet."
 
-3. parse_file("exhibits.pdf")  [BACKTRACKING]
-   Reason: "Backtracking to exhibits.pdf because purchase_agreement.pdf 
-   referenced it for adjustment details. Found working capital adjustment 
-   formula in Exhibit B."
+3. read(".../pages/page-0012.md")
+   Reason: "Page 12 contains the headline purchase price clause. I will read page 13 to confirm the breakdown."
 
 4. STOP with final answer including citations:
    "The purchase price is $50,000,000 [Source: purchase_agreement.pdf, Section 2.1], 
@@ -1429,6 +1448,207 @@ class FsExplorerAgent:
         )
         return rendered, receipt
 
+    def _glob_with_context(self, *, directory: str, pattern: str) -> tuple[str, str]:
+        index_context = _INDEX_CONTEXT_VAR.get()
+        if index_context is None:
+            rendered = glob_paths(directory=directory, pattern=pattern)
+            return rendered, f"Glob receipt: directory={directory}; pattern={pattern}."
+        storage = PostgresStorage(index_context.db_path, read_only=True, initialize=False)
+        try:
+            resolved = _resolve_document_page_scope(
+                storage=storage,
+                index_context=index_context,
+                target=directory,
+            )
+            if resolved is None:
+                rendered = glob_paths(directory=directory, pattern=pattern)
+                return rendered, f"Glob receipt: directory={directory}; pattern={pattern}."
+            document, pages_dir = resolved
+            rendered = glob_paths(directory=pages_dir, pattern=pattern)
+            context_state = get_context_state()
+            if context_state is not None:
+                context_state.set_active_scope(
+                    document_id=str(document["id"]),
+                    file_path=pages_dir,
+                    ranges=[],
+                )
+                _emit_runtime_event(
+                    "page_scope_resolved",
+                    document_id=str(document["id"]),
+                    original_filename=str(
+                        document.get("original_filename")
+                        or document.get("relative_path")
+                        or document["id"]
+                    ),
+                    pages_dir=pages_dir,
+                    page_count=int(document.get("page_count") or 0),
+                )
+            return rendered, (
+                "Glob receipt: "
+                f"document={document.get('original_filename') or document['id']}; "
+                f"pages_dir={pages_dir}; pattern={pattern}."
+            )
+        finally:
+            storage.close()
+
+    def _grep_with_context(self, *, file_path: str, pattern: str) -> tuple[str, str]:
+        index_context = _INDEX_CONTEXT_VAR.get()
+        if index_context is None:
+            rendered = grep_file_content(file_path=file_path, pattern=pattern)
+            return rendered, f"Grep receipt: target={file_path}; pattern={pattern}."
+        storage = PostgresStorage(index_context.db_path, read_only=True, initialize=False)
+        try:
+            resolved = _resolve_document_page_scope(
+                storage=storage,
+                index_context=index_context,
+                target=file_path,
+            )
+            if resolved is None:
+                rendered = grep_file_content(file_path=file_path, pattern=pattern)
+                return rendered, f"Grep receipt: target={file_path}; pattern={pattern}."
+            document, pages_dir = resolved
+            regex = re.compile(pattern=pattern, flags=re.IGNORECASE | re.MULTILINE)
+            pages = load_document_pages(
+                storage=storage,
+                blob_store=_PAGE_BLOB_STORE,
+                document_id=str(document["id"]),
+            )
+            hits: list[dict[str, Any]] = []
+            for page in pages:
+                matches = list(regex.finditer(str(page.get("markdown") or "")))
+                if not matches:
+                    continue
+                snippet = str(page.get("markdown") or "")
+                start = max(0, matches[0].start() - 40)
+                end = min(len(snippet), matches[0].end() + 180)
+                hits.append(
+                    {
+                        "doc_id": str(document["id"]),
+                        "absolute_path": str(page["file_path"]),
+                        "source_unit_no": int(page["page_no"]),
+                        "score": float(len(matches)),
+                        "text": snippet[start:end],
+                    }
+                )
+            hits.sort(
+                key=lambda item: (-float(item["score"]), int(item["source_unit_no"])),
+            )
+            hits = hits[:8]
+            rendered = grep_file_content(file_path=pages_dir, pattern=pattern)
+            context_state = get_context_state()
+            summary_for_model = ""
+            if context_state is not None:
+                summary = context_state.ingest_search_results(
+                    query=pattern,
+                    filters=None,
+                    hits=hits,
+                    limit=min(8, max(1, len(hits))) if hits else 1,
+                )
+                summary_for_model = summary.get("summary_for_model", "")
+                _emit_runtime_event(
+                    "candidate_pages_found",
+                    document_id=str(document["id"]),
+                    original_filename=str(
+                        document.get("original_filename")
+                        or document.get("relative_path")
+                        or document["id"]
+                    ),
+                    candidate_pages=[
+                        {
+                            "page_no": int(hit["source_unit_no"]),
+                            "file_path": str(hit["absolute_path"]),
+                            "score": float(hit["score"]),
+                        }
+                        for hit in hits
+                    ],
+                )
+                _emit_runtime_event(
+                    "context_scope_updated",
+                    context_scope=context_state.snapshot()["context_scope"],
+                )
+            return rendered, (
+                "Grep receipt: "
+                f"document={document.get('original_filename') or document['id']}; "
+                f"pattern={pattern!r}; candidate_pages="
+                f"{', '.join(str(hit['source_unit_no']) for hit in hits) if hits else '-'}; "
+                f"{summary_for_model or 'stored candidate pages for later reasoning.'}"
+            )
+        finally:
+            storage.close()
+
+    def _read_with_context(self, *, file_path: str) -> tuple[str, str]:
+        index_context = _INDEX_CONTEXT_VAR.get()
+        if index_context is None:
+            rendered = read_file(file_path=file_path)
+            return rendered, f"Read receipt: path={file_path}."
+        storage = PostgresStorage(index_context.db_path, read_only=True, initialize=False)
+        try:
+            resolved = find_page_by_path(
+                storage=storage,
+                blob_store=_PAGE_BLOB_STORE,
+                document_ids=list(index_context.document_ids),
+                file_path=file_path,
+            )
+            if resolved is None:
+                rendered = read_file(file_path=file_path)
+                return rendered, f"Read receipt: path={file_path}."
+            document, page = resolved
+            rendered = read_file(file_path=file_path)
+            context_state = get_context_state()
+            if context_state is not None:
+                parse_summary = context_state.ingest_parse_result(
+                    document_id=str(document["id"]),
+                    file_path=str(page["file_path"]),
+                    label=str(
+                        document.get("original_filename")
+                        or document.get("relative_path")
+                        or document["id"]
+                    ),
+                    units=[
+                        {
+                            "unit_no": int(page["page_no"]),
+                            "source_locator": page.get("source_locator"),
+                            "heading": page.get("heading"),
+                            "markdown": page.get("markdown"),
+                        }
+                    ],
+                    total_units=int(document.get("page_count") or 0) or None,
+                    focus_hint=None,
+                    anchor=int(page["page_no"]),
+                    window=0,
+                    max_units=1,
+                )
+                _emit_runtime_event(
+                    "pages_read",
+                    document_id=str(document["id"]),
+                    original_filename=str(
+                        document.get("original_filename")
+                        or document.get("relative_path")
+                        or document["id"]
+                    ),
+                    read_pages=[int(page["page_no"])],
+                )
+                _emit_runtime_event(
+                    "context_scope_updated",
+                    context_scope=context_state.snapshot()["context_scope"],
+                )
+                if context_state.no_new_coverage_streak >= 2:
+                    _emit_runtime_event(
+                        "stale_page_range_detected",
+                        document_id=str(document["id"]),
+                        stale_page_ranges=context_state.snapshot()
+                        .get("coverage_by_document", {})
+                        .get(str(document["id"]), {})
+                        .get("summarized_ranges", []),
+                    )
+                return rendered, _build_parse_receipt(
+                    file_path=str(page["file_path"]),
+                    summary=parse_summary,
+                )
+            return rendered, f"Read receipt: path={file_path}."
+        finally:
+            storage.close()
+
     def _get_document_with_context(self, *, doc_id: str) -> tuple[str, str]:
         rendered, structured = _run_get_document(doc_id)
         state = get_context_state()
@@ -1629,6 +1849,12 @@ class FsExplorerAgent:
             if tool_name == "parse_file":
                 result = self._parse_file_with_cache(**tool_input)
                 history_receipt = getattr(self, "_last_parse_receipt", None)
+            elif tool_name == "glob":
+                result, history_receipt = self._glob_with_context(**tool_input)
+            elif tool_name == "grep":
+                result, history_receipt = self._grep_with_context(**tool_input)
+            elif tool_name == "read":
+                result, history_receipt = self._read_with_context(**tool_input)
             elif tool_name == "semantic_search":
                 result, history_receipt = self._semantic_search_with_context(**tool_input)
             elif tool_name == "get_document":

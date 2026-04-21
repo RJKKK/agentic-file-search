@@ -20,6 +20,7 @@ from .document_parsing import (
     parse_document,
     select_parsed_document,
 )
+from .page_store import parse_page_front_matter
 
 
 # =============================================================================
@@ -33,6 +34,13 @@ MAX_PREVIEW_LINES = 30  # Maximum lines to show in scan results
 
 # Parallel processing settings
 DEFAULT_MAX_WORKERS = 4  # Thread pool size for parallel document scanning
+
+
+def _snippet(text: str, *, limit: int = 220) -> str:
+    normalized = " ".join(str(text or "").split()).strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(0, limit - 3)].rstrip() + "..."
 
 
 # =============================================================================
@@ -180,7 +188,18 @@ def read_file(file_path: str) -> str:
         return f"No such file: {file_path}"
 
     try:
-        return _read_text_with_fallbacks(file_path)
+        content = _read_text_with_fallbacks(file_path)
+        header, body = parse_page_front_matter(content)
+        if header.get("page_no"):
+            lines = [
+                f"=== PAGE {header.get('page_no')} of {header.get('original_filename') or Path(file_path).name} ===",
+                f"Heading: {header.get('heading') or '-'}",
+                f"Source: {header.get('source_locator') or '-'}",
+                "",
+                body,
+            ]
+            return "\n".join(lines).strip()
+        return content
     except OSError as exc:
         return f"Error reading {file_path}: {exc}"
 
@@ -197,19 +216,65 @@ def grep_file_content(file_path: str, pattern: str) -> str:
         A formatted string with matches, "No matches found",
         or an error message if the file doesn't exist.
     """
-    if not os.path.exists(file_path) or not os.path.isfile(file_path):
+    if not os.path.exists(file_path):
+        return f"No such file: {file_path}"
+    regex = re.compile(pattern=pattern, flags=re.MULTILINE | re.IGNORECASE)
+
+    if os.path.isdir(file_path):
+        matches: list[tuple[int, str, str, str, int]] = []
+        for candidate in sorted(Path(file_path).rglob("page-*.md")):
+            try:
+                content = _read_text_with_fallbacks(str(candidate))
+            except OSError:
+                continue
+            header, body = parse_page_front_matter(content)
+            page_no = int(header.get("page_no") or 0)
+            hits = list(regex.finditer(body))
+            if not hits:
+                continue
+            snippet = _snippet(body[hits[0].start() : hits[0].start() + 220], limit=220)
+            matches.append(
+                (
+                    page_no,
+                    str(candidate),
+                    header.get("heading") or "-",
+                    snippet,
+                    len(hits),
+                )
+            )
+        if matches:
+            lines = [f"CANDIDATE PAGES for {pattern} in {file_path}:", ""]
+            for page_no, candidate, heading, snippet, hit_count in matches[:8]:
+                lines.append(
+                    f"- page={page_no} hits={hit_count} path={candidate} heading={heading}"
+                )
+                lines.append(f"  snippet: {snippet}")
+            return "\n".join(lines)
+        return "No matches found"
+
+    if not os.path.isfile(file_path):
         return f"No such file: {file_path}"
 
     try:
         content = _read_text_with_fallbacks(file_path)
     except OSError as exc:
         return f"Error searching {file_path}: {exc}"
-    
-    regex = re.compile(pattern=pattern, flags=re.MULTILINE)
-    matches = regex.findall(content)
-    
+
+    header, body = parse_page_front_matter(content)
+    matches = list(regex.finditer(body if header else content))
     if matches:
-        return f"MATCHES for {pattern} in {file_path}:\n\n- " + "\n- ".join(matches)
+        haystack = body if header else content
+        snippets = [
+            _snippet(haystack[max(0, match.start() - 40) : match.end() + 180], limit=220)
+            for match in matches[:5]
+        ]
+        if header.get("page_no"):
+            return (
+                f"CANDIDATE PAGE page={header.get('page_no')} path={file_path} "
+                f"heading={header.get('heading') or '-'} hits={len(matches)}\n\n- "
+                + "\n- ".join(snippets)
+            )
+        return f"MATCHES for {pattern} in {file_path}:\n\n- " + "\n- ".join(snippets)
     return "No matches found"
 
 
@@ -230,9 +295,29 @@ def glob_paths(directory: str, pattern: str) -> str:
     
     # Use pathlib for cleaner path handling
     search_path = Path(directory) / pattern
-    matches = glob_module.glob(str(search_path))
+    matches = glob_module.glob(str(search_path), recursive=True)
     
     if matches:
+        if any(Path(match).name.startswith("page-") and match.endswith(".md") for match in matches):
+            page_numbers = []
+            for match in matches:
+                stem = Path(match).stem
+                try:
+                    page_numbers.append(int(stem.split("-")[-1]))
+                except ValueError:
+                    continue
+            range_label = (
+                f"{min(page_numbers)}-{max(page_numbers)}" if page_numbers else "-"
+            )
+            lines = [
+                f"PAGES for {directory}:",
+                f"range={range_label}; total={len(matches)}",
+                "",
+            ]
+            lines.extend(f"- {match}" for match in matches[:20])
+            if len(matches) > 20:
+                lines.append(f"- ... ({len(matches) - 20} more)")
+            return "\n".join(lines)
         return f"MATCHES for {pattern} in {directory}:\n\n- " + "\n- ".join(matches)
     return "No matches found"
 
