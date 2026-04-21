@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 import fs_explorer.indexing.pipeline as pipeline_module
+import fs_explorer.document_parsing as parsing_module
 from fs_explorer.document_parsing import (
     PARSER_VERSION,
     ParsedDocument,
@@ -267,6 +268,54 @@ def test_parse_document_markdown_returns_single_page(tmp_path: Path) -> None:
     assert len(parsed.pages) == 1
     assert parsed.pages[0].page_no == 1
     assert "Body text" in parsed.markdown
+
+
+def test_pdf_parser_disables_pymupdf4llm_headers_and_footers(tmp_path: Path, monkeypatch) -> None:
+    pdf_path = tmp_path / "sample.pdf"
+    pdf_path.write_bytes(b"not a real pdf")
+    captured: dict[str, object] = {}
+
+    class FakePyMuPDF4LLM:
+        @staticmethod
+        def to_markdown(doc, **kwargs):  # noqa: ANN001
+            captured["doc"] = doc
+            captured.update(kwargs)
+            return [{"page": 1, "text": "Body text"}]
+
+    monkeypatch.setattr(parsing_module, "pymupdf4llm", FakePyMuPDF4LLM)
+
+    parsed = parse_document(str(pdf_path))
+
+    assert parsed.parser_name == "pymupdf4llm"
+    assert parsed.parser_version == PARSER_VERSION
+    assert parsed.pages[0].markdown == "Body text"
+    assert captured["header"] is False
+    assert captured["footer"] is False
+    assert captured["margins"] == (0.0, 36.0, 0.0, 36.0)
+
+
+def test_pdf_parser_falls_back_to_margins_for_legacy_pymupdf4llm(tmp_path: Path, monkeypatch) -> None:
+    pdf_path = tmp_path / "legacy.pdf"
+    pdf_path.write_bytes(b"not a real pdf")
+    calls: list[dict[str, object]] = []
+
+    class FakeLegacyPyMuPDF4LLM:
+        @staticmethod
+        def to_markdown(doc, **kwargs):  # noqa: ANN001
+            calls.append(dict(kwargs))
+            if "header" in kwargs or "footer" in kwargs:
+                raise TypeError("unexpected keyword argument")
+            return [{"page": 1, "text": "Legacy body"}]
+
+    monkeypatch.setattr(parsing_module, "pymupdf4llm", FakeLegacyPyMuPDF4LLM)
+
+    parsed = parse_document(str(pdf_path))
+
+    assert parsed.pages[0].markdown == "Legacy body"
+    assert len(calls) == 2
+    assert calls[1]["margins"] == (0.0, 36.0, 0.0, 36.0)
+    assert "header" not in calls[1]
+    assert "footer" not in calls[1]
 
 
 def test_indexing_pipeline_reuses_page_cache(tmp_path: Path, monkeypatch) -> None:

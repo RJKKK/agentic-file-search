@@ -1401,8 +1401,6 @@ async def delete_document_api(doc_id: str, db_path: str | None = None):
         storage = PostgresStorage(resolved_db_path)
         try:
             document = _load_document_or_404(storage=storage, doc_id=doc_id)
-            storage.remove_document_from_all_collections(doc_id=doc_id)
-            updated = storage.set_document_deleted(doc_id=doc_id, is_deleted=True)
             pages_prefix = str(document.get("pages_prefix") or "")
             if pages_prefix:
                 _blob_store.delete_prefix(prefix=pages_prefix)
@@ -1411,10 +1409,11 @@ async def delete_document_api(doc_id: str, db_path: str | None = None):
             )
             if source_object_key:
                 _blob_store.delete(object_key=source_object_key)
+            deleted_document = storage.delete_document(doc_id=doc_id)
         finally:
             storage.close()
 
-        if updated is None:
+        if deleted_document is None:
             return _error_response(
                 status_code=404,
                 error_code="document_not_found",
@@ -1424,7 +1423,9 @@ async def delete_document_api(doc_id: str, db_path: str | None = None):
 
         return _json_with_trace(
             {
-                "document": _serialize_document_summary(updated),
+                "document": _serialize_document_summary(
+                    {**deleted_document, "is_deleted": True}
+                ),
                 "deleted": True,
             },
             trace_id=trace_id,

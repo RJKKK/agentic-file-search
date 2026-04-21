@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 import fs_explorer.server as server_module
 from fs_explorer.blob_store import LocalBlobStore
 from fs_explorer.server import app
+from fs_explorer.storage import PostgresStorage
 
 
 @pytest.fixture()
@@ -90,6 +91,14 @@ def test_document_library_list_parse_and_delete(
     assert pages_response.status_code == 200
     assert pages_response.json()["total"] >= 1
     assert "Purchase price" in pages_response.json()["items"][0]["markdown"]
+    assert "document_id:" not in pages_response.json()["items"][0]["markdown"]
+    assert pages_response.json()["items"][0]["page_no"] == 1
+
+    page_path = Path(alpha["pages_prefix"]) / "page-0001.md"
+    stored_page = server_module._blob_store.get(object_key=page_path.as_posix()).decode("utf-8")
+    assert not stored_page.startswith("---\n")
+    assert "document_id:" not in stored_page
+    assert "Purchase price" in stored_page
 
     patch_response = client_with_store.patch(
         f"/api/documents/{beta['id']}",
@@ -115,7 +124,15 @@ def test_document_library_list_parse_and_delete(
         item["id"]: item
         for item in deleted_list.json()["items"]
     }
-    assert listed[beta["id"]]["status"] == "deleted"
+    assert beta["id"] not in listed
+
+    storage = PostgresStorage(db_path, read_only=True, initialize=False)
+    try:
+        assert storage.get_document(doc_id=beta["id"]) is None
+        assert storage.list_document_pages(document_id=beta["id"]) == []
+        assert storage.list_parsed_units(document_id=beta["id"]) == []
+    finally:
+        storage.close()
 
 
 def test_collection_crud_and_document_membership(

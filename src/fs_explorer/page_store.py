@@ -65,21 +65,14 @@ def render_page_markdown(
     heading: str | None,
     body: str,
 ) -> str:
-    """Render one stored page with deterministic front matter."""
-    front_matter = [
-        "---",
-        f'document_id: "{document_id}"',
-        f'original_filename: "{original_filename}"',
-        f"page_no: {int(page_no)}",
-        f'page_label: "{page_label}"',
-        f'content_type: "{content_type or ""}"',
-        f'source_locator: "{source_locator or ""}"',
-        f'heading: "{heading or ""}"',
-        "---",
-        "",
-    ]
+    """Render one stored page body.
+
+    Metadata is persisted in the document_pages manifest, not embedded in the
+    markdown body, so agent reads only see source content.
+    """
+    _ = (document_id, original_filename, page_no, page_label, content_type, source_locator, heading)
     normalized_body = str(body or "").strip()
-    return "\n".join(front_matter) + normalized_body + ("\n" if normalized_body else "")
+    return normalized_body + ("\n" if normalized_body else "")
 
 
 def strip_page_front_matter(markdown: str) -> str:

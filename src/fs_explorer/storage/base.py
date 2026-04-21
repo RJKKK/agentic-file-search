@@ -201,6 +201,9 @@ class StorageBackend(Protocol):
     ) -> dict[str, Any] | None:
         """Toggle logical deletion for a document and return the updated row."""
 
+    def delete_document(self, *, doc_id: str) -> dict[str, Any] | None:
+        """Physically delete a document and all dependent rows."""
+
     def update_document_absolute_path(
         self,
         *,

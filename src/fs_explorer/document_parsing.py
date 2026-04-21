@@ -31,7 +31,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     DocumentConverter = None
 
-PARSER_VERSION = "m2-v1"
+PARSER_VERSION = "m2-v2"
 
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
     {".pdf", ".docx", ".doc", ".pptx", ".xlsx", ".html", ".md"}
@@ -39,6 +39,7 @@ SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
 
 LOGICAL_UNIT_TARGET_CHARS = 1600
 LOGICAL_UNIT_MIN_CHARS = 450
+DEFAULT_PDF_CONTENT_MARGINS = (0.0, 36.0, 0.0, 36.0)
 
 
 class DocumentParseError(RuntimeError):
@@ -618,8 +619,22 @@ def _parse_pdf(
                     document if document is not None else file_path,
                     pages=requested_pages,
                     page_chunks=True,
+                    header=False,
+                    footer=False,
+                    margins=_pdf_content_margins(),
                 )
                 chunks = _extract_pdf_markdown_chunks(payload)
+            except TypeError:
+                try:
+                    payload = pymupdf4llm.to_markdown(
+                        document if document is not None else file_path,
+                        pages=requested_pages,
+                        page_chunks=True,
+                        margins=_pdf_content_margins(),
+                    )
+                    chunks = _extract_pdf_markdown_chunks(payload)
+                except Exception:
+                    chunks = []
             except Exception:
                 chunks = []
 
@@ -820,6 +835,33 @@ def _extract_pdf_markdown_chunks(payload: object) -> list[tuple[int, str]]:
         else:
             chunks.append((index, str(item)))
     return chunks
+
+
+def _pdf_content_margins() -> tuple[float, float, float, float]:
+    """Return page margins used to drop PDF header/footer bands for legacy parsing."""
+    raw = os.getenv("FS_EXPLORER_PDF_CONTENT_MARGINS", "").strip()
+    if not raw:
+        return DEFAULT_PDF_CONTENT_MARGINS
+
+    try:
+        values = tuple(
+            float(part.strip())
+            for part in re.split(r"[,; ]+", raw)
+            if part.strip()
+        )
+    except ValueError:
+        return DEFAULT_PDF_CONTENT_MARGINS
+
+    if len(values) == 1:
+        value = values[0]
+        return (value, value, value, value)
+    if len(values) == 2:
+        top, bottom = values
+        return (0.0, top, 0.0, bottom)
+    if len(values) == 4:
+        left, top, right, bottom = values
+        return (left, top, right, bottom)
+    return DEFAULT_PDF_CONTENT_MARGINS
 
 
 def _strip_pdf_headers_and_footers(

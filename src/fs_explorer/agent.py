@@ -914,8 +914,9 @@ The main QA path is page-first, not full-document reading:
 1. Use `glob` on the selected document's `pages_dir` or source path to see available `page-XXXX.md` files.
 2. Use `grep` on that document scope to find candidate pages for the user question.
 3. Use `read` on only a few candidate page files.
-4. If the first pages are insufficient, change the query or switch to new pages. Do not keep rereading the same page range.
-5. Use `parse_file` only for rebuild/debug scenarios, not as the normal answering tool.
+4. If a candidate page looks incomplete, include BOTH the previous page and the next page as candidate pages before answering.
+5. If the first pages are insufficient, change the query or switch to new pages. Do not keep rereading the same page range.
+6. Use `parse_file` only for rebuild/debug scenarios, not as the normal answering tool.
 
 ## Structured Context Rules
 
@@ -943,12 +944,14 @@ Use it only when it helps avoid repeated reads or promotes especially relevant e
 1. Use `grep` with a focused phrase derived from the user question.
 2. Prefer narrow, content-bearing terms over the full question.
 3. In your **reason**, say which candidate pages look most promising.
+4. When the best page may be a continuation page, the start of a table, the end of a table, or otherwise incomplete, add its previous and next page to your candidate set. Example: if page 33 contains the matching table but the row may continue, consider pages 32, 33, and 34.
 
 ### PHASE 3: Read Only What You Need
 1. Use `read` on a few candidate page files.
-2. If the answer is incomplete, run a new `grep` or read adjacent pages only when the evidence suggests continuation.
-3. If repeated reads add no new evidence, BACKTRACK by changing the query, changing pages, or changing documents.
-4. If no trustworthy evidence appears after backtracking, stop with insufficient evidence.
+2. If the answer is incomplete or appears cut off by a page boundary, read the previous and next page for that evidence page before concluding.
+3. Only treat a tool call as repeated when both the tool name and all parameters are identical. Reading different pages with `read` is valid progress, not repetition.
+4. If repeated identical reads add no new evidence, BACKTRACK by changing the query, changing pages, or changing documents.
+5. If no trustworthy evidence appears after backtracking, provide a best-effort answer from existing evidence and clearly state what remains uncertain. Do not return a generic tool-loop failure message.
 
 ## Providing Detailed Reasoning
 
@@ -1043,6 +1046,7 @@ REPEATED_TOOLCALL_PROMPT = """
 Loop guard: you are repeating the same tool call with the same parameters and are not making progress.
 
 Do not repeat the exact same tool call again.
+Using the same tool with different parameters is allowed. For example, reading page-0033 and then page-0034 is valid progress.
 Choose a meaningfully different next step:
 - change the search or parsing strategy
 - use a different tool
@@ -1050,6 +1054,19 @@ Choose a meaningfully different next step:
 - or ask the human for clarification if the evidence is insufficient
 
 Return exactly one JSON Action object and nothing else.
+"""
+
+BEST_EFFORT_FINAL_PROMPT = """
+Loop guard: you repeated the same tool call multiple times. Stop using tools now.
+
+Using only the evidence already present in the structured context and tool receipts, provide the best-effort final answer to the user's original task.
+
+Requirements:
+- Return exactly one JSON Action object and nothing else.
+- The action must be `{"final_result": "..."}`.
+- Do not say you could not make progress because of repeated tool calls.
+- If evidence is incomplete, answer what is supported and explicitly state the missing/uncertain parts.
+- Include citations for factual claims whenever source/page information is available.
 """
 
 
@@ -1738,7 +1755,36 @@ class FsExplorerAgent:
         signature = _toolcall_signature(tool_name, tool_input)
         return self._last_tool_signature == signature
 
-    async def take_action(self) -> tuple[Action, ActionType] | None:
+    def _best_effort_context_stop(self) -> Action:
+        """Return a final answer assembled from structured evidence when loop repair fails."""
+        context_state = get_context_state()
+        if context_state is None:
+            final_result = (
+                "I reached a repeated tool-call loop. Based on the evidence already shown, "
+                "I cannot add more reliable details, so please use the partial evidence above "
+                "as the best available answer."
+            )
+        else:
+            context_pack, _ = context_state.build_context_pack(max_chars=5000)
+            final_result = (
+                "Based on the evidence already collected, here is the best-effort answer. "
+                "The evidence may be incomplete, so any missing parts should be treated as uncertain.\n\n"
+                f"{context_pack}"
+            )
+        action = Action(
+            action=StopAction(final_result=final_result),
+            reason="Stopped repeated tool calls and returned the best available evidence.",
+        )
+        self._chat_history.append(
+            Content(role="model", parts=[Part.from_text(text=action.model_dump_json())])
+        )
+        return action
+
+    async def take_action(
+        self,
+        *,
+        final_only: bool = False,
+    ) -> tuple[Action, ActionType] | None:
         """
         Request the next action from the AI model.
 
@@ -1809,6 +1855,10 @@ class FsExplorerAgent:
                         parts=[Part.from_text(text=action.model_dump_json())],
                     )
                 )
+                if final_only and action.to_action_type() != "stop":
+                    guarded_stop = self._best_effort_context_stop()
+                    return guarded_stop, guarded_stop.to_action_type()
+
                 if action.to_action_type() == "toolcall":
                     toolcall = cast(ToolCallAction, action.action)
                     tool_input = toolcall.to_fn_args()
@@ -1818,25 +1868,16 @@ class FsExplorerAgent:
                     ):
                         self._repeat_guard_hits += 1
                         if self._repeat_guard_hits >= 2:
-                            guarded_stop = Action(
-                                action=StopAction(
-                                    final_result=(
-                                        "I could not make further progress without repeating "
-                                        "the same tool call. The available evidence appears "
-                                        "truncated or insufficient for a reliable final extraction."
-                                    )
-                                ),
-                                reason=(
-                                    "Loop guard stopped the run after the model repeated the "
-                                    "same tool call multiple times without progress."
-                                ),
-                            )
                             self._chat_history.append(
                                 Content(
-                                    role="model",
-                                    parts=[Part.from_text(text=guarded_stop.model_dump_json())],
+                                    role="user",
+                                    parts=[Part.from_text(text=BEST_EFFORT_FINAL_PROMPT)],
                                 )
                             )
+                            final_result = await self.take_action(final_only=True)
+                            if final_result is not None and final_result[1] == "stop":
+                                return final_result
+                            guarded_stop = self._best_effort_context_stop()
                             return guarded_stop, guarded_stop.to_action_type()
 
                         self._chat_history.append(

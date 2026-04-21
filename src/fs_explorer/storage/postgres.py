@@ -1477,6 +1477,51 @@ class PostgresStorage:
                 return None
         return self.get_document(doc_id=doc_id)
 
+    def delete_document(self, *, doc_id: str) -> dict[str, Any] | None:
+        document = self.get_document(doc_id=doc_id)
+        if document is None:
+            return None
+
+        if self._use_local:
+            state = self._local()
+            state.documents.pop(doc_id, None)
+            state.collection_documents = {
+                key for key in state.collection_documents if key[1] != doc_id
+            }
+            chunk_ids = [
+                chunk_id
+                for chunk_id, item in state.chunks.items()
+                if item["doc_id"] == doc_id
+            ]
+            for chunk_id in chunk_ids:
+                state.chunks.pop(chunk_id, None)
+                state.chunk_embeddings.pop(chunk_id, None)
+            for key in [key for key in state.parsed_units if key[0] == doc_id]:
+                state.parsed_units.pop(key, None)
+            for key in [key for key in state.document_pages if key[0] == doc_id]:
+                state.document_pages.pop(key, None)
+            for image_hash in [
+                image_hash
+                for image_hash, item in state.image_semantics.items()
+                if item["source_document_id"] == doc_id
+            ]:
+                state.image_semantics.pop(image_hash, None)
+            return copy.deepcopy(document)
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM chunk_embeddings
+                WHERE chunk_id IN (SELECT id FROM chunks WHERE doc_id = %s)
+                """,
+                (doc_id,),
+            )
+            cur.execute("DELETE FROM chunks WHERE doc_id = %s", (doc_id,))
+            cur.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
+            if cur.rowcount == 0:
+                return None
+        return document
+
     def update_document_absolute_path(
         self,
         *,

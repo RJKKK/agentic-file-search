@@ -301,7 +301,10 @@ class FsExplorerWorkflow(Workflow):
             f"The user task is still: '{state.initial_task}'. "
             "Given the tool result and structured context you just received, "
             "choose the next action. Do not assume the previously active pages still contain the answer. "
-            "If the current range is stale or insufficient, run a fresh search or parse a genuinely new range."
+            "If the current page appears incomplete, cut off, or part of a continued table/list, "
+            "treat the previous and next page as candidate pages before answering. "
+            "If the current range is stale or insufficient, run a fresh search or read genuinely new adjacent/candidate pages. "
+            "If repeated tool calls would be needed, stop and answer from the evidence already collected with any uncertainty noted."
         )
 
         return await _process_agent_action(agent, ctx, update_directory=True)

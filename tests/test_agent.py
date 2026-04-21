@@ -23,6 +23,7 @@ from fs_explorer.agent import (
     clear_index_context,
 )
 from fs_explorer.models import Action, StopAction, ToolCallAction
+from fs_explorer.document_parsing import PARSER_VERSION
 from google.genai.types import Content, Part
 from fs_explorer.storage import (
     ChunkRecord,
@@ -333,6 +334,63 @@ class TestAgentActions:
         assert action.action.final_result == "Best-effort answer after avoiding a loop."
         assert agent._client.aio.models.calls == 3
 
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
+    async def test_take_action_allows_same_tool_with_different_parameters(self) -> None:
+        read_first_page = (
+            '{"action":{"tool_name":"read","tool_input":'
+            '[{"parameter_name":"file_path","parameter_value":"tests/page-0033.md"}]},'
+            '"reason":"Read the first candidate page"}'
+        )
+        read_adjacent_page = (
+            '{"action":{"tool_name":"read","tool_input":'
+            '[{"parameter_name":"file_path","parameter_value":"tests/page-0034.md"}]},'
+            '"reason":"Read the adjacent page because the table may continue"}'
+        )
+
+        agent = FsExplorerAgent()
+        agent.configure_task("Read adjacent pages when evidence spans pages")
+        agent._client = _SequenceClient([read_first_page, read_adjacent_page])
+
+        first_result = await agent.take_action()
+        assert first_result is not None
+        assert first_result[1] == "toolcall"
+
+        second_result = await agent.take_action()
+        assert second_result is not None
+        assert second_result[1] == "toolcall"
+        assert agent._client.aio.models.calls == 2
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
+    async def test_repeated_tool_guard_never_returns_generic_failure_message(self) -> None:
+        repeated_tool = (
+            '{"action":{"tool_name":"glob","tool_input":'
+            '[{"parameter_name":"directory","parameter_value":"tests"},'
+            '{"parameter_name":"pattern","parameter_value":"*.py"}]},'
+            '"reason":"Search the test directory"}'
+        )
+
+        agent = FsExplorerAgent()
+        agent.configure_task("Answer from current evidence if tools repeat")
+        agent._client = _SequenceClient(
+            [repeated_tool, repeated_tool, repeated_tool, repeated_tool]
+        )
+
+        first_result = await agent.take_action()
+        assert first_result is not None
+        assert first_result[1] == "toolcall"
+
+        second_result = await agent.take_action()
+        assert second_result is not None
+        action, action_type = second_result
+
+        assert action_type == "stop"
+        assert isinstance(action.action, StopAction)
+        assert "I could not make further progress without repeating" not in action.action.final_result
+        assert "best available" in action.action.final_result.lower()
+        assert agent._client.aio.models.calls == 4
+
     @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
     def test_parse_file_auto_anchor_is_consumed_after_one_default(self) -> None:
         agent = FsExplorerAgent()
@@ -421,6 +479,9 @@ class TestSystemPrompt:
         assert "Three-Phase" in SYSTEM_PROMPT or "PHASE" in SYSTEM_PROMPT
         assert "Parallel Scan" in SYSTEM_PROMPT or "PARALLEL" in SYSTEM_PROMPT
         assert "Backtracking" in SYSTEM_PROMPT or "BACKTRACK" in SYSTEM_PROMPT
+        assert "previous page and the next page" in SYSTEM_PROMPT
+        assert "best-effort answer from existing evidence" in SYSTEM_PROMPT
+        assert "tool name and all parameters are identical" in SYSTEM_PROMPT
 
     def test_system_prompt_contains_index_tools(self) -> None:
         """Test that system prompt documents index-aware tools."""
@@ -512,12 +573,12 @@ class TestImageSemanticEnhancement:
         storage.sync_parsed_units(
             document_id=doc_id,
             parser_name="pymupdf4llm",
-            parser_version="m2-v1",
+            parser_version=PARSER_VERSION,
             units=[
                 ParsedUnitRecord(
                     document_id=doc_id,
                     parser_name="pymupdf4llm",
-                    parser_version="m2-v1",
+                    parser_version=PARSER_VERSION,
                     page_no=1,
                     markdown="Quarterly review includes revenue chart and commentary.",
                     content_hash="page-1-hash",
