@@ -3,7 +3,7 @@
 ## Current Position
 
 - The full historical Python implementation has been archived under `legacy/python/`
-- The new default implementation work starts in `node/`
+- The new default implementation now lives at the repository root
 
 ## Phase 1 Node Decisions
 
@@ -16,4 +16,3 @@
 ## Reference Policy
 
 All new Node source files must declare their Python reference files with `Reference:` comments pointing into `legacy/python/`.
-
