@@ -700,7 +700,7 @@ def _parse_pdf(
     for page_no, markdown in cleaned_chunks:
         # Reference: keep PDF parsing close to the legacy chain, but scrub
         # synthetic PyMuPDF table placeholder columns before final normalization.
-        normalized = _normalize_markdown(_sanitize_pdf_table_placeholders(markdown))
+        normalized = _normalize_markdown(_normalize_pdf_table_markdown(markdown))
         images = tuple(
             ParsedImage(
                 image_hash=str(image["image_hash"]),
@@ -1109,15 +1109,33 @@ def _normalize_markdown(value: str) -> str:
     return normalized.strip()
 
 
-def _sanitize_pdf_table_placeholders(value: str) -> str:
-    """Collapse synthetic ColN table columns emitted by PyMuPDF markdown extraction.
+def _normalize_pdf_table_markdown(value: str) -> str:
+    """Normalize unstable PyMuPDF markdown tables into a model-friendly shape.
 
-    Reference: pymupdf4llm may synthesize placeholder headers such as `Col1`,
-    `Col2`, ... when merged cells expand a table grid. These columns often carry
-    no user-visible content and can mislead the downstream model into assuming
-    hidden data exists. We drop truly empty placeholder columns and merge any
-    non-empty spillover content back into the nearest real column.
+    Reference: keep table titles, flatten multiline headers, remove synthetic
+    placeholder columns, and merge obviously fragmented header columns so the
+    downstream model does not invent hidden fields from malformed table grids.
     """
+
+    placeholder_values = {"-", "--", "—", "N/A", "n/a", "null", "None"}
+
+    def normalize_inline_text(text: str) -> str:
+        normalized = re.sub(r"(?i)<br\s*/?>", "", str(text or ""))
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        normalized = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", normalized)
+        normalized = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[A-Za-z0-9])", "", normalized)
+        normalized = re.sub(r"(?<=[A-Za-z0-9])\s+(?=[\u4e00-\u9fff])", "", normalized)
+        return normalized
+
+    def smart_join_text(parts: list[str]) -> str:
+        normalized_parts = [normalize_inline_text(part) for part in parts]
+        normalized_parts = [part for part in normalized_parts if part]
+        if not normalized_parts:
+            return ""
+        joined = "".join(normalized_parts)
+        joined = re.sub(r"\s+", " ", joined).strip()
+        joined = re.sub(r"(?<=[A-Za-z])(?=[A-Z][a-z])", " ", joined)
+        return joined
 
     def is_table_line(line: str) -> bool:
         stripped = line.strip()
@@ -1132,12 +1150,21 @@ def _sanitize_pdf_table_placeholders(value: str) -> str:
     def render_row(cells: list[str]) -> str:
         return "| " + " | ".join(cells) + " |"
 
+    def is_placeholder_cell(value: str) -> bool:
+        stripped = normalize_inline_text(value)
+        return (
+            not stripped
+            or stripped in placeholder_values
+            or bool(re.fullmatch(r":?-{3,}:?", stripped))
+            or bool(re.fullmatch(r"Col\d+", stripped, flags=re.IGNORECASE))
+        )
+
     def meaningful_cell(value: str) -> bool:
-        return bool(value.strip() and value.strip() not in {"-", "--", "—", "N/A", "n/a", "null", "None"})
+        return not is_placeholder_cell(value)
 
     def merge_cells(left: str, right: str) -> str:
-        left = left.strip()
-        right = right.strip()
+        left = normalize_inline_text(left)
+        right = normalize_inline_text(right)
         if not left:
             return right
         if not right:
@@ -1146,7 +1173,62 @@ def _sanitize_pdf_table_placeholders(value: str) -> str:
             return left
         if left in right:
             return right
-        return f"{left} {right}"
+        return smart_join_text([left, right])
+
+    def maybe_extract_caption(rows: list[list[str]]) -> tuple[str | None, list[list[str]]]:
+        if len(rows) < 3 or not is_separator_line(rows[1]):
+            return None, rows
+        meaningful = [normalize_inline_text(cell) for cell in rows[0] if meaningful_cell(cell)]
+        if len(meaningful) != 1:
+            return None, rows
+        return meaningful[0], rows[2:]
+
+    def merge_fragmented_header_columns(
+        header: list[str],
+        body_rows: list[list[str]],
+    ) -> tuple[list[str], list[list[str]]]:
+        width = len(header)
+        keep_indexes = list(range(width))
+
+        def header_is_fragment(text: str) -> bool:
+            stripped = normalize_inline_text(text)
+            return bool(stripped) and len(stripped) <= 10 and not re.search(r"\d", stripped)
+
+        def body_group_is_sparse(start: int, end: int) -> bool:
+            if end <= start:
+                return False
+            for row in body_rows:
+                meaningful_count = sum(1 for index in range(start, end + 1) if meaningful_cell(row[index]))
+                if meaningful_count > 1:
+                    return False
+            return True
+
+        index = 0
+        while index < width - 1:
+            if not header_is_fragment(header[index]):
+                index += 1
+                continue
+            group_end = index
+            while (
+                group_end + 1 < width
+                and header_is_fragment(header[group_end + 1])
+                and body_group_is_sparse(index, group_end + 1)
+            ):
+                group_end += 1
+            if group_end == index:
+                index += 1
+                continue
+            header[index] = smart_join_text(header[index : group_end + 1])
+            for row in body_rows:
+                row[index] = smart_join_text(row[index : group_end + 1])
+            for drop_index in range(index + 1, group_end + 1):
+                if drop_index in keep_indexes:
+                    keep_indexes.remove(drop_index)
+            index = group_end + 1
+
+        normalized_header = [header[index] for index in keep_indexes]
+        normalized_body = [[row[index] for index in keep_indexes] for row in body_rows]
+        return normalized_header, normalized_body
 
     def normalize_table_block(lines: list[str]) -> list[str]:
         if len(lines) < 2:
@@ -1156,46 +1238,73 @@ def _sanitize_pdf_table_placeholders(value: str) -> str:
         if width < 2:
             return lines
         rows = [row + [""] * (width - len(row)) for row in rows]
-        header = rows[0]
-        if not is_separator_line(rows[1]):
-            return lines
-
+        caption, rows = maybe_extract_caption(rows)
+        if caption:
+            if len(rows) < 2:
+                return lines
+            header = rows[0]
+            body_rows = rows[1:]
+        else:
+            if len(rows) < 2 or not is_separator_line(rows[1]):
+                return lines
+            header = rows[0]
+            body_rows = rows[2:]
         placeholder_indexes = [
-            index for index, cell in enumerate(header) if re.fullmatch(r"Col\d+", cell.strip(), flags=re.IGNORECASE)
+            index
+            for index, cell in enumerate(header)
+            if re.fullmatch(r"Col\d+", normalize_inline_text(cell), flags=re.IGNORECASE)
         ]
-        if not placeholder_indexes:
-            return lines
-
         keep_indexes = list(range(width))
         for index in placeholder_indexes:
-            body_values = [row[index].strip() for row in rows[2:]]
+            body_values = [normalize_inline_text(row[index]) for row in body_rows]
             if not any(meaningful_cell(value) for value in body_values):
                 if index in keep_indexes:
                     keep_indexes.remove(index)
                 continue
 
-            target_index = next((candidate for candidate in reversed(range(index)) if candidate in keep_indexes and candidate not in placeholder_indexes), None)
+            target_index = next(
+                (
+                    candidate
+                    for candidate in reversed(range(index))
+                    if candidate in keep_indexes and candidate not in placeholder_indexes
+                ),
+                None,
+            )
             if target_index is None:
                 target_index = next(
-                    (candidate for candidate in range(index + 1, width) if candidate in keep_indexes and candidate not in placeholder_indexes),
+                    (
+                        candidate
+                        for candidate in range(index + 1, width)
+                        if candidate in keep_indexes and candidate not in placeholder_indexes
+                    ),
                     None,
                 )
             if target_index is None:
                 continue
 
-            for row_index, row in enumerate(rows):
-                if row_index < 2:
-                    continue
+            for row in body_rows:
                 row[target_index] = merge_cells(row[target_index], row[index])
             if index in keep_indexes:
                 keep_indexes.remove(index)
 
-        if len(keep_indexes) == width or len(keep_indexes) < 2:
+        header = [normalize_inline_text(header[index]) for index in keep_indexes]
+        body_rows = [[normalize_inline_text(row[index]) for index in keep_indexes] for row in body_rows]
+        if len(header) < 2:
             return lines
 
-        normalized_rows = [[row[index] for index in keep_indexes] for row in rows]
-        normalized_rows[1] = ["---"] * len(keep_indexes)
-        return [render_row(row) for row in normalized_rows]
+        header, body_rows = merge_fragmented_header_columns(header, body_rows)
+        if len(header) < 2:
+            return lines
+        if any(is_placeholder_cell(cell) for cell in header):
+            return lines
+
+        rendered_lines: list[str] = []
+        if caption:
+            rendered_lines.extend([f"表格标题：{caption}", ""])
+        rendered_lines.append(render_row(header))
+        rendered_lines.append(render_row(["---"] * len(header)))
+        rendered_lines.extend(render_row(row) for row in body_rows)
+        return rendered_lines
 
     output_lines: list[str] = []
     pending_table: list[str] = []

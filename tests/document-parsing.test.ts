@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, it } from "node:test";
 
 import {
@@ -54,6 +55,52 @@ function buildDocument(): ParsedDocument {
       },
     ],
   };
+}
+
+function configuredPythonExecutable(): string {
+  if (process.env.FS_EXPLORER_PYTHON_BIN?.trim()) {
+    return process.env.FS_EXPLORER_PYTHON_BIN.trim();
+  }
+  if (process.platform === "win32") {
+    return resolve(process.cwd(), ".venv", "Scripts", "python.exe");
+  }
+  return resolve(process.cwd(), ".venv", "bin", "python");
+}
+
+function runPythonTableNormalization(markdown: string): string | null {
+  const pythonExecutable = configuredPythonExecutable();
+  const pythonEnv = {
+    ...process.env,
+    PYTHONUTF8: "1",
+    PYTHONIOENCODING: "utf-8",
+  };
+  const probe = spawnSync(pythonExecutable, ["-c", "print('ok')"], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: pythonEnv,
+  });
+  if (probe.error || probe.status !== 0) {
+    return null;
+  }
+  const script = [
+    "import json",
+    "import sys",
+    "from pathlib import Path",
+    "sys.path.insert(0, str(Path.cwd()))",
+    "from python.document_parsing import _normalize_pdf_table_markdown",
+    "print(json.dumps({'text': _normalize_pdf_table_markdown(sys.stdin.read())}, ensure_ascii=False))",
+  ].join("\n");
+  const completed = spawnSync(pythonExecutable, ["-c", script], {
+    cwd: process.cwd(),
+    input: markdown,
+    encoding: "utf8",
+    env: pythonEnv,
+  });
+  if (completed.error) {
+    throw completed.error;
+  }
+  assert.equal(completed.status, 0, completed.stderr || completed.stdout || "python normalization failed");
+  return (JSON.parse(completed.stdout) as { text: string }).text;
 }
 
 describe("document parsing runtime", () => {
@@ -133,5 +180,44 @@ describe("document parsing runtime", () => {
   it("decodes Python bridge JSON even when dependency warnings precede stdout", () => {
     const parsed = parsePythonBridgeJson('Warning - optional module noise\n{"ok":true,"document":{"units":[]}}');
     assert.deepEqual(parsed, { ok: true, document: { units: [] } });
+  });
+
+  it("normalizes unstable PDF table markdown into caption plus flat headers", (t) => {
+    const normalized = runPythonTableNormalization([
+      "|董事出席董事会及股东大会的情况|---|---|---|---|---|---|---|",
+      "|---|---|---|---|---|---|---|---|",
+      "|董事姓名|本报告期应<br>参加董事会<br>次数|现场出席董<br>事会次数|以通讯方式<br>参加董事会<br>次数|委托出席董<br>事会次数|缺席董事会<br>次数|是否连续两<br>次未亲自参<br>加董事会会<br>议|出席股东大<br>会次数|",
+      "|曾毓群|7|1|6|0|0|否|2|",
+    ].join("\n"));
+    if (normalized == null) {
+      t.skip("Python executable is not available for PDF normalization checks.");
+      return;
+    }
+    assert.match(normalized, /表格标题：董事出席董事会及股东大会的情况/);
+    assert.match(
+      normalized,
+      /\| 董事姓名 \| 本报告期应参加董事会次数 \| 现场出席董事会次数 \| 以通讯方式参加董事会次数 \| 委托出席董事会次数 \| 缺席董事会次数 \| 是否连续两次未亲自参加董事会会议 \| 出席股东大会次数 \|/,
+    );
+    assert.match(normalized, /\| 曾毓群 \| 7 \| 1 \| 6 \| 0 \| 0 \| 否 \| 2 \|/);
+
+    const mergedPlaceholder = runPythonTableNormalization([
+      "|项目|Col1|2024|",
+      "|---|---|---|",
+      "|产品|动力电池系统|321|",
+      "|地区|中国|88|",
+    ].join("\n"));
+    assert.equal(mergedPlaceholder?.includes("Col1"), false);
+    assert.match(mergedPlaceholder ?? "", /\| 项目 \| 2024 \|/);
+    assert.match(mergedPlaceholder ?? "", /\| 产品动力电池系统 \| 321 \|/);
+
+    const plainTable = runPythonTableNormalization([
+      "|列A|列B|",
+      "|---|---|",
+      "|A|B|",
+    ].join("\n"));
+    assert.equal(plainTable, "| 列A | 列B |\n| --- | --- |\n| A | B |");
+
+    const plainText = runPythonTableNormalization("普通段落\n\n不是表格");
+    assert.equal(plainText, "普通段落\n\n不是表格");
   });
 });

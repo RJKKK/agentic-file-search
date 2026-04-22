@@ -151,6 +151,7 @@ The Node rewrite now has its own SQLite storage backend.
 - Runtime module: `src/storage/sqlite.ts`
 - Path resolution: `src/storage/resolve-db-path.ts`
 - Driver: `better-sqlite3`
+- Default database file: `data/agentic-file-search.sqlite`
 - Physical tables: `collections`, `collection_documents`, `documents`, `document_pages`, `image_semantics`
 
 The legacy `corpora` concept is still present logically, but it is no longer a physical table. Node stores the `root_path <-> corpus_id` mapping as hidden `corpus_scope` rows inside `collections`, while user-visible collections continue to behave like normal reusable document sets.

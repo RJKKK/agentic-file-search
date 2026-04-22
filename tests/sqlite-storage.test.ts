@@ -306,4 +306,12 @@ describe("sqlite storage", () => {
 
     storage.close();
   });
+
+  it("defaults the sqlite database into the data directory", () => {
+    const resolved = resolveSqliteDbPath();
+    assert.match(
+      resolved.replaceAll("\\", "/"),
+      /\/data\/agentic-file-search\.sqlite$/,
+    );
+  });
 });

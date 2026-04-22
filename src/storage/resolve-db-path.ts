@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const DEFAULT_SQLITE_DB_PATH = "agentic-file-search.sqlite";
+export const DEFAULT_SQLITE_DB_PATH = "data/agentic-file-search.sqlite";
 export const ENV_SQLITE_DB_PATH = "FS_EXPLORER_SQLITE_PATH";
 export const ENV_DB_PATH_LEGACY = "FS_EXPLORER_DB_PATH";
 

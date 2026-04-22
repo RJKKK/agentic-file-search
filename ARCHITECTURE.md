@@ -53,6 +53,7 @@ Outdated skills remain versioned in-repo for reference and later replacement des
 
 The Node storage layer uses SQLite via `better-sqlite3`.
 
+- Default runtime database file: `data/agentic-file-search.sqlite`
 - Physical tables: `collections`, `collection_documents`, `documents`, `document_pages`, `image_semantics`
 - Logical corpus mapping: hidden `collections.kind='corpus_scope'` rows
 - User-visible collections: `collections.kind='user'`
