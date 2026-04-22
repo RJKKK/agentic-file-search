@@ -28,7 +28,7 @@ const uploadState = reactive({ uploading: false, progress: 0 });
 const detailState = reactive({
   visible: false,
   loading: false,
-  parseLoading: false,
+  rebuildLoading: false,
   document: null,
   pageSummary: null,
   metadataDraft: "{}",
@@ -212,7 +212,7 @@ async function loadDocumentDetail(docId = detailState.document?.id) {
       `/api/documents/${encodeURIComponent(docId)}${suffix ? `?${suffix}` : ""}`,
     );
     detailState.document = payload.document;
-    detailState.pageSummary = payload.page_summary || payload.parse_summary || null;
+    detailState.pageSummary = payload.page_summary || null;
     detailState.metadataDraft = JSON.stringify(payload.document.metadata || {}, null, 2);
   } catch (error) {
     ElMessage.error(error.message);
@@ -262,9 +262,9 @@ async function saveMetadata() {
   }
 }
 
-async function parseDocument(row = detailState.document) {
+async function rebuildDocumentPages(row = detailState.document) {
   if (!row?.id) return;
-  detailState.parseLoading = true;
+  detailState.rebuildLoading = true;
   try {
     const params = buildDbParams();
     const suffix = params.toString();
@@ -276,7 +276,7 @@ async function parseDocument(row = detailState.document) {
         body: JSON.stringify({ mode: "full", force: true }),
       },
     );
-    ElMessage.success("文档解析已完成");
+    ElMessage.success("文档分页已重建");
     await Promise.all([
       refreshDocuments(documentList.page),
       refreshAskDocuments(),
@@ -286,7 +286,7 @@ async function parseDocument(row = detailState.document) {
   } catch (error) {
     ElMessage.error(error.message);
   } finally {
-    detailState.parseLoading = false;
+    detailState.rebuildLoading = false;
   }
 }
 
@@ -778,7 +778,7 @@ function scrollAnswerToBottom() {
               :show-file-list="false"
               :disabled="uploadState.uploading"
             >
-              <el-button type="primary" :loading="uploadState.uploading" :icon="Upload">上传并解析</el-button>
+              <el-button type="primary" :loading="uploadState.uploading" :icon="Upload">上传并生成分页</el-button>
             </el-upload>
             <el-progress
               v-if="uploadState.uploading || uploadState.progress === 100"
@@ -818,8 +818,8 @@ function scrollAnswerToBottom() {
             <el-table-column label="操作" width="260" fixed="right">
               <template #default="{ row }">
                 <el-button size="small" :icon="View" @click="openDocumentDetail(row)">查看</el-button>
-                <el-button size="small" :loading="detailState.parseLoading && detailState.document?.id === row.id" @click="parseDocument(row)">
-                  解析
+                <el-button size="small" :loading="detailState.rebuildLoading && detailState.document?.id === row.id" @click="rebuildDocumentPages(row)">
+                  重建
                 </el-button>
                 <el-button size="small" type="danger" :icon="Delete" @click="deleteDocument(row)">删除</el-button>
               </template>
@@ -856,7 +856,7 @@ function scrollAnswerToBottom() {
         </el-descriptions>
 
         <div class="drawer-actions">
-          <el-button type="primary" :loading="detailState.parseLoading" @click="parseDocument(detailState.document)">重新解析</el-button>
+          <el-button type="primary" :loading="detailState.rebuildLoading" @click="rebuildDocumentPages(detailState.document)">重建分页</el-button>
           <el-button @click="loadDocumentPages(detailState.document.id, detailState.pagesPage)">刷新页面预览</el-button>
           <el-button type="success" @click="saveMetadata">保存 Metadata</el-button>
         </div>

@@ -280,6 +280,14 @@ class StorageBackend(Protocol):
     ) -> dict[str, dict[str, Any]]:
         """Fetch cached image semantics keyed by image hash."""
 
+    def list_image_semantics_for_document(
+        self,
+        *,
+        document_id: str,
+        page_nos: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """List cached image semantics rows for a document, optionally filtered by page."""
+
     def update_image_semantic(
         self,
         *,

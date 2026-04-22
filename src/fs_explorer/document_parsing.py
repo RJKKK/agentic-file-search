@@ -371,25 +371,18 @@ def enhance_page_image_semantics(
     parser_version: str = PARSER_VERSION,
 ) -> int:
     """Lazy-fill missing image semantics for one parsed page."""
-    units = storage.list_parsed_units(
+    _ = parser_version
+    images = storage.list_image_semantics_for_document(
         document_id=document_id,
-        parser_version=parser_version,
-        unit_nos=[page_no],
+        page_nos=[page_no],
     )
-    target = next((unit for unit in units if int(unit["page_no"]) == page_no), None)
-    if target is None:
-        return 0
-
-    images = _coerce_image_list(target.get("images"))
     if not images:
         return 0
 
-    hashes = [str(image["image_hash"]) for image in images]
-    semantics = storage.get_image_semantics(image_hashes=hashes)
     missing_hashes = [
-        image_hash
-        for image_hash in hashes
-        if image_hash not in semantics or not semantics[image_hash].get("semantic_text")
+        str(image["image_hash"])
+        for image in images
+        if not image.get("semantic_text")
     ]
     if not missing_hashes:
         return 0
@@ -413,7 +406,7 @@ def enhance_page_image_semantics(
         semantic_text, semantic_model = enhancer.describe_image(
             file_path=file_path,
             page_no=page_no,
-            image_index=int(image["image_index"]),
+            image_index=int(image["source_image_index"]),
             image_bytes=asset["image_bytes"],
             mime_type=_optional_str(image.get("mime_type")),
         )
@@ -904,6 +897,19 @@ def _strip_pdf_headers_and_footers(
             )
             if last_index is not None and trimmed[last_index] in repeated_footers:
                 trimmed[last_index] = ""
+            last_index = next(
+                (
+                    index
+                    for index in range(len(trimmed) - 1, -1, -1)
+                    if trimmed[index].strip()
+                ),
+                None,
+            )
+            if last_index is not None and _is_page_number_footer(
+                trimmed[last_index],
+                page_no=page_no,
+            ):
+                trimmed[last_index] = ""
         cleaned.append((page_no, "\n".join(trimmed)))
 
     return cleaned
@@ -916,6 +922,24 @@ def _is_repeatable_header_footer(text: str) -> bool:
     if len(stripped) > 120:
         return False
     return True
+
+
+def _is_page_number_footer(text: str, *, page_no: int) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    compact = re.sub(r"\s+", "", stripped)
+    escaped_page_no = re.escape(str(int(page_no)))
+    patterns = (
+        rf"^{escaped_page_no}$",
+        rf"^[-_~·•]*{escaped_page_no}[-_~·•]*$",
+        rf"^第{escaped_page_no}页$",
+        rf"^{escaped_page_no}/\d+$",
+        rf"^\d+/{escaped_page_no}$",
+        rf"^{escaped_page_no}-\d+$",
+        rf"^\d+-{escaped_page_no}$",
+    )
+    return any(re.fullmatch(pattern, compact) for pattern in patterns)
 
 
 def _extract_pdf_images(

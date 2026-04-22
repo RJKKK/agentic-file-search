@@ -23,13 +23,11 @@ from .fs import (
     glob_paths,
     scan_folder,
     preview_file,
-    parse_file,
 )
 from .blob_store import LocalBlobStore
 from .document_pages import find_page_by_path, load_document_pages, resolve_pages_directory
 from .embeddings import EmbeddingProvider
-from .document_parsing import PARSER_VERSION, ParseSelector, enhance_page_image_semantics, reconstruct_parsed_document
-from .document_cache import format_parse_result, get_or_parse_document_units, resolve_document_by_path
+from .document_parsing import enhance_page_image_semantics
 from .document_library import LIBRARY_CORPUS_ROOT
 from .image_semantics import build_image_semantic_enhancer
 from .index_config import resolve_db_path
@@ -89,9 +87,7 @@ class TokenUsage:
     def add_tool_result(self, result: str, tool_name: str) -> None:
         """Record metrics from a tool execution."""
         self.tool_result_chars += len(result)
-        if tool_name == "parse_file":
-            self.documents_parsed += 1
-        elif tool_name == "scan_folder":
+        if tool_name == "scan_folder":
             # Count documents in scan result by counting document markers
             self.documents_scanned += result.count("│ [")
         elif tool_name == "preview_file":
@@ -365,15 +361,6 @@ def _emit_runtime_event(event_type: str, **data: Any) -> None:
         callback(event_type, data)
 
 
-def _unit_to_context_dict(unit: Any) -> dict[str, Any]:
-    return {
-        "unit_no": int(unit.unit_no),
-        "source_locator": unit.source_locator,
-        "heading": unit.heading,
-        "markdown": unit.markdown,
-    }
-
-
 def _build_parse_receipt(
     *,
     file_path: str,
@@ -539,23 +526,20 @@ def _render_search_output(
 
 def _pending_image_hashes_for_unit(
     storage: PostgresStorage,
-    unit: dict[str, Any],
+    *,
+    document_id: str,
+    page_no: int,
 ) -> list[str]:
-    images = unit.get("images")
-    if not isinstance(images, list) or not images:
+    images = storage.list_image_semantics_for_document(
+        document_id=document_id,
+        page_nos=[page_no],
+    )
+    if not images:
         return []
-    image_hashes = [
+    return [
         str(image["image_hash"])
         for image in images
-        if isinstance(image, dict) and isinstance(image.get("image_hash"), str)
-    ]
-    if not image_hashes:
-        return []
-    semantics = storage.get_image_semantics(image_hashes=image_hashes)
-    return [
-        image_hash
-        for image_hash in image_hashes
-        if image_hash not in semantics or not semantics[image_hash].get("semantic_text")
+        if isinstance(image.get("image_hash"), str) and not image.get("semantic_text")
     ]
 
 
@@ -610,22 +594,42 @@ def _maybe_enhance_images_for_hits(
     seen_pages: set[tuple[str, int]] = set()
 
     for hit in hits:
-        units = storage.list_parsed_units(
-            document_id=hit.doc_id,
-            parser_version=PARSER_VERSION,
-        )
-        for page_no in _select_relevant_page_numbers(units, hit.text):
+        if hit.source_unit_no is not None:
+            units = load_document_pages(
+                storage=storage,
+                blob_store=_PAGE_BLOB_STORE,
+                document_id=hit.doc_id,
+                page_nos=[int(hit.source_unit_no)],
+            )
+            page_numbers = [int(hit.source_unit_no)] if units else []
+        else:
+            units = load_document_pages(
+                storage=storage,
+                blob_store=_PAGE_BLOB_STORE,
+                document_id=hit.doc_id,
+            )
+            page_numbers = _select_relevant_page_numbers(units, hit.text)
+
+        for page_no in page_numbers:
             page_key = (hit.doc_id, page_no)
             if page_key in seen_pages:
                 continue
             seen_pages.add(page_key)
-            unit = next(
+            page = next(
                 (candidate for candidate in units if int(candidate["page_no"]) == page_no),
                 None,
             )
-            if unit is None:
+            if page is None:
                 continue
-            pending_hashes = _pending_image_hashes_for_unit(storage, unit)
+            pending_hashes = _pending_image_hashes_for_unit(
+                storage,
+                document_id=hit.doc_id,
+                page_no=page_no,
+            )
+            image_rows = storage.list_image_semantics_for_document(
+                document_id=hit.doc_id,
+                page_nos=[page_no],
+            )
             if pending_hashes:
                 _emit_runtime_event(
                     "image_enhance_started",
@@ -650,7 +654,7 @@ def _maybe_enhance_images_for_hits(
                     image_hashes=pending_hashes,
                     enhanced_images=page_enhanced,
                 )
-            elif unit.get("images"):
+            elif image_rows:
                 cached_pages += 1
                 _emit_runtime_event(
                     "cache_hit",
@@ -658,7 +662,7 @@ def _maybe_enhance_images_for_hits(
                     doc_id=hit.doc_id,
                     absolute_path=hit.absolute_path,
                     page_no=page_no,
-                    cached_images=len(unit["images"]),
+                    cached_images=len(image_rows),
                 )
 
     return enhanced_images, cached_pages
@@ -669,39 +673,29 @@ def _format_cached_image_semantics(
     *,
     document_id: str,
 ) -> str:
-    units = storage.list_parsed_units(
-        document_id=document_id,
-        parser_version=PARSER_VERSION,
-    )
-    if not units:
+    image_rows = storage.list_image_semantics_for_document(document_id=document_id)
+    if not image_rows:
         return ""
 
+    page_headings = {
+        int(page["page_no"]): str(page.get("heading") or "").strip()
+        for page in storage.list_document_pages(document_id=document_id)
+    }
     lines: list[str] = []
-    for unit in units:
-        images = unit.get("images")
-        if not isinstance(images, list) or not images:
-            continue
-        image_hashes = [
-            str(image["image_hash"])
-            for image in images
-            if isinstance(image, dict) and isinstance(image.get("image_hash"), str)
-        ]
-        semantics = storage.get_image_semantics(image_hashes=image_hashes)
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for image in image_rows:
+        grouped.setdefault(int(image["source_page_no"]), []).append(image)
+    for page_no in sorted(grouped):
         page_entries: list[str] = []
-        for image in images:
-            if not isinstance(image, dict):
-                continue
-            image_hash = image.get("image_hash")
-            if not isinstance(image_hash, str):
-                continue
-            semantic = semantics.get(image_hash)
-            if semantic is None or not semantic.get("semantic_text"):
+        for image in grouped[page_no]:
+            if not image.get("semantic_text"):
                 continue
             page_entries.append(
-                f"- image {image.get('image_index', '?')}: {semantic['semantic_text']}"
+                f"- image {image.get('source_image_index', '?')}: {image['semantic_text']}"
             )
         if page_entries:
-            lines.append(f"Page {unit['page_no']}:")
+            heading = page_headings.get(page_no)
+            lines.append(f"Page {page_no}{f' ({heading})' if heading else ''}:")
             lines.extend(page_entries)
 
     if not lines:
@@ -810,13 +804,17 @@ def _run_get_document(
     semantic_section = _format_cached_image_semantics(storage, document_id=doc_id)
     document_body = str(document.get("content") or "")
     if not document_body.strip():
-        cached_units = storage.list_parsed_units(
+        page_blobs = load_document_pages(
+            storage=storage,
+            blob_store=_PAGE_BLOB_STORE,
             document_id=doc_id,
-            parser_version=PARSER_VERSION,
         )
-        cached_document = reconstruct_parsed_document(cached_units)
-        if cached_document is not None:
-            document_body = cached_document.markdown
+        if page_blobs:
+            document_body = "\n\n".join(
+                str(page.get("markdown") or "").strip()
+                for page in page_blobs
+                if str(page.get("markdown") or "").strip()
+            )
 
     rendered = (
         f"=== DOCUMENT {doc_id} ===\n"
@@ -880,7 +878,6 @@ TOOLS: dict[Tools, Callable[..., str]] = {
     "glob": glob_paths,
     "scan_folder": scan_folder,
     "preview_file": preview_file,
-    "parse_file": parse_file,
     "semantic_search": semantic_search,
     "get_document": get_document,
     "list_indexed_documents": list_indexed_documents,
@@ -901,7 +898,6 @@ You are FsExplorer, an AI agent that explores filesystems to answer user questio
 | `glob` | List page files for one selected document pages directory | `directory`, `pattern` |
 | `grep` | Find candidate pages by searching page markdown files | `file_path`, `pattern` |
 | `read` | Read one page markdown file with page metadata | `file_path` |
-| `parse_file` | Rebuild or inspect a source document when maintenance is needed | `file_path`, `focus_hint`, `anchor`, `window`, `max_units` |
 | `scan_folder` | Legacy broad scan; avoid in normal selected-document QA | `directory` |
 | `preview_file` | Legacy preview tool; avoid when page files exist | `file_path` |
 | `semantic_search` | Legacy indexed retrieval; not part of the main QA path | `query`, `filters`, `limit` |
@@ -916,7 +912,7 @@ The main QA path is page-first, not full-document reading:
 3. Use `read` on only a few candidate page files.
 4. If a candidate page looks incomplete, include BOTH the previous page and the next page as candidate pages before answering.
 5. If the first pages are insufficient, change the query or switch to new pages. Do not keep rereading the same page range.
-6. Use `parse_file` only for rebuild/debug scenarios, not as the normal answering tool.
+6. Page files are already built at upload time. Do not ask for reparsing during normal QA.
 
 ## Structured Context Rules
 
@@ -1029,7 +1025,6 @@ For tool calls, use exactly this shape:
 - `glob`
 - `scan_folder`
 - `preview_file`
-- `parse_file`
 - `semantic_search`
 - `get_document`
 - `list_indexed_documents`
@@ -1323,7 +1318,6 @@ class FsExplorerAgent:
         self.model_name = text_config.model_name
         self._chat_history: list[Content] = []
         self._last_tool_signature: str | None = None
-        self._last_parse_receipt: str | None = None
         self._repeat_guard_hits = 0
         self.token_usage = TokenUsage()
         self._budget_manager = ContextBudgetManager(
@@ -1905,44 +1899,9 @@ class FsExplorerAgent:
             tool_name: Name of the tool to execute.
             tool_input: Dictionary of arguments to pass to the tool.
         """
-        if tool_name == "parse_file":
-            anchor = _LAST_FOCUS_ANCHOR_VAR.get()
-            if (
-                "anchor" not in tool_input
-                and anchor is not None
-                and bool(anchor.get("auto_inject_allowed", False))
-            ):
-                path = str(tool_input.get("file_path") or "")
-                anchor_path = str(anchor.get("absolute_path") or "")
-                try:
-                    normalized_path = str(Path(path).resolve())
-                except Exception:
-                    normalized_path = path
-                try:
-                    normalized_anchor = str(Path(anchor_path).resolve())
-                except Exception:
-                    normalized_anchor = anchor_path
-                if (
-                    normalized_path
-                    and normalized_anchor
-                    and (
-                        normalized_path.lower() == normalized_anchor.lower()
-                        or normalized_anchor.lower().endswith(normalized_path.lower())
-                    )
-                ):
-                    tool_input.setdefault("anchor", anchor.get("source_unit_no"))
-                    tool_input.setdefault("focus_hint", anchor.get("query"))
-                    tool_input.setdefault("window", 1)
-                    tool_input.setdefault("max_units", 4)
-                    consumed_anchor = dict(anchor)
-                    consumed_anchor["auto_inject_allowed"] = False
-                    _set_last_focus_anchor(consumed_anchor)
         history_receipt: str | None = None
         try:
-            if tool_name == "parse_file":
-                result = self._parse_file_with_cache(**tool_input)
-                history_receipt = getattr(self, "_last_parse_receipt", None)
-            elif tool_name == "glob":
+            if tool_name == "glob":
                 result, history_receipt = self._glob_with_context(**tool_input)
             elif tool_name == "grep":
                 result, history_receipt = self._grep_with_context(**tool_input)
@@ -1969,134 +1928,10 @@ class FsExplorerAgent:
             history_receipt = f"Tool result for {tool_name}:\n\n{result}"
         self._append_history_receipt(history_receipt)
 
-    def _parse_file_with_cache(
-        self,
-        file_path: str,
-        focus_hint: str | None = None,
-        anchor: int | None = None,
-        window: int = 1,
-        max_units: int | None = None,
-    ) -> str:
-        self._last_parse_receipt = None
-        index_context = _INDEX_CONTEXT_VAR.get()
-        if index_context is None:
-            return parse_file(
-                file_path=file_path,
-                focus_hint=focus_hint,
-                anchor=anchor,
-                window=window,
-                max_units=max_units,
-            )
-
-        storage = PostgresStorage(index_context.db_path)
-        try:
-            normalized_target = str(Path(file_path).resolve())
-            scoped_documents = (
-                storage.list_documents_by_ids(
-                    doc_ids=list(index_context.document_ids),
-                    include_deleted=False,
-                )
-                if index_context.document_ids
-                else storage.list_documents(
-                    corpus_id=storage.get_corpus_id(index_context.root_folder or LIBRARY_CORPUS_ROOT) or "",
-                    include_deleted=False,
-                )
-            )
-            document = next(
-                (
-                    item
-                    for item in scoped_documents
-                    if str(Path(str(item["absolute_path"])).resolve()) == normalized_target
-                ),
-                None,
-            )
-            if document is None or bool(document.get("is_deleted", False)):
-                return parse_file(
-                    file_path=file_path,
-                    focus_hint=focus_hint,
-                    anchor=anchor,
-                    window=window,
-                    max_units=max_units,
-                )
-
-            selector = (
-                ParseSelector(
-                    query=focus_hint.strip() if focus_hint else None,
-                    anchor=anchor,
-                    window=max(window, 0),
-                    max_units=max_units,
-                )
-                if (
-                    (focus_hint is not None and focus_hint.strip())
-                    or anchor is not None
-                    or max_units is not None
-                )
-                else None
-            )
-            parsed = get_or_parse_document_units(
-                storage=storage,
-                document=document,
-                blob_store=None,
-                selector=selector,
-                force=False,
-            )
-            rendered = format_parse_result(
-                file_path=file_path,
-                selected_document=parsed.selected_document,
-                total_units=parsed.total_units,
-                anchor=anchor,
-                window=window,
-                max_units=max_units,
-            )
-            context_state = get_context_state()
-            if context_state is not None:
-                parse_summary = context_state.ingest_parse_result(
-                    document_id=str(document["id"]),
-                    file_path=str(document["absolute_path"]),
-                    label=str(
-                        document.get("original_filename")
-                        or document.get("relative_path")
-                        or document["id"]
-                    ),
-                    units=[
-                        _unit_to_context_dict(unit)
-                        for unit in parsed.selected_document.units
-                    ],
-                    total_units=parsed.total_units,
-                    focus_hint=focus_hint.strip() if focus_hint else None,
-                    anchor=anchor,
-                    window=window,
-                    max_units=max_units,
-                )
-                self._last_parse_receipt = _build_parse_receipt(
-                    file_path=file_path,
-                    summary=parse_summary,
-                )
-                _emit_runtime_event(
-                    "evidence_added",
-                    tool_name="parse_file",
-                    summary=parse_summary,
-                )
-                _emit_runtime_event(
-                    "context_scope_updated",
-                    context_scope=context_state.snapshot()["context_scope"],
-                )
-                if parse_summary.get("coverage_gap"):
-                    _emit_runtime_event(
-                        "coverage_gap_detected",
-                        document_id=str(document["id"]),
-                        file_path=str(document["absolute_path"]),
-                        coverage_gap=parse_summary.get("coverage_gap"),
-                    )
-            return rendered
-        finally:
-            storage.close()
-
     def reset(self) -> None:
         """Reset the agent's conversation history and token tracking."""
         self._chat_history.clear()
         self._last_tool_signature = None
-        self._last_parse_receipt = None
         self._repeat_guard_hits = 0
         self.token_usage = TokenUsage()
         _LAST_FOCUS_ANCHOR_VAR.set(None)

@@ -2154,6 +2154,63 @@ class PostgresStorage:
             }
         return result
 
+    def list_image_semantics_for_document(
+        self,
+        *,
+        document_id: str,
+        page_nos: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        if page_nos is not None and len(page_nos) == 0:
+            return []
+        if self._use_local:
+            allowed_pages = set(page_nos) if page_nos is not None else None
+            results: list[dict[str, Any]] = []
+            for item in self._local().image_semantics.values():
+                if str(item.get("source_document_id")) != document_id:
+                    continue
+                page_no = int(item.get("source_page_no") or 0)
+                if allowed_pages is not None and page_no not in allowed_pages:
+                    continue
+                results.append(copy.deepcopy(item))
+            results.sort(
+                key=lambda item: (
+                    int(item.get("source_page_no") or 0),
+                    int(item.get("source_image_index") or 0),
+                )
+            )
+            return results
+
+        sql = """
+            SELECT
+                image_hash, source_document_id, source_page_no, source_image_index,
+                mime_type, width, height, semantic_text, semantic_model
+            FROM image_semantics
+            WHERE source_document_id = %s
+        """
+        params: list[Any] = [document_id]
+        if page_nos:
+            placeholders = ", ".join(["%s"] * len(page_nos))
+            sql += f" AND source_page_no IN ({placeholders})"
+            params.extend(sorted(set(page_nos)))
+        sql += " ORDER BY source_page_no ASC, source_image_index ASC"
+        with self._conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        return [
+            {
+                "image_hash": str(row[0]),
+                "source_document_id": str(row[1]),
+                "source_page_no": int(row[2]),
+                "source_image_index": int(row[3]),
+                "mime_type": row[4],
+                "width": row[5],
+                "height": row[6],
+                "semantic_text": row[7],
+                "semantic_model": row[8],
+            }
+            for row in rows
+        ]
+
     def update_image_semantic(
         self,
         *,

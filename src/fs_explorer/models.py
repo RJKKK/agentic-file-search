@@ -19,7 +19,6 @@ Tools: TypeAlias = Literal[
     "glob",
     "scan_folder",
     "preview_file",
-    "parse_file",
     "semantic_search",
     "get_document",
     "list_indexed_documents",

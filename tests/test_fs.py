@@ -16,6 +16,7 @@ from fs_explorer.fs import (
     clear_document_cache,
     SUPPORTED_EXTENSIONS,
 )
+from fs_explorer.page_store import render_page_markdown
 
 
 class TestDescribeDirContent:
@@ -54,6 +55,27 @@ class TestReadFile:
         """Test reading a file that doesn't exist."""
         content = read_file("tests/testfiles/file2.txt")
         assert content == "No such file: tests/testfiles/file2.txt"
+
+    def test_page_blob_reads_with_page_context(self, tmp_path: Path) -> None:
+        """Test reading a stored page blob returns plain body content."""
+        page_path = tmp_path / "page-0001.md"
+        page_path.write_text(
+            render_page_markdown(
+                document_id="doc-1",
+                original_filename="alpha.md",
+                page_no=1,
+                page_label="1",
+                content_type="text/markdown",
+                source_locator="page-1",
+                heading="Alpha",
+                body="Purchase price is $45,000,000.",
+            ),
+            encoding="utf-8",
+        )
+
+        content = read_file(str(page_path))
+
+        assert content == "Purchase price is $45,000,000.\n"
 
     def test_windows_encoded_file(self, tmp_path: Path) -> None:
         """Test reading a GBK/CP936-style file on Windows-friendly fallback paths."""

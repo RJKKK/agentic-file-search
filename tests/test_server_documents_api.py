@@ -73,9 +73,9 @@ def test_document_library_list_parse_and_delete(
         json={"mode": "incremental", "force": False, "anchor": 1, "window": 0, "max_units": 1},
     )
     assert parse_response.status_code == 200
-    parse_payload = parse_response.json()
-    assert parse_payload["document_id"] == alpha["id"]
-    assert parse_payload["parsed_units"] >= 1
+    rebuild_payload = parse_response.json()
+    assert rebuild_payload["document_id"] == alpha["id"]
+    assert rebuild_payload["page_count"] >= 1
 
     detail_response = client_with_store.get(
         f"/api/documents/{alpha['id']}",
@@ -83,6 +83,7 @@ def test_document_library_list_parse_and_delete(
     )
     assert detail_response.status_code == 200
     assert detail_response.json()["document"]["original_filename"] == "alpha.md"
+    assert "parse_summary" not in detail_response.json()
 
     pages_response = client_with_store.get(
         f"/api/documents/{alpha['id']}/pages",

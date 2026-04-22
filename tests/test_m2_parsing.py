@@ -205,6 +205,28 @@ class MemoryStorage:
             if image_hash in self.image_semantics
         }
 
+    def list_image_semantics_for_document(
+        self,
+        *,
+        document_id: str,
+        page_nos: list[int] | None = None,
+    ) -> list[dict[str, object]]:
+        allowed_pages = set(page_nos) if page_nos is not None else None
+        results = []
+        for item in self.image_semantics.values():
+            if str(item["source_document_id"]) != document_id:
+                continue
+            if allowed_pages is not None and int(item["source_page_no"]) not in allowed_pages:
+                continue
+            results.append(item.copy())
+        results.sort(
+            key=lambda item: (
+                int(item["source_page_no"]),
+                int(item["source_image_index"]),
+            )
+        )
+        return results
+
     def update_image_semantic(
         self,
         *,
@@ -316,6 +338,23 @@ def test_pdf_parser_falls_back_to_margins_for_legacy_pymupdf4llm(tmp_path: Path,
     assert calls[1]["margins"] == (0.0, 36.0, 0.0, 36.0)
     assert "header" not in calls[1]
     assert "footer" not in calls[1]
+
+
+def test_pdf_parser_strips_terminal_page_number(tmp_path: Path, monkeypatch) -> None:
+    pdf_path = tmp_path / "footer-page-no.pdf"
+    pdf_path.write_bytes(b"not a real pdf")
+
+    class FakePyMuPDF4LLM:
+        @staticmethod
+        def to_markdown(doc, **kwargs):  # noqa: ANN001
+            return [{"page": 51, "text": "董事会成员名单\n\n51"}]
+
+    monkeypatch.setattr(parsing_module, "pymupdf4llm", FakePyMuPDF4LLM)
+
+    parsed = parse_document(str(pdf_path))
+
+    assert parsed.pages[0].page_no == 51
+    assert parsed.pages[0].markdown == "董事会成员名单"
 
 
 def test_indexing_pipeline_reuses_page_cache(tmp_path: Path, monkeypatch) -> None:

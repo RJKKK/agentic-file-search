@@ -67,10 +67,19 @@ def render_page_markdown(
 ) -> str:
     """Render one stored page body.
 
-    Metadata is persisted in the document_pages manifest, not embedded in the
-    markdown body, so agent reads only see source content.
+    Metadata is persisted in the document_pages manifest. Page blobs themselves
+    remain plain markdown/text so object-store files are easy to inspect and
+    grep directly.
     """
-    _ = (document_id, original_filename, page_no, page_label, content_type, source_locator, heading)
+    _ = (
+        document_id,
+        original_filename,
+        page_no,
+        page_label,
+        content_type,
+        source_locator,
+        heading,
+    )
     normalized_body = str(body or "").strip()
     return normalized_body + ("\n" if normalized_body else "")
 

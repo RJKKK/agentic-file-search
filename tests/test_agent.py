@@ -1,5 +1,6 @@
 """Tests for the FsExplorerAgent class."""
 
+import io
 import pytest
 import os
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import fs_explorer.agent as agent_module
+from fs_explorer.blob_store import LocalBlobStore
 from fs_explorer.agent import (
     FsExplorerAgent,
     SYSTEM_PROMPT,
@@ -22,15 +24,15 @@ from fs_explorer.agent import (
     get_search_flags,
     clear_index_context,
 )
+from fs_explorer.document_pages import page_record_from_manifest
 from fs_explorer.models import Action, StopAction, ToolCallAction
-from fs_explorer.document_parsing import PARSER_VERSION
+from fs_explorer.page_store import StoredPage, render_page_markdown
 from google.genai.types import Content, Part
 from fs_explorer.storage import (
     ChunkRecord,
     DocumentRecord,
     DuckDBStorage,
     ImageSemanticRecord,
-    ParsedUnitRecord,
 )
 from .conftest import MockGenAIClient
 
@@ -391,32 +393,21 @@ class TestAgentActions:
         assert "best available" in action.action.final_result.lower()
         assert agent._client.aio.models.calls == 4
 
-    @patch.dict(os.environ, {"TEXT_API_KEY": "test-api-key"})
-    def test_parse_file_auto_anchor_is_consumed_after_one_default(self) -> None:
-        agent = FsExplorerAgent()
-        captured_inputs: list[dict[str, object]] = []
+    def test_parse_action_response_rejects_parse_file_tool(self) -> None:
+        raw = """
+{
+  "action": {
+    "tool_name": "parse_file",
+    "tool_input": {
+      "file_path": "report.pdf"
+    }
+  },
+  "reason": "Reparse the original file."
+}
+"""
+        action = _parse_action_response(raw)
 
-        def fake_parse_file_with_cache(**kwargs):  # noqa: ANN003
-            captured_inputs.append(dict(kwargs))
-            return "focused parse"
-
-        agent._parse_file_with_cache = fake_parse_file_with_cache  # type: ignore[method-assign]
-        agent_module._LAST_FOCUS_ANCHOR_VAR.set(
-            {
-                "doc_id": "doc-1",
-                "absolute_path": str(Path("report.pdf").resolve()),
-                "source_unit_no": 48,
-                "query": "董事会成员",
-                "auto_inject_allowed": True,
-            }
-        )
-
-        agent.call_tool("parse_file", {"file_path": str(Path("report.pdf").resolve())})
-        agent.call_tool("parse_file", {"file_path": str(Path("report.pdf").resolve())})
-
-        assert captured_inputs[0]["anchor"] == 48
-        assert captured_inputs[0]["focus_hint"] == "董事会成员"
-        assert "anchor" not in captured_inputs[1]
+        assert action is None
 
 
 class TestTokenUsage:
@@ -432,10 +423,10 @@ class TestTokenUsage:
         assert usage.total_tokens == 150
         assert usage.api_calls == 1
 
-    def test_add_tool_result_parse_file(self) -> None:
-        """Test tracking parse_file tool usage."""
+    def test_add_tool_result_preview_file(self) -> None:
+        """Test tracking preview_file tool usage."""
         usage = TokenUsage()
-        usage.add_tool_result("document content here", "parse_file")
+        usage.add_tool_result("document content here", "preview_file")
         
         assert usage.documents_parsed == 1
         assert usage.tool_result_chars == len("document content here")
@@ -469,10 +460,10 @@ class TestSystemPrompt:
         """Test that system prompt documents all tools."""
         assert "scan_folder" in SYSTEM_PROMPT
         assert "preview_file" in SYSTEM_PROMPT
-        assert "parse_file" in SYSTEM_PROMPT
         assert "read" in SYSTEM_PROMPT
         assert "grep" in SYSTEM_PROMPT
         assert "glob" in SYSTEM_PROMPT
+        assert "parse_file" not in SYSTEM_PROMPT
 
     def test_system_prompt_contains_strategy(self) -> None:
         """Test that system prompt includes exploration strategy."""
@@ -548,6 +539,7 @@ class TestImageSemanticEnhancement:
     @staticmethod
     def _seed_indexed_pdf(tmp_path):
         storage = DuckDBStorage(str(tmp_path / "index.duckdb"))
+        object_store = LocalBlobStore(tmp_path / "object_store")
         corpus_id = storage.get_or_create_corpus(str(tmp_path.resolve()))
         doc_id = storage.make_document_id(corpus_id, "report.pdf")
         document = DocumentRecord(
@@ -560,6 +552,8 @@ class TestImageSemanticEnhancement:
             file_mtime=0.0,
             file_size=128,
             content_sha256="sha-report",
+            original_filename="report.pdf",
+            pages_prefix="documents/report.pdf/pages",
         )
         chunk = ChunkRecord(
             id=storage.make_chunk_id(doc_id, 0, 0, 56),
@@ -570,21 +564,37 @@ class TestImageSemanticEnhancement:
             end_char=56,
         )
         storage.upsert_document(document, [chunk])
-        storage.sync_parsed_units(
+        storage.sync_document_pages(
             document_id=doc_id,
-            parser_name="pymupdf4llm",
-            parser_version=PARSER_VERSION,
-            units=[
-                ParsedUnitRecord(
+            pages=[
+                page_record_from_manifest(
+                    StoredPage(
+                        page_no=1,
+                        object_key="documents/report.pdf/pages/page-0001.md",
+                        heading="Quarterly review",
+                        source_locator="page-1",
+                        content_hash="page-1-hash",
+                        char_count=56,
+                        is_synthetic_page=False,
+                    ),
                     document_id=doc_id,
-                    parser_name="pymupdf4llm",
-                    parser_version=PARSER_VERSION,
-                    page_no=1,
-                    markdown="Quarterly review includes revenue chart and commentary.",
-                    content_hash="page-1-hash",
-                    images_json='[{"image_hash":"img-1","image_index":1,"mime_type":"image/png","width":320,"height":200}]',
                 )
             ],
+        )
+        object_store.put(
+            object_key="documents/report.pdf/pages/page-0001.md",
+            data=io.BytesIO(
+                render_page_markdown(
+                    document_id=doc_id,
+                    original_filename="report.pdf",
+                    page_no=1,
+                    page_label="1",
+                    content_type="application/pdf",
+                    source_locator="page-1",
+                    heading="Quarterly review",
+                    body="Quarterly review includes revenue chart and commentary.",
+                ).encode("utf-8")
+            ),
         )
         storage.upsert_image_semantics(
             images=[
@@ -599,14 +609,14 @@ class TestImageSemanticEnhancement:
                 )
             ]
         )
-        return storage, corpus_id, doc_id
+        return storage, object_store, corpus_id, doc_id
 
     def test_semantic_search_lazily_enhances_hit_images(
         self,
         tmp_path,
         monkeypatch,
     ) -> None:
-        storage, corpus_id, _ = self._seed_indexed_pdf(tmp_path)
+        storage, object_store, corpus_id, _ = self._seed_indexed_pdf(tmp_path)
 
         class StubEnhancer:
             def __init__(self) -> None:
@@ -622,6 +632,7 @@ class TestImageSemanticEnhancement:
             "_get_index_storage_and_corpus",
             lambda: (storage, corpus_id, None),
         )
+        monkeypatch.setattr(agent_module, "_PAGE_BLOB_STORE", object_store)
         monkeypatch.setattr(
             "fs_explorer.document_parsing._extract_pdf_images",
             lambda file_path, page_no, include_bytes=False: [
@@ -653,7 +664,7 @@ class TestImageSemanticEnhancement:
         tmp_path,
         monkeypatch,
     ) -> None:
-        storage, corpus_id, doc_id = self._seed_indexed_pdf(tmp_path)
+        storage, object_store, corpus_id, doc_id = self._seed_indexed_pdf(tmp_path)
 
         class StubEnhancer:
             def describe_image(self, **kwargs):  # noqa: ANN003
@@ -665,6 +676,7 @@ class TestImageSemanticEnhancement:
             "_get_index_storage_and_corpus",
             lambda: (storage, corpus_id, None),
         )
+        monkeypatch.setattr(agent_module, "_PAGE_BLOB_STORE", object_store)
         monkeypatch.setattr(
             "fs_explorer.document_parsing._extract_pdf_images",
             lambda file_path, page_no, include_bytes=False: [
@@ -703,7 +715,7 @@ class TestImageSemanticEnhancement:
         tmp_path,
         monkeypatch,
     ) -> None:
-        storage, corpus_id, doc_id = self._seed_indexed_pdf(tmp_path)
+        storage, object_store, corpus_id, doc_id = self._seed_indexed_pdf(tmp_path)
         storage.update_image_semantic(
             image_hash="img-1",
             semantic_text="Revenue bar chart with quarterly labels.",
@@ -714,10 +726,84 @@ class TestImageSemanticEnhancement:
             "_get_index_storage_and_corpus",
             lambda: (storage, corpus_id, None),
         )
+        monkeypatch.setattr(agent_module, "_PAGE_BLOB_STORE", object_store)
 
         rendered = get_document(doc_id)
 
         assert "Image semantics cache:" in rendered
-        assert "Page 1:" in rendered
+        assert "Page 1 (Quarterly review):" in rendered
         assert "image 1: Revenue bar chart with quarterly labels." in rendered
+        storage.close()
+
+    def test_get_document_falls_back_to_page_blobs_when_content_is_empty(
+        self,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        storage = DuckDBStorage(str(tmp_path / "index.duckdb"))
+        blob_store = LocalBlobStore(tmp_path / "object_store")
+        corpus_id = storage.get_or_create_corpus(str(tmp_path.resolve()))
+        doc_id = storage.make_document_id(corpus_id, "report.pdf")
+        document = DocumentRecord(
+            id=doc_id,
+            corpus_id=corpus_id,
+            relative_path="report.pdf",
+            absolute_path=str(tmp_path / "report.pdf"),
+            content="",
+            metadata_json="{}",
+            file_mtime=0.0,
+            file_size=128,
+            content_sha256="sha-report",
+            original_filename="report.pdf",
+            pages_prefix="documents/report.pdf/pages",
+        )
+        storage.upsert_document_stub(document)
+        storage.sync_document_pages(
+            document_id=doc_id,
+            pages=[
+                page_record_from_manifest(
+                    StoredPage(
+                        page_no=1,
+                        object_key="documents/report.pdf/pages/page-0001.md",
+                        heading="Summary",
+                        source_locator="page-1",
+                        content_hash="page-1",
+                        char_count=17,
+                        is_synthetic_page=False,
+                    ),
+                    document_id=doc_id,
+                ),
+                page_record_from_manifest(
+                    StoredPage(
+                        page_no=2,
+                        object_key="documents/report.pdf/pages/page-0002.md",
+                        heading="Details",
+                        source_locator="page-2",
+                        content_hash="page-2",
+                        char_count=17,
+                        is_synthetic_page=False,
+                    ),
+                    document_id=doc_id,
+                ),
+            ],
+        )
+        blob_store.put(
+            object_key="documents/report.pdf/pages/page-0001.md",
+            data=io.BytesIO(b"Page one summary.\n"),
+        )
+        blob_store.put(
+            object_key="documents/report.pdf/pages/page-0002.md",
+            data=io.BytesIO(b"Page two details.\n"),
+        )
+        monkeypatch.setattr(agent_module, "_PAGE_BLOB_STORE", blob_store)
+        monkeypatch.setattr(
+            agent_module,
+            "_get_index_storage_and_corpus",
+            lambda: (storage, corpus_id, None),
+        )
+
+        rendered = get_document(doc_id)
+
+        assert "Page one summary." in rendered
+        assert "Page two details." in rendered
         storage.close()

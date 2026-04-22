@@ -53,7 +53,13 @@ from .index_config import resolve_db_path
 from .indexing import IndexingPipeline
 from .indexing.metadata import auto_discover_profile
 from .search import MetadataFilterParseError, parse_metadata_filters
-from .storage import CollectionRecord, DocumentPageRecord, DocumentRecord, PostgresStorage
+from .storage import (
+    CollectionRecord,
+    DocumentPageRecord,
+    DocumentRecord,
+    ImageSemanticRecord,
+    PostgresStorage,
+)
 from .page_store import persist_document_pages, validate_storage_filename
 from .workflow import (
     AskHumanEvent,
@@ -497,6 +503,12 @@ def _sync_document_pages(
             for page in stored_pages
         ],
     )
+    storage.upsert_image_semantics(
+        images=_image_records_from_parsed_document(
+            document_id=str(document["id"]),
+            parsed_document=parsed_document,
+        )
+    )
     storage.update_document_parse_state(
         doc_id=str(document["id"]),
         parsed_content_sha256=source_hash,
@@ -513,6 +525,26 @@ def _sync_document_pages(
         "pages_updated": len(stored_pages),
         "from_cache": False,
     }
+
+
+def _image_records_from_parsed_document(
+    *,
+    document_id: str,
+    parsed_document,
+) -> list[ImageSemanticRecord]:
+    return [
+        ImageSemanticRecord(
+            image_hash=image.image_hash,
+            source_document_id=document_id,
+            source_page_no=unit.page_no,
+            source_image_index=image.image_index,
+            mime_type=image.mime_type,
+            width=image.width,
+            height=image.height,
+        )
+        for unit in parsed_document.units
+        for image in unit.images
+    ]
 
 
 async def _run_exploration_session(session: ExploreSession) -> None:
@@ -1254,6 +1286,12 @@ async def upload_document_api(
                         for page in stored_pages
                     ],
                 )
+                storage.upsert_image_semantics(
+                    images=_image_records_from_parsed_document(
+                        document_id=doc_id,
+                        parsed_document=parsed_document,
+                    )
+                )
                 storage.update_document_parse_state(
                     doc_id=doc_id,
                     parsed_content_sha256=source_hash,
@@ -1332,7 +1370,6 @@ async def get_document_api(doc_id: str, db_path: str | None = None):
                     page_count=len(pages),
                 ),
                 "page_summary": page_summary,
-                "parse_summary": page_summary,
             },
             trace_id=trace_id,
         )
@@ -1475,8 +1512,6 @@ async def parse_document_api(
                 "pages_updated": parse_result["pages_updated"],
                 "from_cache": parse_result["from_cache"],
                 "page_naming_scheme": "page-0001.md",
-                "parsed_units": parse_result["page_count"],
-                "parsed_units_updated": parse_result["pages_updated"],
             },
             trace_id=trace_id,
         )
