@@ -38,6 +38,74 @@ describe("sqlite storage", () => {
     ]);
   });
 
+  it("migrates older sqlite schemas during initialize", async () => {
+    const root = await mkdtemp(join(tmpdir(), "afs-sqlite-migrate-"));
+    const dbPath = join(root, "storage.sqlite");
+    const db = new Database(dbPath);
+    db.exec(`
+      CREATE TABLE collections (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        is_deleted INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE documents (
+        id TEXT PRIMARY KEY,
+        corpus_id TEXT NOT NULL,
+        relative_path TEXT NOT NULL,
+        absolute_path TEXT NOT NULL,
+        content TEXT NOT NULL DEFAULT '',
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        file_mtime REAL NOT NULL,
+        file_size INTEGER NOT NULL,
+        content_sha256 TEXT NOT NULL,
+        last_indexed_at TEXT NOT NULL,
+        is_deleted INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE TABLE document_pages (
+        document_id TEXT NOT NULL,
+        page_no INTEGER NOT NULL,
+        object_key TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        char_count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (document_id, page_no)
+      );
+
+      INSERT INTO collections (id, name, is_deleted, created_at, updated_at)
+      VALUES ('collection_legacy', 'Legacy', 0, '2024-01-01T00:00:00.000Z', '2024-01-01T00:00:00.000Z');
+
+      INSERT INTO documents (
+        id, corpus_id, relative_path, absolute_path, content, metadata_json,
+        file_mtime, file_size, content_sha256, last_indexed_at, is_deleted
+      )
+      VALUES (
+        'doc_legacy', 'corpus_legacy', 'legacy.pdf', 'legacy.pdf', 'Legacy body', '{}',
+        1, 11, 'sha-legacy', '2024-01-01T00:00:00.000Z', 0
+      );
+    `);
+    db.close();
+
+    const storage = new SqliteStorage({ dbPath });
+    storage.initialize();
+
+    assert.equal(storage.getDocument("doc_legacy")?.original_filename, "legacy.pdf");
+    assert.equal(storage.getDocument("doc_legacy")?.upload_status, "uploaded");
+    assert.deepEqual(storage.listCollections().map((item) => item.name), ["Legacy"]);
+
+    const corpusId = storage.getOrCreateCorpus("blob://library/default");
+    assert.equal(storage.getCorpusId("blob://library/default"), corpusId);
+    const collection = storage.createCollection("Migrated");
+    storage.attachDocumentsToCollection(collection.id, ["doc_legacy"]);
+    assert.deepEqual(storage.listCollectionDocuments(collection.id).map((item) => item.id), [
+      "doc_legacy",
+    ]);
+
+    storage.close();
+  });
+
   it("preserves corpus semantics via hidden scope collections", async () => {
     const root = await mkdtemp(join(tmpdir(), "afs-sqlite-corpus-"));
     const dbPath = join(root, "storage.sqlite");
@@ -52,6 +120,55 @@ describe("sqlite storage", () => {
     const userCollection = storage.createCollection("Deals");
     assert.deepEqual(storage.listCollections().map((item) => item.name), ["Deals"]);
     assert.equal(storage.getCollection(userCollection.id)?.name, "Deals");
+
+    storage.close();
+  });
+
+  it("enforces active collection names and replaces document mappings", async () => {
+    const root = await mkdtemp(join(tmpdir(), "afs-sqlite-collections-"));
+    const dbPath = join(root, "storage.sqlite");
+    const storage = new SqliteStorage({ dbPath });
+    storage.initialize();
+
+    const corpusId = storage.getOrCreateCorpus("blob://library/default");
+    const docA = SqliteStorage.makeDocumentId(corpusId, "alpha.md");
+    const docB = SqliteStorage.makeDocumentId(corpusId, "beta.md");
+    for (const [docId, relativePath] of [
+      [docA, "alpha.md"],
+      [docB, "beta.md"],
+    ] as const) {
+      storage.upsertDocumentStub({
+        id: docId,
+        corpusId,
+        relativePath,
+        absolutePath: relativePath,
+        content: "",
+        metadataJson: "{}",
+        fileMtime: 1,
+        fileSize: 10,
+        contentSha256: `sha-${relativePath}`,
+        originalFilename: relativePath,
+      });
+    }
+
+    const deals = storage.createCollection("Deals");
+    assert.throws(() => storage.createCollection("Deals"), /already exists/i);
+    assert.equal(storage.countCollectionDocuments(deals.id), 0);
+
+    const other = storage.createCollection("Other");
+    assert.throws(() => storage.updateCollection(other.id, "Deals"), /already exists/i);
+
+    storage.replaceCollectionDocuments(deals.id, [docA, docB]);
+    assert.deepEqual(storage.listCollectionDocuments(deals.id).map((item) => item.id), [docA, docB]);
+    assert.equal(storage.countCollectionDocuments(deals.id), 2);
+
+    storage.replaceDocumentCollections(docA, [other.id]);
+    assert.deepEqual(storage.listDocumentCollections(docA).map((item) => item.id), [other.id]);
+    assert.deepEqual(storage.listCollectionDocuments(deals.id).map((item) => item.id), [docB]);
+
+    storage.setCollectionDeleted(deals.id, true);
+    const reused = storage.createCollection("Deals");
+    assert.equal(reused.name, "Deals");
 
     storage.close();
   });
@@ -311,7 +428,7 @@ describe("sqlite storage", () => {
     const resolved = resolveSqliteDbPath();
     assert.match(
       resolved.replaceAll("\\", "/"),
-      /\/data\/agentic-file-search\.sqlite$/,
+      /\/data\/agentic-file-search\.db$/,
     );
   });
 });

@@ -168,14 +168,45 @@ describe("http server", () => {
       payload: upload.body,
     });
     const docId = uploaded.json().document.id as string;
+    const uploadB = multipartBody({ filename: "beta.pdf", content: "%PDF fake" });
+    const uploadedB = await app.inject({
+      method: "POST",
+      url: "/api/documents",
+      headers: { "content-type": uploadB.contentType },
+      payload: uploadB.body,
+    });
+    const docIdB = uploadedB.json().document.id as string;
 
     const created = await app.inject({
       method: "POST",
       url: "/api/collections",
       payload: { name: "Deals" },
     });
-    assert.equal(created.statusCode, 200);
+    assert.equal(created.statusCode, 201);
     const collectionId = created.json().collection.id as string;
+    assert.equal(created.json().collection.document_count, 0);
+
+    const duplicate = await app.inject({
+      method: "POST",
+      url: "/api/collections",
+      payload: { name: " Deals " },
+    });
+    assert.equal(duplicate.statusCode, 409);
+    assert.equal(duplicate.json().error_code, "duplicate_collection_name");
+
+    const other = await app.inject({
+      method: "POST",
+      url: "/api/collections",
+      payload: { name: "Other" },
+    });
+    const otherId = other.json().collection.id as string;
+
+    const duplicateRename = await app.inject({
+      method: "PATCH",
+      url: `/api/collections/${otherId}`,
+      payload: { name: "Deals" },
+    });
+    assert.equal(duplicateRename.statusCode, 409);
 
     const attached = await app.inject({
       method: "POST",
@@ -191,13 +222,70 @@ describe("http server", () => {
     });
     assert.equal(listed.statusCode, 200);
     assert.equal(listed.json().items[0].id, docId);
+    assert.equal(listed.json().collection.document_count, 1);
+
+    const replaced = await app.inject({
+      method: "PUT",
+      url: `/api/collections/${collectionId}/documents`,
+      payload: { document_ids: [docId, docIdB] },
+    });
+    assert.equal(replaced.statusCode, 200);
+    assert.deepEqual(
+      replaced.json().items.map((item: { id: string }) => item.id),
+      [docId, docIdB],
+    );
+
+    const scopedSearch = await app.inject({
+      method: "POST",
+      url: "/api/search",
+      payload: {
+        query: "purchase price",
+        document_ids: [docId],
+        collection_ids: [collectionId],
+        limit: 10,
+      },
+    });
+    assert.equal(scopedSearch.statusCode, 200);
+    assert.equal(scopedSearch.json().collection_id, collectionId);
+    assert.deepEqual(scopedSearch.json().collection_ids, [collectionId]);
+    assert.deepEqual(scopedSearch.json().document_ids, [docId, docIdB]);
+
+    const documentCollections = await app.inject({
+      method: "GET",
+      url: `/api/documents/${docId}/collections`,
+    });
+    assert.equal(documentCollections.statusCode, 200);
+    assert.deepEqual(
+      documentCollections.json().items.map((item: { id: string }) => item.id),
+      [collectionId],
+    );
+
+    const documentCollectionsUpdated = await app.inject({
+      method: "PUT",
+      url: `/api/documents/${docId}/collections`,
+      payload: { collection_ids: [otherId] },
+    });
+    assert.equal(documentCollectionsUpdated.statusCode, 200);
+    assert.deepEqual(
+      documentCollectionsUpdated.json().items.map((item: { id: string }) => item.id),
+      [otherId],
+    );
 
     const detached = await app.inject({
       method: "DELETE",
       url: `/api/collections/${collectionId}/documents/${docId}`,
     });
     assert.equal(detached.statusCode, 200);
-    assert.equal(detached.json().removed, true);
+    assert.equal(detached.json().removed, false);
+
+    const deleted = await app.inject({ method: "DELETE", url: `/api/collections/${collectionId}` });
+    assert.equal(deleted.statusCode, 200);
+    const recreated = await app.inject({
+      method: "POST",
+      url: "/api/collections",
+      payload: { name: "Deals" },
+    });
+    assert.equal(recreated.statusCode, 201);
     await app.close();
     storage.close();
   });
@@ -212,13 +300,16 @@ describe("http server", () => {
       payload: upload.body,
     });
     const docId = uploaded.json().document.id as string;
+    const collection = storage.createCollection("Answers");
+    storage.attachDocumentsToCollection(collection.id, [docId]);
 
     const started = await app.inject({
       method: "POST",
       url: "/api/explore/sessions",
       payload: {
         task: "What is the purchase price?",
-        document_ids: [docId],
+        document_ids: [],
+        collection_ids: [collection.id],
       },
     });
     assert.equal(started.statusCode, 200);
@@ -237,6 +328,11 @@ describe("http server", () => {
     }
     assert.equal(snapshot.statusCode, 200);
     assert.equal(snapshot.json().status, "completed");
+    assert.deepEqual(snapshot.json().collection_ids, [collection.id]);
+    assert.deepEqual(snapshot.json().document_ids, [docId]);
+    assert.equal(snapshot.json().batch_mode, "auto");
+    assert.equal(snapshot.json().batch_size, 5);
+    assert.equal(snapshot.json().batch_threshold, 10);
 
     const reply = await app.inject({
       method: "POST",

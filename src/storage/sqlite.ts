@@ -97,6 +97,10 @@ function toPublicCollectionRecord(collection: StoredCollection): PublicCollectio
   };
 }
 
+function normalizeCollectionName(name: string): string {
+  return String(name || "").trim();
+}
+
 function normalizeStoredDocumentPage(row: SqliteRow): StoredDocumentPage {
   return {
     document_id: String(row.document_id),
@@ -150,6 +154,16 @@ export class SqliteStorage implements SqliteStorageBackend {
   }
 
   initialize(): void {
+    const migrate = this.db.transaction(() => {
+      this.createSchemaTables();
+      this.migrateSchemaColumns();
+      this.backfillSchemaDefaults();
+      this.createSchemaIndexes();
+    });
+    migrate();
+  }
+
+  private createSchemaTables(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS collections (
         id TEXT PRIMARY KEY,
@@ -161,14 +175,6 @@ export class SqliteStorage implements SqliteStorageBackend {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
-
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_collections_scope_root
-      ON collections (root_path)
-      WHERE kind = 'corpus_scope';
-
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_collections_scope_corpus
-      ON collections (corpus_id)
-      WHERE kind = 'corpus_scope';
 
       CREATE TABLE IF NOT EXISTS documents (
         id TEXT PRIMARY KEY,
@@ -195,17 +201,11 @@ export class SqliteStorage implements SqliteStorageBackend {
         UNIQUE(corpus_id, relative_path)
       );
 
-      CREATE INDEX IF NOT EXISTS idx_documents_corpus_deleted
-      ON documents (corpus_id, is_deleted);
-
       CREATE TABLE IF NOT EXISTS collection_documents (
         collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
         document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
         PRIMARY KEY (collection_id, document_id)
       );
-
-      CREATE INDEX IF NOT EXISTS idx_collection_documents_collection
-      ON collection_documents (collection_id, document_id);
 
       CREATE TABLE IF NOT EXISTS document_pages (
         document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
@@ -220,9 +220,6 @@ export class SqliteStorage implements SqliteStorageBackend {
         PRIMARY KEY (document_id, page_no)
       );
 
-      CREATE INDEX IF NOT EXISTS idx_document_pages_document
-      ON document_pages (document_id, page_no);
-
       CREATE TABLE IF NOT EXISTS image_semantics (
         image_hash TEXT PRIMARY KEY,
         source_document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
@@ -235,10 +232,120 @@ export class SqliteStorage implements SqliteStorageBackend {
         semantic_model TEXT,
         last_enhanced_at TEXT
       );
+    `);
+  }
+
+  private createSchemaIndexes(): void {
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_collections_scope_root
+      ON collections (root_path)
+      WHERE kind = 'corpus_scope';
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_collections_scope_corpus
+      ON collections (corpus_id)
+      WHERE kind = 'corpus_scope';
+
+      CREATE INDEX IF NOT EXISTS idx_documents_corpus_deleted
+      ON documents (corpus_id, is_deleted);
+
+      CREATE INDEX IF NOT EXISTS idx_collection_documents_collection
+      ON collection_documents (collection_id, document_id);
+
+      CREATE INDEX IF NOT EXISTS idx_document_pages_document
+      ON document_pages (document_id, page_no);
 
       CREATE INDEX IF NOT EXISTS idx_image_semantics_source_page
       ON image_semantics (source_document_id, source_page_no);
     `);
+  }
+
+  private migrateSchemaColumns(): void {
+    this.addColumnIfMissing("collections", "kind", "TEXT NOT NULL DEFAULT 'user'");
+    this.addColumnIfMissing("collections", "corpus_id", "TEXT");
+    this.addColumnIfMissing("collections", "root_path", "TEXT");
+    this.addColumnIfMissing("collections", "is_deleted", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("collections", "created_at", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("collections", "updated_at", "TEXT NOT NULL DEFAULT ''");
+
+    this.addColumnIfMissing("documents", "corpus_id", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("documents", "relative_path", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("documents", "absolute_path", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("documents", "original_filename", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("documents", "object_key", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("documents", "source_object_key", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("documents", "pages_prefix", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("documents", "storage_uri", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("documents", "content_type", "TEXT");
+    this.addColumnIfMissing("documents", "upload_status", "TEXT NOT NULL DEFAULT 'uploaded'");
+    this.addColumnIfMissing("documents", "page_count", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("documents", "content", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("documents", "metadata_json", "TEXT NOT NULL DEFAULT '{}'");
+    this.addColumnIfMissing("documents", "file_mtime", "REAL NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("documents", "file_size", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("documents", "content_sha256", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("documents", "parsed_content_sha256", "TEXT");
+    this.addColumnIfMissing("documents", "parsed_is_complete", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("documents", "last_indexed_at", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("documents", "is_deleted", "INTEGER NOT NULL DEFAULT 0");
+
+    this.addColumnIfMissing("document_pages", "object_key", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("document_pages", "heading", "TEXT");
+    this.addColumnIfMissing("document_pages", "source_locator", "TEXT");
+    this.addColumnIfMissing("document_pages", "content_hash", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("document_pages", "char_count", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("document_pages", "is_synthetic_page", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("document_pages", "updated_at", "TEXT NOT NULL DEFAULT ''");
+
+    this.addColumnIfMissing("image_semantics", "source_document_id", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("image_semantics", "source_page_no", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("image_semantics", "source_image_index", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("image_semantics", "mime_type", "TEXT");
+    this.addColumnIfMissing("image_semantics", "width", "INTEGER");
+    this.addColumnIfMissing("image_semantics", "height", "INTEGER");
+    this.addColumnIfMissing("image_semantics", "semantic_text", "TEXT");
+    this.addColumnIfMissing("image_semantics", "semantic_model", "TEXT");
+    this.addColumnIfMissing("image_semantics", "last_enhanced_at", "TEXT");
+  }
+
+  private addColumnIfMissing(tableName: string, columnName: string, definition: string): void {
+    const columns = this.tableColumns(tableName);
+    if (columns.has(columnName)) {
+      return;
+    }
+    this.db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  }
+
+  private backfillSchemaDefaults(): void {
+    this.db.exec(`
+      UPDATE documents
+      SET original_filename = relative_path
+      WHERE original_filename = '' AND relative_path <> '';
+
+      UPDATE documents
+      SET source_object_key = object_key
+      WHERE source_object_key = '' AND object_key <> '';
+
+      UPDATE documents
+      SET upload_status = 'uploaded'
+      WHERE upload_status = '';
+
+      UPDATE collections
+      SET kind = 'user'
+      WHERE kind = '';
+
+      UPDATE collections
+      SET created_at = updated_at
+      WHERE created_at = '' AND updated_at <> '';
+
+      UPDATE collections
+      SET updated_at = created_at
+      WHERE updated_at = '' AND created_at <> '';
+    `);
+  }
+
+  private tableColumns(tableName: string): Set<string> {
+    const rows = this.db.prepare(`PRAGMA table_info(${tableName})`).all() as SqliteRow[];
+    return new Set(rows.map((row) => String(row.name)));
   }
 
   close(): void {
@@ -681,8 +788,15 @@ export class SqliteStorage implements SqliteStorageBackend {
   }
 
   createCollection(name: string): PublicCollectionRecord {
+    const normalizedName = normalizeCollectionName(name);
+    if (!normalizedName) {
+      throw new Error("Collection name is required.");
+    }
+    if (this.getActiveCollectionByName(normalizedName)) {
+      throw new Error("Collection name already exists.");
+    }
     const createdAt = utcNowIso();
-    const collectionId = stableId("collection", `${name}:${createdAt}`);
+    const collectionId = stableId("collection", `${normalizedName}:${createdAt}`);
     this.db
       .prepare(
         `
@@ -690,7 +804,7 @@ export class SqliteStorage implements SqliteStorageBackend {
           VALUES (?, ?, 'user', NULL, NULL, 0, ?, ?)
         `,
       )
-      .run(collectionId, name, createdAt, createdAt);
+      .run(collectionId, normalizedName, createdAt, createdAt);
     const collection = this.getCollection(collectionId);
     if (!collection) {
       throw new Error("Failed to create collection.");
@@ -727,16 +841,38 @@ export class SqliteStorage implements SqliteStorageBackend {
     return row ? toPublicCollectionRecord(normalizeStoredCollection(row)) : null;
   }
 
+  getActiveCollectionByName(name: string): PublicCollectionRecord | null {
+    const row = this.db
+      .prepare(
+        `
+          SELECT id, name, kind, corpus_id, root_path, is_deleted, created_at, updated_at
+          FROM collections
+          WHERE kind = 'user' AND is_deleted = 0 AND name = ?
+          LIMIT 1
+        `,
+      )
+      .get(normalizeCollectionName(name)) as SqliteRow | undefined;
+    return row ? toPublicCollectionRecord(normalizeStoredCollection(row)) : null;
+  }
+
   updateCollection(collectionId: string, name: string): PublicCollectionRecord | null {
+    const normalizedName = normalizeCollectionName(name);
+    if (!normalizedName) {
+      throw new Error("Collection name is required.");
+    }
+    const existing = this.getActiveCollectionByName(normalizedName);
+    if (existing && existing.id !== collectionId) {
+      throw new Error("Collection name already exists.");
+    }
     const result = this.db
       .prepare(
         `
           UPDATE collections
           SET name = ?, updated_at = ?
-          WHERE id = ? AND kind = 'user'
+          WHERE id = ? AND kind = 'user' AND is_deleted = 0
         `,
       )
-      .run(name, utcNowIso(), collectionId);
+      .run(normalizedName, utcNowIso(), collectionId);
     if (result.changes === 0) {
       return null;
     }
@@ -759,6 +895,20 @@ export class SqliteStorage implements SqliteStorageBackend {
     return this.getCollection(collectionId);
   }
 
+  countCollectionDocuments(collectionId: string): number {
+    const row = this.db
+      .prepare(
+        `
+          SELECT COUNT(*) AS count
+          FROM collection_documents cd
+          JOIN documents d ON d.id = cd.document_id
+          WHERE cd.collection_id = ? AND d.is_deleted = 0
+        `,
+      )
+      .get(collectionId) as SqliteRow | undefined;
+    return Number(row?.count ?? 0);
+  }
+
   listCollectionDocuments(collectionId: string, includeDeleted = false): StoredDocument[] {
     const ids = (this.db
       .prepare(
@@ -773,6 +923,23 @@ export class SqliteStorage implements SqliteStorageBackend {
       )
       .all(collectionId) as SqliteRow[]).map((row) => String(row.id));
     return this.listDocumentsByIds(ids, includeDeleted);
+  }
+
+  listDocumentCollections(docId: string, includeDeleted = false): PublicCollectionRecord[] {
+    const rows = this.db
+      .prepare(
+        `
+          SELECT c.id, c.name, c.kind, c.corpus_id, c.root_path, c.is_deleted, c.created_at, c.updated_at
+          FROM collection_documents cd
+          JOIN collections c ON c.id = cd.collection_id
+          WHERE cd.document_id = ?
+            AND c.kind = 'user'
+            ${includeDeleted ? "" : "AND c.is_deleted = 0"}
+          ORDER BY lower(c.name), c.created_at
+        `,
+      )
+      .all(docId) as SqliteRow[];
+    return rows.map(normalizeStoredCollection).map(toPublicCollectionRecord);
   }
 
   attachDocumentsToCollection(collectionId: string, documentIds: string[]): number {
@@ -795,11 +962,53 @@ export class SqliteStorage implements SqliteStorageBackend {
     return uniqueIds.length;
   }
 
+  replaceCollectionDocuments(collectionId: string, documentIds: string[]): number {
+    const uniqueIds = [...new Set(documentIds.map((item) => String(item).trim()).filter(Boolean))].sort();
+    const run = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM collection_documents WHERE collection_id = ?").run(collectionId);
+      if (uniqueIds.length === 0) {
+        return;
+      }
+      const statement = this.db.prepare(
+        `
+          INSERT OR IGNORE INTO collection_documents (collection_id, document_id)
+          VALUES (?, ?)
+        `,
+      );
+      for (const docId of uniqueIds) {
+        statement.run(collectionId, docId);
+      }
+    });
+    run();
+    return uniqueIds.length;
+  }
+
   detachDocumentFromCollection(collectionId: string, docId: string): boolean {
     const result = this.db
       .prepare("DELETE FROM collection_documents WHERE collection_id = ? AND document_id = ?")
       .run(collectionId, docId);
     return Boolean(result.changes);
+  }
+
+  replaceDocumentCollections(docId: string, collectionIds: string[]): number {
+    const uniqueIds = [...new Set(collectionIds.map((item) => String(item).trim()).filter(Boolean))].sort();
+    const run = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM collection_documents WHERE document_id = ?").run(docId);
+      if (uniqueIds.length === 0) {
+        return;
+      }
+      const statement = this.db.prepare(
+        `
+          INSERT OR IGNORE INTO collection_documents (collection_id, document_id)
+          VALUES (?, ?)
+        `,
+      );
+      for (const collectionId of uniqueIds) {
+        statement.run(collectionId, docId);
+      }
+    });
+    run();
+    return uniqueIds.length;
   }
 
   removeDocumentFromAllCollections(docId: string): number {

@@ -16,6 +16,9 @@ import type {
   IndexSearchServiceContract,
   IndexStatusResult,
   LazyIndexingStats,
+  PageBatchReadGroup,
+  PageBatchReadInput,
+  PageScopeSummary,
   PageSearchForTargetResult,
   PageSearchHit,
   ResolvedPageScope,
@@ -115,13 +118,14 @@ function scopeResult(
   corpusId: string,
   documentIds: string[],
   documents: StoredDocument[],
-  collection: PublicCollectionRecord | null,
+  collections: PublicCollectionRecord[],
 ): DocumentScope {
   return {
     corpusId,
     documentIds,
     documents,
-    collection,
+    collection: collections[0] ?? null,
+    collections,
     isEmpty: documentIds.length === 0,
   };
 }
@@ -169,6 +173,7 @@ export interface IndexSearchServiceOptions {
   rootPath?: string | null;
   documentIds?: string[] | null;
   collectionId?: string | null;
+  collectionIds?: string[] | null;
   scopeLabel?: string | null;
   emitRuntimeEvent?: RuntimeEventEmitter | null;
 }
@@ -187,8 +192,10 @@ export class IndexSearchService implements IndexSearchServiceContract {
       return this.options.scopeLabel;
     }
     const scope = this.resolveScope();
-    if (scope.collection) {
-      return scope.collection.name;
+    if (scope.collections.length > 0) {
+      return scope.collections.length === 1
+        ? scope.collections[0]!.name
+        : `${scope.collections.length} selected collections`;
     }
     if (scope.documentIds.length > 0) {
       return `${scope.documentIds.length} selected documents`;
@@ -219,16 +226,31 @@ export class IndexSearchService implements IndexSearchServiceContract {
   }
 
   resolveScope(): DocumentScope {
-    if (this.options.collectionId) {
-      const collection = this.options.storage.getCollection(this.options.collectionId);
-      if (!collection || collection.is_deleted) {
-        throw new Error("Collection not found.");
+    const collectionIds = [
+      ...new Set(
+        [
+          ...(this.options.collectionIds ?? []),
+          ...(this.options.collectionId ? [this.options.collectionId] : []),
+        ]
+          .map((item) => String(item).trim())
+          .filter(Boolean),
+      ),
+    ];
+    if (collectionIds.length > 0) {
+      const collections: PublicCollectionRecord[] = [];
+      const resolvedIds: string[] = [];
+      for (const collectionId of collectionIds) {
+        const collection = this.options.storage.getCollection(collectionId);
+        if (!collection || collection.is_deleted) {
+          throw new Error("Collection not found.");
+        }
+        collections.push(collection);
+        for (const document of this.options.storage.listCollectionDocuments(collectionId, false)) {
+          if (!resolvedIds.includes(document.id)) {
+            resolvedIds.push(document.id);
+          }
+        }
       }
-      const collectionDocuments = this.options.storage.listCollectionDocuments(
-        this.options.collectionId,
-        false,
-      );
-      const resolvedIds = collectionDocuments.map((document) => document.id);
       for (const docId of this.normalizedDocumentIds) {
         if (!resolvedIds.includes(docId)) {
           resolvedIds.push(docId);
@@ -239,7 +261,7 @@ export class IndexSearchService implements IndexSearchServiceContract {
         documents[0]?.corpus_id ?? "",
         documents.map((document) => document.id),
         documents,
-        collection,
+        collections,
       );
     }
 
@@ -249,17 +271,17 @@ export class IndexSearchService implements IndexSearchServiceContract {
         documents[0]?.corpus_id ?? "",
         documents.map((document) => document.id),
         documents,
-        null,
+        [],
       );
     }
 
     const corpusRoot = this.options.rootPath || LIBRARY_CORPUS_ROOT;
     const corpusId = this.options.storage.getCorpusId(corpusRoot) ?? "";
     if (!corpusId) {
-      return scopeResult("", [], [], null);
+      return scopeResult("", [], [], []);
     }
     const documents = this.options.storage.listDocuments(corpusId, false);
-    return scopeResult(corpusId, documents.map((document) => document.id), documents, null);
+    return scopeResult(corpusId, documents.map((document) => document.id), documents, []);
   }
 
   listIndexedDocuments(): string {
@@ -286,6 +308,45 @@ export class IndexSearchService implements IndexSearchServiceContract {
     lines.push("");
     lines.push("Use glob/grep/read on the pages_dir to answer questions page-by-page.");
     return lines.join("\n");
+  }
+
+  async listPageScopes(): Promise<PageScopeSummary[]> {
+    const summaries: PageScopeSummary[] = [];
+    for (const document of this.resolveScope().documents) {
+      const pagesDir = document.pages_prefix
+        ? resolvePagesDirectory({
+            blobStore: this.options.blobStore,
+            pagesPrefix: document.pages_prefix,
+          })
+        : "";
+      let pageRange: PageScopeSummary["page_range"] = null;
+      try {
+        const pages = await loadDocumentPages({
+          storage: this.options.storage,
+          blobStore: this.options.blobStore,
+          documentId: document.id,
+        });
+        if (pages.length > 0) {
+          const pageNos = pages.map((page) => page.page_no);
+          pageRange = { start: Math.min(...pageNos), end: Math.max(...pageNos) };
+        }
+      } catch {
+        pageRange = null;
+      }
+      summaries.push({
+        doc_id: document.id,
+        filename: document.original_filename || document.relative_path || document.id,
+        source_path: document.absolute_path,
+        pages_dir: pagesDir,
+        page_count: document.page_count || 0,
+        page_range: pageRange,
+      });
+    }
+    summaries.sort((left, right) =>
+      left.filename.toLowerCase().localeCompare(right.filename.toLowerCase()) ||
+      left.doc_id.localeCompare(right.doc_id),
+    );
+    return summaries;
   }
 
   async getDocument(docId: string): Promise<IndexedDocumentReadResult> {
@@ -402,7 +463,8 @@ export class IndexSearchService implements IndexSearchServiceContract {
     return {
       query,
       document_ids: [...scope.documentIds],
-      collection_id: this.options.collectionId ?? null,
+      collection_id: scope.collections[0]?.id ?? this.options.collectionId ?? null,
+      collection_ids: scope.collections.map((collection) => collection.id),
       lazy_indexing: { ...EMPTY_LAZY_INDEXING },
       hits: hits.slice(0, limit),
     };
@@ -490,6 +552,180 @@ export class IndexSearchService implements IndexSearchServiceContract {
       hits: hits.slice(0, 8),
       pages,
     };
+  }
+
+  async searchPagesAcrossScope(
+    query: string,
+    options: { maxHitsPerDocument?: number; maxTotalHits?: number; regex?: boolean } = {},
+  ): Promise<PageSearchForTargetResult> {
+    const trimmedQuery = String(query || "").trim();
+    if (!trimmedQuery) {
+      throw new Error("Query must not be empty.");
+    }
+    const scope = this.resolveScope();
+    if (scope.isEmpty) {
+      throw new Error("At least one document or one collection must be selected.");
+    }
+    const maxHitsPerDocument = Math.max(Number(options.maxHitsPerDocument ?? 5), 1);
+    const maxTotalHits = Math.max(Number(options.maxTotalHits ?? 24), 1);
+    let regex: RegExp | null = null;
+    if (options.regex) {
+      try {
+        regex = new RegExp(trimmedQuery, "gim");
+      } catch (error) {
+        throw new Error(`Invalid regex pattern ${trimmedQuery}: ${String(error)}`);
+      }
+    }
+
+    const hits: PageSearchHit[] = [];
+    const allPages: LoadedDocumentPage[] = [];
+    for (const document of scope.documents) {
+      const pages = await loadDocumentPages({
+        storage: this.options.storage,
+        blobStore: this.options.blobStore,
+        documentId: document.id,
+      });
+      allPages.push(...pages);
+      const docHits: PageSearchHit[] = [];
+      for (const page of pages) {
+        let score = 0;
+        let matchCount = 0;
+        let matchStart: number | null = null;
+        if (regex) {
+          const matches = [...page.markdown.matchAll(regex)];
+          matchCount = matches.length;
+          score = matches.length;
+          matchStart = matches[0]?.index ?? null;
+        } else {
+          const match = pageMatchesQuery({
+            query: trimmedQuery,
+            markdown: page.markdown,
+            heading: page.heading,
+          });
+          score = match.score;
+          matchCount = match.matchCount;
+          matchStart = match.matchStart;
+        }
+        if (score <= 0) {
+          continue;
+        }
+        docHits.push({
+          doc_id: document.id,
+          absolute_path: page.file_path,
+          source_unit_no: page.page_no,
+          score,
+          text: buildSearchSnippet({
+            markdown: page.markdown,
+            matchStart,
+          }),
+          match_count: matchCount,
+        });
+      }
+      docHits.sort(
+        (left, right) =>
+          right.score - left.score ||
+          right.match_count - left.match_count ||
+          left.source_unit_no - right.source_unit_no,
+      );
+      hits.push(...docHits.slice(0, maxHitsPerDocument));
+    }
+
+    hits.sort(
+      (left, right) =>
+        right.score - left.score ||
+        right.match_count - left.match_count ||
+        left.doc_id.localeCompare(right.doc_id) ||
+        left.source_unit_no - right.source_unit_no,
+    );
+    return {
+      hits: hits.slice(0, maxTotalHits),
+      pages: allPages,
+    };
+  }
+
+  async resolvePageBatch(input: PageBatchReadInput): Promise<PageBatchReadGroup[]> {
+    const maxPages = Math.max(Number(input.maxPages ?? 5), 1);
+    const maxChars = Math.max(Number(input.maxChars ?? 8_000), 1);
+    const groups = new Map<string, { document: StoredDocument; pages: LoadedDocumentPage[] }>();
+
+    const addPage = (document: StoredDocument, page: LoadedDocumentPage): void => {
+      const existing = groups.get(document.id) ?? { document, pages: [] };
+      if (!existing.pages.some((item) => item.page_no === page.page_no)) {
+        existing.pages.push(page);
+      }
+      groups.set(document.id, existing);
+    };
+
+    const filePaths = [...new Set((input.filePaths ?? []).map((item) => String(item).trim()).filter(Boolean))];
+    for (const filePath of filePaths) {
+      const resolvedPage = await this.findPageByPath(filePath);
+      if (resolvedPage) {
+        addPage(resolvedPage.document, resolvedPage.page);
+      }
+    }
+
+    const documentId = String(input.documentId ?? "").trim();
+    if (documentId) {
+      const scope = this.resolveScope();
+      if (!scope.documentIds.includes(documentId)) {
+        throw new Error(`Document ${documentId} is outside the currently selected document scope.`);
+      }
+      const document = scope.documents.find((item) => item.id === documentId);
+      if (!document) {
+        throw new Error(`Document ${documentId} was not found.`);
+      }
+      const pages = await loadDocumentPages({
+        storage: this.options.storage,
+        blobStore: this.options.blobStore,
+        documentId,
+      });
+      const startPage = Math.max(Number(input.startPage ?? input.endPage ?? 1), 1);
+      const endPage = Math.max(Number(input.endPage ?? startPage), startPage);
+      for (const page of pages) {
+        if (page.page_no >= startPage && page.page_no <= endPage) {
+          addPage(document, page);
+        }
+      }
+    }
+
+    const orderedGroups = [...groups.values()].sort((left, right) =>
+      (left.document.original_filename || left.document.relative_path || left.document.id)
+        .toLowerCase()
+        .localeCompare((right.document.original_filename || right.document.relative_path || right.document.id).toLowerCase()) ||
+      left.document.id.localeCompare(right.document.id),
+    );
+
+    const limitedGroups: PageBatchReadGroup[] = [];
+    let pagesUsed = 0;
+    let charsUsed = 0;
+    for (const group of orderedGroups) {
+      const sortedPages = [...group.pages].sort((left, right) => left.page_no - right.page_no);
+      const accepted: LoadedDocumentPage[] = [];
+      const omittedPages: number[] = [];
+      for (const page of sortedPages) {
+        const nextChars = charsUsed + page.markdown.length;
+        if (pagesUsed >= maxPages || (accepted.length > 0 && nextChars > maxChars)) {
+          omittedPages.push(page.page_no);
+          continue;
+        }
+        if (nextChars > maxChars && pagesUsed > 0) {
+          omittedPages.push(page.page_no);
+          continue;
+        }
+        accepted.push(page);
+        pagesUsed += 1;
+        charsUsed = nextChars;
+      }
+      if (accepted.length > 0 || omittedPages.length > 0) {
+        limitedGroups.push({
+          document: group.document,
+          pages: accepted,
+          truncated: omittedPages.length > 0,
+          omittedPages,
+        });
+      }
+    }
+    return limitedGroups;
   }
 
   async findPageByPath(

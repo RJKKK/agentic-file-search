@@ -79,6 +79,16 @@ body {
   padding: 14px;
 }
 
+.scope-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.scope-form .el-form-item {
+  margin-bottom: 8px;
+}
+
 .document-select {
   width: 100%;
 }
@@ -124,6 +134,7 @@ body {
 }
 
 .trace-section,
+.batch-section,
 .answer-section {
   display: flex;
   /* min-height: 0; */
@@ -133,6 +144,12 @@ body {
 .trace-section {
   /* flex: 0 0 36%; */
   /* min-height: 180px; */
+  border-bottom: 1px solid #ebeef5;
+}
+
+.batch-section {
+  flex: 0 0 auto;
+  max-height: 320px;
   border-bottom: 1px solid #ebeef5;
 }
 
@@ -164,10 +181,46 @@ body {
 }
 
 .trace-list,
+.batch-cache,
 .answer-scroll {
   min-height: 0;
   /* overflow: auto; */
   padding: 12px 16px;
+}
+
+.batch-cache {
+  display: grid;
+  gap: 10px;
+  overflow: auto;
+}
+
+.batch-card {
+  padding: 10px 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #f9fafb;
+}
+
+.active-batch {
+  background: #fff7ed;
+}
+
+.batch-card p,
+.batch-docs {
+  margin: 6px 0;
+  color: #606266;
+  font-size: 12px;
+}
+
+.batch-card pre,
+.batch-cache pre {
+  margin: 8px 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
 }
 
 .trace-title {
@@ -237,17 +290,24 @@ body {
   gap: 12px;
 }
 
-.documents-page {
+.documents-page,
+.collections-page {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 12px;
 }
 
-.document-toolbar {
+.collections-page {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.document-toolbar,
+.collection-toolbar {
   min-height: 64px;
 }
 
-.document-toolbar .el-card__body {
+.document-toolbar .el-card__body,
+.collection-toolbar .el-card__body {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -340,6 +400,70 @@ body {
   line-height: 1.7;
 }
 
+.wide-control {
+  width: 100%;
+}
+
+.dialog-subtitle {
+  margin: 0 0 12px;
+  color: #606266;
+}
+
+.collection-members {
+  display: grid;
+  gap: 14px;
+}
+
+.member-header,
+.member-search {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.member-header h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.member-header span {
+  color: #909399;
+  font-size: 13px;
+}
+
+.member-search .el-input {
+  max-width: 420px;
+}
+
+.document-transfer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: stretch;
+}
+
+.document-transfer .el-transfer-panel {
+  width: auto;
+}
+
+.transfer-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.transfer-row span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transfer-row span:last-child {
+  color: #909399;
+  font-size: 12px;
+}
+
 @media (max-width: 900px) {
   .app-header {
     gap: 10px;
@@ -354,8 +478,10 @@ body {
     display: none;
   }
 
+  .scope-form,
   .ask-bar,
-  .document-toolbar .el-card__body {
+  .document-toolbar .el-card__body,
+  .collection-toolbar .el-card__body {
     grid-template-columns: 1fr;
     flex-direction: column;
     align-items: stretch;
@@ -365,5 +491,9 @@ body {
   .toolbar-left,
   .toolbar-right {
     flex-wrap: wrap;
+  }
+
+  .document-transfer {
+    grid-template-columns: 1fr;
   }
 }

@@ -10,6 +10,7 @@ import type { SqliteStorageBackend } from "./storage.js";
 import type { ToolRegistry } from "./skills.js";
 
 export type ExploreSessionStatus = "created" | "running" | "awaiting_human" | "completed" | "error" | "closed";
+export type BatchMode = "auto" | "off" | "force";
 
 export interface ExploreStreamEventPayload {
   session_id: string;
@@ -33,9 +34,15 @@ export interface ExploreSessionSnapshot {
   task: string;
   document_ids: string[];
   collection_id: string | null;
+  collection_ids: string[];
   db_path: string | null;
   enable_semantic: boolean;
   enable_metadata: boolean;
+  batch_summaries: Array<Record<string, unknown>>;
+  cumulative_answer: string | null;
+  batch_mode: BatchMode;
+  batch_size: number;
+  batch_threshold: number;
   created_at: string;
   updated_at: string;
 }
@@ -44,9 +51,13 @@ export interface CreateExploreSessionInput {
   task: string;
   documentIds?: string[];
   collectionId?: string | null;
+  collectionIds?: string[] | null;
   dbPath?: string | null;
   enableSemantic?: boolean;
   enableMetadata?: boolean;
+  batchMode?: BatchMode;
+  batchSize?: number | null;
+  batchThreshold?: number | null;
 }
 
 export interface HumanReplyInput {

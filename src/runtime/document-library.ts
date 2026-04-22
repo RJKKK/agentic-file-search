@@ -15,13 +15,14 @@ function scopeResult(
   corpusId: string,
   documentIds: string[],
   documents: StoredDocument[],
-  collection: PublicCollectionRecord | null,
+  collections: PublicCollectionRecord[],
 ): DocumentScope {
   return {
     corpusId,
     documentIds,
     documents,
-    collection,
+    collection: collections[0] ?? null,
+    collections,
     isEmpty: documentIds.length === 0,
   };
 }
@@ -85,17 +86,29 @@ export function resolveDocumentScope(input: {
   storage: SqliteStorageBackend;
   documentIds?: string[] | null;
   collectionId?: string | null;
+  collectionIds?: string[] | null;
 }): DocumentScope {
   const corpusId = getLibraryCorpusId(input.storage, { createIfMissing: true }) || "";
   const resolvedIds: string[] = [];
-  let collection: PublicCollectionRecord | null = null;
+  const collections: PublicCollectionRecord[] = [];
+  const collectionIds = [
+    ...new Set(
+      [
+        ...(input.collectionIds ?? []),
+        ...(input.collectionId ? [input.collectionId] : []),
+      ]
+        .map((item) => String(item).trim())
+        .filter(Boolean),
+    ),
+  ];
 
-  if (input.collectionId) {
-    collection = input.storage.getCollection(input.collectionId);
+  for (const collectionId of collectionIds) {
+    const collection = input.storage.getCollection(collectionId);
     if (!collection || collection.is_deleted) {
       throw new Error("Collection not found.");
     }
-    for (const document of input.storage.listCollectionDocuments(input.collectionId, false)) {
+    collections.push(collection);
+    for (const document of input.storage.listCollectionDocuments(collectionId, false)) {
       if (!resolvedIds.includes(document.id)) {
         resolvedIds.push(document.id);
       }
@@ -111,7 +124,7 @@ export function resolveDocumentScope(input: {
 
   const documents = input.storage.listDocumentsByIds(resolvedIds, false);
   const liveIds = documents.map((document) => document.id);
-  return scopeResult(corpusId, liveIds, documents, collection);
+  return scopeResult(corpusId, liveIds, documents, collections);
 }
 
 export function serializeDocumentSummary(

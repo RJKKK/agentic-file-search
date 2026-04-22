@@ -61,6 +61,7 @@ export interface DocumentScope {
   documentIds: string[];
   documents: StoredDocument[];
   collection: PublicCollectionRecord | null;
+  collections: PublicCollectionRecord[];
   isEmpty: boolean;
 }
 

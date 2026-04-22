@@ -2,16 +2,47 @@
   "id": "read-skill",
   "name": "Read Skill",
   "status": "active",
-  "description": "Read one page markdown file with page metadata.",
+  "description": "Read one page markdown file, multiple page files, or a document page range.",
   "entry": "./index.ts",
   "tools": [
     {
       "name": "read",
-      "description": "Read one page markdown file with page metadata.",
+      "description": "Read one page markdown file, multiple page files, or a document page range.",
       "parameters": [
         {
           "name": "file_path",
-          "description": "The file to read."
+          "description": "The file to read.",
+          "required": false
+        },
+        {
+          "name": "file_paths",
+          "description": "Multiple page files to read; pages are grouped by document.",
+          "required": false
+        },
+        {
+          "name": "document_id",
+          "description": "Document id for range reads.",
+          "required": false
+        },
+        {
+          "name": "start_page",
+          "description": "Start page number for range reads.",
+          "required": false
+        },
+        {
+          "name": "end_page",
+          "description": "End page number for range reads.",
+          "required": false
+        },
+        {
+          "name": "max_pages",
+          "description": "Maximum pages to read in one call.",
+          "required": false
+        },
+        {
+          "name": "max_chars",
+          "description": "Maximum raw characters to read in one call.",
+          "required": false
         }
       ]
     }

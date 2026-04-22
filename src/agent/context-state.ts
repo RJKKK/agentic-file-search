@@ -447,6 +447,92 @@ export class ContextState {
     };
   }
 
+  releaseDocumentEvidence(input: {
+    documentId: string;
+    summarizedRanges?: Array<{ start: number; end: number }>;
+    reason?: string;
+  }): Record<string, unknown> {
+    const documentId = String(input.documentId || "").trim();
+    const coverage = documentId ? this.coverageByDocument.get(documentId) : null;
+    if (!documentId || !coverage) {
+      return {
+        released: false,
+        document_id: documentId || null,
+        reason: "document has no tracked coverage",
+      };
+    }
+
+    const summarizedRanges =
+      input.summarizedRanges && input.summarizedRanges.length
+        ? input.summarizedRanges
+        : coverage.activeRanges.length
+          ? [...coverage.activeRanges]
+          : this.coverageRanges(coverage);
+    const existingSummarized = coverage.summarizedRanges.flatMap((range) => {
+      const units: number[] = [];
+      for (let unitNo = range.start; unitNo <= range.end; unitNo += 1) {
+        units.push(unitNo);
+      }
+      return units;
+    });
+    const newSummarized = summarizedRanges.flatMap((range) => {
+      const units: number[] = [];
+      for (let unitNo = range.start; unitNo <= range.end; unitNo += 1) {
+        units.push(unitNo);
+      }
+      return units;
+    });
+    coverage.summarizedRanges = compressUnitRanges([...existingSummarized, ...newSummarized]);
+    coverage.activeRanges = [];
+
+    let releasedUnits = 0;
+    for (const evidence of this.evidenceUnits.values()) {
+      if (evidence.documentId !== documentId || !evidence.text) {
+        continue;
+      }
+      if (evidence.kind === "parsed_unit" || evidence.kind === "document_body") {
+        evidence.text = "";
+        evidence.promoted = evidence.cited;
+        releasedUnits += 1;
+      }
+    }
+
+    if (this.activeDocumentId === documentId) {
+      this.setActiveScope({
+        documentId,
+        filePath: coverage.filePath,
+        ranges: [],
+      });
+    }
+
+    const summary =
+      `Released raw evidence for ${coverage.label}: summarized=${renderRanges(coverage.summarizedRanges)}; ` +
+      `snippets and citations remain available.`;
+    this.workingSummary.push(summary);
+    this.trimSummary();
+    this.compactionLog.push({
+      action: "release_batch_raw_context",
+      document_id: documentId,
+      summarized_ranges: [...coverage.summarizedRanges],
+      released_units: releasedUnits,
+      reason: input.reason ?? "batch completed",
+    });
+    while (this.compactionLog.length > 10) {
+      this.compactionLog.shift();
+    }
+
+    return {
+      released: true,
+      document_id: documentId,
+      file_path: coverage.filePath,
+      summarized_ranges: [...coverage.summarizedRanges],
+      active_ranges: [],
+      released_units: releasedUnits,
+      coverage: this.coverageAsDict(coverage),
+      summary_for_model: summary,
+    };
+  }
+
   applyContextPlan(plan: Record<string, unknown> | null | undefined): ContextPlanResult | null {
     if (!plan || typeof plan !== "object" || Array.isArray(plan)) {
       return null;

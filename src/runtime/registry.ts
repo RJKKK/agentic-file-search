@@ -7,6 +7,7 @@ import type { LoadedSkill, RegisteredTool, ToolRegistry } from "../types/skills.
 
 const PREFERRED_TOOL_ORDER = [
   "glob",
+  "search_candidates",
   "grep",
   "read",
   "list_indexed_documents",

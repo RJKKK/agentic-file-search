@@ -14,7 +14,8 @@
     "element-plus": "^2.13.7",
     "github-markdown-css": "^5.9.0",
     "markdown-it": "^14.1.1",
-    "vue": "^3.5.13"
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.2.1",

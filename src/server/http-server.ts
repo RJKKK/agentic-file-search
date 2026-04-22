@@ -112,6 +112,29 @@ function toIntValue(value: unknown, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function toBatchMode(value: unknown): "auto" | "off" | "force" {
+  const mode = String(value ?? "auto").trim();
+  return mode === "off" || mode === "force" ? mode : "auto";
+}
+
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return [...new Set(value.map((item) => String(item).trim()).filter(Boolean))];
+}
+
+function collectionIdsFromBody(body: Record<string, unknown>): string[] {
+  return [
+    ...new Set([
+      ...toStringArray(body.collection_ids),
+      ...(toStringValue(body.collection_id, "").trim()
+        ? [toStringValue(body.collection_id).trim()]
+        : []),
+    ]),
+  ];
+}
+
 function parseJsonObject(value: string): Record<string, unknown> {
   const parsed = JSON.parse(value || "{}") as unknown;
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -126,14 +149,19 @@ function serializeCollection(collection: {
   is_deleted: boolean;
   created_at: string;
   updated_at: string;
+  document_count?: number;
 }): Record<string, unknown> {
-  return {
+  const payload: Record<string, unknown> = {
     id: collection.id,
     name: collection.name,
     is_deleted: collection.is_deleted,
     created_at: collection.created_at,
     updated_at: collection.updated_at,
   };
+  if (typeof collection.document_count === "number") {
+    payload.document_count = collection.document_count;
+  }
+  return payload;
 }
 
 function serializeDocumentPage(page: {
@@ -304,8 +332,9 @@ export async function createHttpServer(
       const service = new IndexSearchService({
         storage,
         blobStore,
-        documentIds: Array.isArray(body.document_ids) ? body.document_ids.map(String) : [],
+        documentIds: toStringArray(body.document_ids),
         collectionId: toStringValue(body.collection_id, "") || null,
+        collectionIds: collectionIdsFromBody(body),
       });
       const result = await service.search({
         query: toStringValue(body.query),
@@ -581,84 +610,287 @@ export async function createHttpServer(
   });
 
   app.get("/api/collections", async () => ({
-    items: storage.listCollections(false).map(serializeCollection),
+    items: storage.listCollections(false).map((collection) =>
+      serializeCollection({
+        ...collection,
+        document_count: storage.countCollectionDocuments(collection.id),
+      }),
+    ),
   }));
 
   app.post("/api/collections", async (request, reply) => {
+    const traceId = makeTraceId();
     const body = (request.body ?? {}) as { name?: string };
     const name = String(body.name ?? "").trim();
     if (!name) {
-      return reply.code(400).send({ detail: "Collection name is required." });
+      return errorResponse(reply, {
+        statusCode: 400,
+        errorCode: "invalid_collection_name",
+        message: "Collection name is required.",
+        traceId,
+      });
     }
-    return { collection: serializeCollection(storage.createCollection(name)) };
+    try {
+      const collection = storage.createCollection(name);
+      return withTrace(
+        reply,
+        {
+          collection: serializeCollection({ ...collection, document_count: 0 }),
+        },
+        { statusCode: 201, traceId },
+      );
+    } catch (error) {
+      const duplicate = /already exists/i.test(String(error));
+      return errorResponse(reply, {
+        statusCode: duplicate ? 409 : 500,
+        errorCode: duplicate ? "duplicate_collection_name" : "collection_create_failed",
+        message: error instanceof Error ? error.message : String(error),
+        traceId,
+      });
+    }
+  });
+
+  app.get("/api/collections/:collectionId", async (request, reply) => {
+    const traceId = makeTraceId();
+    const { collectionId } = request.params as { collectionId: string };
+    const collection = storage.getCollection(collectionId);
+    if (!collection || collection.is_deleted) {
+      return errorResponse(reply, {
+        statusCode: 404,
+        errorCode: "collection_not_found",
+        message: "Collection not found",
+        traceId,
+      });
+    }
+    return withTrace(reply, {
+      collection: serializeCollection({
+        ...collection,
+        document_count: storage.countCollectionDocuments(collectionId),
+      }),
+    }, { traceId });
   });
 
   app.patch("/api/collections/:collectionId", async (request, reply) => {
+    const traceId = makeTraceId();
     const { collectionId } = request.params as { collectionId: string };
     const body = (request.body ?? {}) as { name?: string };
     const name = String(body.name ?? "").trim();
     if (!name) {
-      return reply.code(400).send({ detail: "Collection name is required." });
+      return errorResponse(reply, {
+        statusCode: 400,
+        errorCode: "invalid_collection_name",
+        message: "Collection name is required.",
+        traceId,
+      });
     }
-    const collection = storage.updateCollection(collectionId, name);
-    if (!collection) {
-      return reply.code(404).send({ detail: "Collection not found" });
+    try {
+      const collection = storage.updateCollection(collectionId, name);
+      if (!collection || collection.is_deleted) {
+        return errorResponse(reply, {
+          statusCode: 404,
+          errorCode: "collection_not_found",
+          message: "Collection not found",
+          traceId,
+        });
+      }
+      return withTrace(
+        reply,
+        {
+          collection: serializeCollection({
+            ...collection,
+            document_count: storage.countCollectionDocuments(collectionId),
+          }),
+        },
+        { traceId },
+      );
+    } catch (error) {
+      const duplicate = /already exists/i.test(String(error));
+      return errorResponse(reply, {
+        statusCode: duplicate ? 409 : 500,
+        errorCode: duplicate ? "duplicate_collection_name" : "collection_update_failed",
+        message: error instanceof Error ? error.message : String(error),
+        traceId,
+      });
     }
-    return { collection: serializeCollection(collection) };
   });
 
   app.delete("/api/collections/:collectionId", async (request, reply) => {
+    const traceId = makeTraceId();
     const { collectionId } = request.params as { collectionId: string };
     const collection = storage.setCollectionDeleted(collectionId, true);
     if (!collection) {
-      return reply.code(404).send({ detail: "Collection not found" });
+      return errorResponse(reply, {
+        statusCode: 404,
+        errorCode: "collection_not_found",
+        message: "Collection not found",
+        traceId,
+      });
     }
-    return { collection: serializeCollection(collection), deleted: true };
+    return withTrace(reply, { collection: serializeCollection(collection), deleted: true }, { traceId });
   });
 
   app.get("/api/collections/:collectionId/documents", async (request, reply) => {
+    const traceId = makeTraceId();
     const { collectionId } = request.params as { collectionId: string };
     const collection = storage.getCollection(collectionId);
     if (!collection || collection.is_deleted) {
-      return reply.code(404).send({ detail: "Collection not found" });
+      return errorResponse(reply, {
+        statusCode: 404,
+        errorCode: "collection_not_found",
+        message: "Collection not found",
+        traceId,
+      });
     }
-    return {
-      collection: serializeCollection(collection),
+    return withTrace(reply, {
+      collection: serializeCollection({
+        ...collection,
+        document_count: storage.countCollectionDocuments(collectionId),
+      }),
       items: storage.listCollectionDocuments(collectionId, false).map((document) =>
         serializeDocumentSummary(document),
       ),
-    };
+    }, { traceId });
   });
 
   app.post("/api/collections/:collectionId/documents", async (request, reply) => {
+    const traceId = makeTraceId();
     const { collectionId } = request.params as { collectionId: string };
     const collection = storage.getCollection(collectionId);
     if (!collection || collection.is_deleted) {
-      return reply.code(404).send({ detail: "Collection not found" });
+      return errorResponse(reply, {
+        statusCode: 404,
+        errorCode: "collection_not_found",
+        message: "Collection not found",
+        traceId,
+      });
     }
     const body = (request.body ?? {}) as { document_ids?: unknown[] };
-    const attached = storage.attachDocumentsToCollection(
-      collectionId,
-      Array.isArray(body.document_ids) ? body.document_ids.map(String) : [],
-    );
-    return {
-      collection: serializeCollection(collection),
+    try {
+      const attached = storage.attachDocumentsToCollection(collectionId, toStringArray(body.document_ids));
+      return withTrace(reply, {
+        collection: serializeCollection({
+          ...collection,
+          document_count: storage.countCollectionDocuments(collectionId),
+        }),
       attached,
       items: storage.listCollectionDocuments(collectionId, false).map((document) =>
         serializeDocumentSummary(document),
       ),
-    };
+      }, { traceId });
+    } catch (error) {
+      return errorResponse(reply, {
+        statusCode: /FOREIGN KEY/i.test(String(error)) ? 400 : 500,
+        errorCode: "collection_documents_update_failed",
+        message: error instanceof Error ? error.message : String(error),
+        traceId,
+      });
+    }
+  });
+
+  app.put("/api/collections/:collectionId/documents", async (request, reply) => {
+    const traceId = makeTraceId();
+    const { collectionId } = request.params as { collectionId: string };
+    const collection = storage.getCollection(collectionId);
+    if (!collection || collection.is_deleted) {
+      return errorResponse(reply, {
+        statusCode: 404,
+        errorCode: "collection_not_found",
+        message: "Collection not found",
+        traceId,
+      });
+    }
+    const body = (request.body ?? {}) as { document_ids?: unknown[] };
+    try {
+      const replaced = storage.replaceCollectionDocuments(collectionId, toStringArray(body.document_ids));
+      return withTrace(reply, {
+        collection: serializeCollection({
+          ...collection,
+          document_count: storage.countCollectionDocuments(collectionId),
+        }),
+        replaced,
+        items: storage.listCollectionDocuments(collectionId, false).map((document) =>
+          serializeDocumentSummary(document),
+        ),
+      }, { traceId });
+    } catch (error) {
+      return errorResponse(reply, {
+        statusCode: /FOREIGN KEY/i.test(String(error)) ? 400 : 500,
+        errorCode: "collection_documents_replace_failed",
+        message: error instanceof Error ? error.message : String(error),
+        traceId,
+      });
+    }
   });
 
   app.delete("/api/collections/:collectionId/documents/:docId", async (request, reply) => {
+    const traceId = makeTraceId();
     const { collectionId, docId } = request.params as { collectionId: string; docId: string };
     const collection = storage.getCollection(collectionId);
     if (!collection || collection.is_deleted) {
-      return reply.code(404).send({ detail: "Collection not found" });
+      return errorResponse(reply, {
+        statusCode: 404,
+        errorCode: "collection_not_found",
+        message: "Collection not found",
+        traceId,
+      });
     }
-    return {
+    return withTrace(reply, {
       removed: storage.detachDocumentFromCollection(collectionId, docId),
-    };
+    }, { traceId });
+  });
+
+  app.get("/api/documents/:docId/collections", async (request, reply) => {
+    const traceId = makeTraceId();
+    const { docId } = request.params as { docId: string };
+    try {
+      requireDocument(storage, docId);
+      return withTrace(reply, {
+        document_id: docId,
+        items: storage.listDocumentCollections(docId, false).map(serializeCollection),
+      }, { traceId });
+    } catch (error) {
+      return errorResponse(reply, {
+        statusCode: 404,
+        errorCode: "document_not_found",
+        message: error instanceof Error ? error.message : String(error),
+        traceId,
+      });
+    }
+  });
+
+  app.put("/api/documents/:docId/collections", async (request, reply) => {
+    const traceId = makeTraceId();
+    const { docId } = request.params as { docId: string };
+    const body = (request.body ?? {}) as { collection_ids?: unknown[] };
+    const collectionIds = toStringArray(body.collection_ids);
+    try {
+      requireDocument(storage, docId);
+      for (const collectionId of collectionIds) {
+        const collection = storage.getCollection(collectionId);
+        if (!collection || collection.is_deleted) {
+          return errorResponse(reply, {
+            statusCode: 404,
+            errorCode: "collection_not_found",
+            message: "Collection not found",
+            traceId,
+          });
+        }
+      }
+      storage.replaceDocumentCollections(docId, collectionIds);
+      return withTrace(reply, {
+        document_id: docId,
+        items: storage.listDocumentCollections(docId, false).map(serializeCollection),
+      }, { traceId });
+    } catch (error) {
+      return errorResponse(reply, {
+        statusCode: /Document not found/i.test(String(error)) ? 404 : 500,
+        errorCode: /Document not found/i.test(String(error))
+          ? "document_not_found"
+          : "document_collections_update_failed",
+        message: error instanceof Error ? error.message : String(error),
+        traceId,
+      });
+    }
   });
 
   app.post("/api/explore/sessions", async (request, reply) => {
@@ -666,11 +898,15 @@ export async function createHttpServer(
     try {
       const result = await workflowService.startSession({
         task: toStringValue(body.task).trim(),
-        documentIds: Array.isArray(body.document_ids) ? body.document_ids.map(String) : [],
+        documentIds: toStringArray(body.document_ids),
         collectionId: toStringValue(body.collection_id, "") || null,
+        collectionIds: collectionIdsFromBody(body),
         dbPath: toStringValue(body.db_path, "") || null,
         enableSemantic: toBoolValue(body.enable_semantic, false),
         enableMetadata: toBoolValue(body.enable_metadata, false),
+        batchMode: toBatchMode(body.batch_mode),
+        batchSize: toIntValue(body.batch_size, 5),
+        batchThreshold: toIntValue(body.batch_threshold, 10),
       });
       return result;
     } catch (error) {

@@ -120,6 +120,29 @@ describe("index search service", () => {
     fixture.storage.close();
   });
 
+  it("searches the union of multiple collections and selected documents", async () => {
+    const fixture = await createIndexedFixture();
+    const collectionA = fixture.storage.createCollection("Deals A");
+    const collectionB = fixture.storage.createCollection("Deals B");
+    fixture.storage.attachDocumentsToCollection(collectionA.id, ["doc-alpha"]);
+    fixture.storage.attachDocumentsToCollection(collectionB.id, ["doc-beta"]);
+
+    const service = new IndexSearchService({
+      storage: fixture.storage,
+      blobStore: fixture.blobStore,
+      documentIds: ["doc-alpha"],
+      collectionIds: [collectionA.id, collectionB.id],
+    });
+
+    const result = await service.search({ query: "purchase price", limit: 5 });
+    assert.deepEqual(result.collection_ids, [collectionA.id, collectionB.id]);
+    assert.deepEqual(result.document_ids, ["doc-alpha", "doc-beta"]);
+    assert.equal(result.collection_id, collectionA.id);
+    assert.equal(result.hits.length, 2);
+
+    fixture.storage.close();
+  });
+
   it("provides legacy list/get document and page-scope helpers", async () => {
     const fixture = await createIndexedFixture();
     const events: Array<{ type: string; data: Record<string, unknown> }> = [];
@@ -147,6 +170,44 @@ describe("index search service", () => {
     assert.deepEqual(pageHits?.hits.map((hit) => hit.source_unit_no), [1]);
     service.emit("candidate_pages_found", { document_id: "doc-alpha" });
     assert.equal(events[0].type, "candidate_pages_found");
+
+    fixture.storage.close();
+  });
+
+  it("lists scope page directories, searches candidates across scope, and resolves batch reads", async () => {
+    const fixture = await createIndexedFixture();
+    const service = new IndexSearchService({
+      storage: fixture.storage,
+      blobStore: fixture.blobStore,
+      documentIds: ["doc-alpha", "doc-beta"],
+    });
+
+    const scopes = await service.listPageScopes();
+    assert.deepEqual(scopes.map((item) => item.doc_id), ["doc-alpha", "doc-beta"]);
+    assert.deepEqual(scopes[0].page_range, { start: 1, end: 1 });
+
+    const candidates = await service.searchPagesAcrossScope("purchase price", {
+      maxTotalHits: 24,
+      maxHitsPerDocument: 5,
+    });
+    assert.deepEqual(candidates.hits.map((hit) => hit.doc_id), ["doc-alpha", "doc-beta"]);
+    assert.ok(candidates.hits.every((hit) => hit.source_unit_no === 1));
+
+    const groups = await service.resolvePageBatch({
+      filePaths: candidates.hits.map((hit) => hit.absolute_path),
+      maxPages: 5,
+      maxChars: 10_000,
+    });
+    assert.deepEqual(groups.map((group) => group.document.id), ["doc-alpha", "doc-beta"]);
+    assert.deepEqual(groups.flatMap((group) => group.pages.map((page) => page.page_no)), [1, 1]);
+
+    const rangeGroups = await service.resolvePageBatch({
+      documentId: "doc-alpha",
+      startPage: 1,
+      endPage: 1,
+    });
+    assert.equal(rangeGroups[0].document.id, "doc-alpha");
+    assert.equal(rangeGroups[0].pages[0].page_no, 1);
 
     fixture.storage.close();
   });

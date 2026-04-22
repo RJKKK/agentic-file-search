@@ -157,11 +157,16 @@ export interface SqliteStorageBackend {
   createCollection(name: string): PublicCollectionRecord;
   listCollections(includeDeleted?: boolean): PublicCollectionRecord[];
   getCollection(collectionId: string): PublicCollectionRecord | null;
+  getActiveCollectionByName(name: string): PublicCollectionRecord | null;
   updateCollection(collectionId: string, name: string): PublicCollectionRecord | null;
   setCollectionDeleted(collectionId: string, isDeleted: boolean): PublicCollectionRecord | null;
+  countCollectionDocuments(collectionId: string): number;
   listCollectionDocuments(collectionId: string, includeDeleted?: boolean): StoredDocument[];
+  listDocumentCollections(docId: string, includeDeleted?: boolean): PublicCollectionRecord[];
   attachDocumentsToCollection(collectionId: string, documentIds: string[]): number;
+  replaceCollectionDocuments(collectionId: string, documentIds: string[]): number;
   detachDocumentFromCollection(collectionId: string, docId: string): boolean;
+  replaceDocumentCollections(docId: string, collectionIds: string[]): number;
   removeDocumentFromAllCollections(docId: string): number;
   createDocumentCatalog(corpusId: string): DocumentCatalog;
 }
