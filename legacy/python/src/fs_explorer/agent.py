@@ -1123,7 +1123,7 @@ def _escape_invalid_json_backslashes(text: str) -> str:
         text,
     )
     return re.sub(r'(?<!\\)\\(?!["\\/bfnrtu])', r"\\\\", text)
-
+ 
 
 def _parse_action_response(raw_text: str) -> Action | None:
     """Parse an Action from raw model text, allowing fenced or embedded JSON."""

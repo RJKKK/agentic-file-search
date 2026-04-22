@@ -1,0 +1,15 @@
+{
+  "id": "list-indexed-documents-skill",
+  "name": "List Indexed Documents Skill",
+  "status": "active",
+  "description": "Legacy document list.",
+  "entry": "./index.ts",
+  "tools": [
+    {
+      "name": "list_indexed_documents",
+      "description": "Legacy document list.",
+      "parameters": []
+    }
+  ],
+  "enabledByDefault": true
+}

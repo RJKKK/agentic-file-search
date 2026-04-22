@@ -1,0 +1,20 @@
+{
+  "id": "read-skill",
+  "name": "Read Skill",
+  "status": "active",
+  "description": "Read one page markdown file with page metadata.",
+  "entry": "./index.ts",
+  "tools": [
+    {
+      "name": "read",
+      "description": "Read one page markdown file with page metadata.",
+      "parameters": [
+        {
+          "name": "file_path",
+          "description": "The file to read."
+        }
+      ]
+    }
+  ],
+  "enabledByDefault": true
+}

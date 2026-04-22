@@ -1,0 +1,21 @@
+{
+  "id": "scan-folder-skill",
+  "name": "Scan Folder Skill",
+  "status": "outdated",
+  "description": "Archived broad folder scan skill from the Python implementation.",
+  "entry": "./index.ts",
+  "tools": [
+    {
+      "name": "scan_folder",
+      "description": "Archived broad directory scan.",
+      "parameters": [
+        {
+          "name": "directory",
+          "description": "The directory to scan."
+        }
+      ]
+    }
+  ],
+  "enabledByDefault": false
+}
+

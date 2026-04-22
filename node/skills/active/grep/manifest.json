@@ -1,0 +1,24 @@
+{
+  "id": "grep-skill",
+  "name": "Grep Skill",
+  "status": "active",
+  "description": "Find candidate pages by searching page markdown files.",
+  "entry": "./index.ts",
+  "tools": [
+    {
+      "name": "grep",
+      "description": "Find candidate pages by searching page markdown files.",
+      "parameters": [
+        {
+          "name": "file_path",
+          "description": "A file path or a page directory."
+        },
+        {
+          "name": "pattern",
+          "description": "The regex pattern to search."
+        }
+      ]
+    }
+  ],
+  "enabledByDefault": true
+}

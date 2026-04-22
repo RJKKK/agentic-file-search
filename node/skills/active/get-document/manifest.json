@@ -1,0 +1,20 @@
+{
+  "id": "get-document-skill",
+  "name": "Get Document Skill",
+  "status": "active",
+  "description": "Legacy full-document read; not part of the main QA path.",
+  "entry": "./index.ts",
+  "tools": [
+    {
+      "name": "get_document",
+      "description": "Legacy full-document read; not part of the main QA path.",
+      "parameters": [
+        {
+          "name": "doc_id",
+          "description": "The known document id."
+        }
+      ]
+    }
+  ],
+  "enabledByDefault": true
+}

@@ -1,0 +1,21 @@
+{
+  "id": "semantic-search-skill",
+  "name": "Semantic Search Skill",
+  "status": "outdated",
+  "description": "Archived indexed retrieval skill from the Python implementation.",
+  "entry": "./index.ts",
+  "tools": [
+    {
+      "name": "semantic_search",
+      "description": "Archived indexed semantic retrieval.",
+      "parameters": [
+        {
+          "name": "query",
+          "description": "The natural language query."
+        }
+      ]
+    }
+  ],
+  "enabledByDefault": false
+}
+
