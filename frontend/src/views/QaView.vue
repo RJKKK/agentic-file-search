@@ -42,10 +42,15 @@ const sessionState = reactive({
   error: "",
   trace: null,
   stats: null,
+  candidateDocumentSelection: null,
+  documentSummaries: [],
+  parallelDocumentLimit: 3,
   batchSummaries: [],
   cumulativeAnswer: "",
   activeBatch: null,
   activeBatchAnswer: "",
+  finalSynthesisDraft: "",
+  finalSynthesisActive: false,
   showHumanModal: false,
   humanQuestion: "",
   humanResponse: "",
@@ -64,6 +69,14 @@ const selectedCollections = computed(() => {
   return askOptions.collections.filter((item) => selected.has(item.id));
 });
 const renderedAnswer = computed(() => markdown.render(sessionState.displayedAnswer || ""));
+const coordinatorVisible = computed(
+  () =>
+    sessionState.candidateDocumentSelection ||
+    sessionState.documentSummaries.length ||
+    sessionState.activeBatch ||
+    sessionState.batchSummaries.length ||
+    sessionState.cumulativeAnswer,
+);
 const traceStatusType = computed(() => {
   if (sessionState.status === "completed") return "success";
   if (sessionState.status === "error") return "danger";
@@ -136,10 +149,15 @@ async function startAskSession() {
   sessionState.error = "";
   sessionState.trace = null;
   sessionState.stats = null;
+  sessionState.candidateDocumentSelection = null;
+  sessionState.documentSummaries = [];
+  sessionState.parallelDocumentLimit = 3;
   sessionState.batchSummaries = [];
   sessionState.cumulativeAnswer = "";
   sessionState.activeBatch = null;
   sessionState.activeBatchAnswer = "";
+  sessionState.finalSynthesisDraft = "";
+  sessionState.finalSynthesisActive = false;
   activeTraceNames.value = [];
 
   try {
@@ -182,7 +200,9 @@ function openEventStream(sessionId) {
     "coverage_gap_detected",
     "page_scope_resolved",
     "candidate_pages_found",
+    "candidate_documents_found",
     "pages_read",
+    "page_boundary_loaded",
     "page_context_compacted",
     "stale_page_range_detected",
     "cache_hit",
@@ -199,6 +219,14 @@ function openEventStream(sessionId) {
     "cumulative_answer_updated",
     "batch_completed",
     "batch_context_released",
+    "document_agent_started",
+    "document_agent_tool_call",
+    "document_answer_delta",
+    "document_answer_done",
+    "document_agent_completed",
+    "final_synthesis_started",
+    "final_synthesis_delta",
+    "final_synthesis_done",
     "complete",
     "error",
   ];
@@ -232,6 +260,45 @@ function openEventStream(sessionId) {
         sessionState.status = "running";
         sessionState.activeBatch = payload.data;
         sessionState.activeBatchAnswer = "";
+      } else if (type === "candidate_documents_found") {
+        sessionState.status = "running";
+        sessionState.candidateDocumentSelection = payload.data;
+        sessionState.parallelDocumentLimit = payload.data.parallel_document_limit || sessionState.parallelDocumentLimit;
+      } else if (type === "document_agent_started") {
+        sessionState.status = "running";
+        sessionState.activeBatch = {
+          batch_index: payload.data.document_index,
+          batch_count: payload.data.document_count,
+          document_ids: [payload.data.document_id],
+          document_names: [payload.data.document_name],
+        };
+        sessionState.activeBatchAnswer = "";
+        upsertDocumentSummary({
+          document_id: payload.data.document_id,
+          document_name: payload.data.document_name,
+          candidate_pages: payload.data.candidate_pages || [],
+          temporary_answer: "",
+          status: "running",
+          cited_sources: [],
+        });
+      } else if (type === "document_answer_delta") {
+        sessionState.status = "running";
+        sessionState.activeBatchAnswer = payload.data.accumulated_text || "";
+        upsertDocumentSummary({
+          document_id: payload.data.document_id,
+          temporary_answer: payload.data.accumulated_text || "",
+          status: "running",
+        });
+      } else if (type === "document_answer_done") {
+        sessionState.activeBatchAnswer = payload.data.temporary_answer || sessionState.activeBatchAnswer;
+        upsertDocumentSummary({
+          document_id: payload.data.document_id,
+          temporary_answer: payload.data.temporary_answer || "",
+          status: payload.data.status || "answered",
+          cited_sources: payload.data.cited_sources || [],
+        });
+      } else if (type === "document_agent_completed") {
+        upsertDocumentSummary(payload.data);
       } else if (type === "batch_answer_delta") {
         sessionState.status = "running";
         sessionState.activeBatchAnswer = payload.data.accumulated_text || "";
@@ -239,6 +306,23 @@ function openEventStream(sessionId) {
         sessionState.activeBatchAnswer = payload.data.batch_answer || sessionState.activeBatchAnswer;
       } else if (type === "cumulative_answer_updated") {
         sessionState.cumulativeAnswer = payload.data.cumulative_answer || "";
+      } else if (type === "final_synthesis_started") {
+        sessionState.status = "answering";
+        sessionState.finalSynthesisActive = true;
+        sessionState.finalSynthesisDraft = "";
+        sessionState.finalAnswer = "";
+        sessionState.displayedAnswer = "";
+      } else if (type === "final_synthesis_delta") {
+        sessionState.status = "answering";
+        sessionState.finalSynthesisDraft = payload.data.accumulated_text || payload.data.delta_text || "";
+        sessionState.finalAnswer = sessionState.finalSynthesisDraft;
+        sessionState.displayedAnswer = sessionState.finalAnswer;
+        nextTick(scrollAnswerToBottom);
+      } else if (type === "final_synthesis_done") {
+        sessionState.finalSynthesisActive = false;
+        sessionState.finalAnswer = payload.data.final_result || sessionState.finalAnswer;
+        sessionState.displayedAnswer = sessionState.finalAnswer;
+        nextTick(scrollAnswerToBottom);
       } else if (type === "batch_completed") {
         const batchIndex = payload.data.batch_index;
         sessionState.batchSummaries = [
@@ -253,8 +337,19 @@ function openEventStream(sessionId) {
         sessionState.stats = payload.data.stats || null;
         sessionState.batchSummaries =
           payload.data.stats?.batch_summaries || payload.data.trace?.batch_summaries || sessionState.batchSummaries;
+        sessionState.documentSummaries =
+          payload.data.stats?.document_summaries || payload.data.trace?.document_summaries || sessionState.documentSummaries;
+        sessionState.candidateDocumentSelection =
+          payload.data.stats?.candidate_document_selection ||
+          payload.data.trace?.candidate_document_selection ||
+          sessionState.candidateDocumentSelection;
+        sessionState.parallelDocumentLimit =
+          payload.data.stats?.parallel_document_limit ||
+          payload.data.trace?.parallel_document_limit ||
+          sessionState.parallelDocumentLimit;
         sessionState.cumulativeAnswer =
           payload.data.stats?.cumulative_answer || payload.data.trace?.cumulative_answer || sessionState.cumulativeAnswer;
+        sessionState.finalSynthesisActive = false;
         sessionState.showHumanModal = false;
         closeEventStream();
         nextTick(scrollAnswerToBottom);
@@ -288,6 +383,10 @@ async function hydrateSessionSnapshot(sessionId) {
     const snapshot = await requestJson(`/api/explore/sessions/${encodeURIComponent(sessionId)}`);
     if (activeSessionId.value !== sessionId) return;
     sessionState.batchSummaries = snapshot.batch_summaries || sessionState.batchSummaries;
+    sessionState.documentSummaries = snapshot.document_summaries || sessionState.documentSummaries;
+    sessionState.candidateDocumentSelection =
+      snapshot.candidate_document_selection || sessionState.candidateDocumentSelection;
+    sessionState.parallelDocumentLimit = snapshot.parallel_document_limit || sessionState.parallelDocumentLimit;
     sessionState.cumulativeAnswer = snapshot.cumulative_answer || sessionState.cumulativeAnswer;
     if (snapshot.status === "completed") {
       sessionState.status = "completed";
@@ -309,6 +408,37 @@ async function hydrateSessionSnapshot(sessionId) {
   } catch {
     // Best-effort sync for sessions that finish before SSE renders.
   }
+}
+
+function upsertDocumentSummary(nextSummary) {
+  const documentId = nextSummary?.document_id;
+  if (!documentId) return;
+  const previous = sessionState.documentSummaries.find((item) => item.document_id === documentId) || {};
+  const merged = { ...previous, ...nextSummary };
+  sessionState.documentSummaries = [
+    ...sessionState.documentSummaries.filter((item) => item.document_id !== documentId),
+    merged,
+  ].sort((left, right) => String(left.document_name || left.document_id).localeCompare(String(right.document_name || right.document_id)));
+}
+
+function statusTagType(status) {
+  if (status === "answered") return "success";
+  if (status === "failed") return "danger";
+  if (status === "insufficient_evidence") return "warning";
+  if (status === "running") return "primary";
+  return "info";
+}
+
+function selectedCoordinatorDocs(selection) {
+  if (!selection) return [];
+  if (Array.isArray(selection.selected_documents)) return selection.selected_documents;
+  if (Array.isArray(selection.selected_document_ids)) {
+    return selection.selected_document_ids.map((documentId) => ({
+      document_id: documentId,
+      document_name: documentId,
+    }));
+  }
+  return [];
 }
 
 async function submitHumanReply() {
@@ -335,6 +465,7 @@ function traceSummary(event) {
   const pieces = [];
   if (data.tool_name) pieces.push(data.tool_name);
   if (data.batch_index) pieces.push(`Batch ${data.batch_index}${data.batch_count ? `/${data.batch_count}` : ""}`);
+  if (data.document_index) pieces.push(`Doc Agent ${data.document_index}${data.document_count ? `/${data.document_count}` : ""}`);
   if (data.document_id) pieces.push(`文档 ${shortText(data.document_id, 16)}`);
   if (data.step) pieces.push(`步骤 ${data.step}`);
   if (data.reason) pieces.push(shortText(data.reason, 42));
@@ -345,6 +476,8 @@ function traceSummary(event) {
     pieces.push(`当前 ${shortText(data.context_scope.active_document_id, 16)}`);
   }
   if (Array.isArray(data.candidate_pages)) pieces.push(`候选页 ${data.candidate_pages.length}`);
+  if (Array.isArray(data.candidate_documents)) pieces.push(`候选文档 ${data.candidate_documents.length}`);
+  if (Array.isArray(data.selected_documents)) pieces.push(`已选文档 ${data.selected_documents.length}`);
   if (Array.isArray(data.pages)) pieces.push(`读取页 ${data.pages.length}`);
   return pieces.length ? pieces.join(" / ") : shortText(readableFallback(data), 68);
 }
@@ -374,6 +507,44 @@ function traceDetails(event) {
       add("文档", data.document_id);
       add("候选页", data.candidate_pages);
       add("查询", data.query || data.search_terms);
+      break;
+    case "candidate_documents_found":
+      add("策略", data.strategy);
+      add("候选文档", data.candidate_documents);
+      add("已选文档", data.selected_documents);
+      add("并发上限", data.parallel_document_limit);
+      break;
+    case "document_agent_started":
+      add("Document Agent", `${data.document_index}/${data.document_count}`);
+      add("文档", data.document_name || data.document_id);
+      add("候选页", data.candidate_pages);
+      break;
+    case "document_agent_tool_call":
+      add("Document Agent", data.document_index);
+      add("文档", data.document_id);
+      add("工具", data.tool_name);
+      add("输入", data.tool_input);
+      add("原因", data.reason);
+      break;
+    case "document_answer_done":
+      add("文档", data.document_id);
+      add("状态", data.status);
+      add("临时答案", data.temporary_answer);
+      add("引用", data.cited_sources);
+      break;
+    case "document_agent_completed":
+      add("文档", data.document_name || data.document_id);
+      add("状态", data.status);
+      add("临时答案", data.temporary_answer);
+      add("引用", data.cited_sources);
+      break;
+    case "final_synthesis_started":
+      add("文档数", data.document_count);
+      add("文档", data.document_ids);
+      break;
+    case "final_synthesis_done":
+      add("最终答案", shortText(data.final_result, 600));
+      add("引用", data.cited_sources);
       break;
     case "context_scope_updated":
       add("当前文档", data.context_scope?.active_document_id || data.context_scope?.active_file_path);
@@ -559,26 +730,90 @@ function scrollAnswerToBottom() {
           </div>
         </section>
 
-        <section
-          v-if="sessionState.activeBatch || sessionState.batchSummaries.length || sessionState.cumulativeAnswer"
-          class="batch-section"
-        >
+        <section v-if="coordinatorVisible" class="batch-section agent-section">
           <div class="section-title">
             <div>
-              <h2>批次答案缓存</h2>
-              <span>大文档集分批处理时显示每批答案、累计答案和引用</span>
+              <h2>文档子 Agent</h2>
+              <span>主 Agent 先筛候选文档，各文档并行生成临时答案，最后统一综合</span>
             </div>
-            <el-tag v-if="sessionState.activeBatch" type="warning">
-              Batch {{ sessionState.activeBatch.batch_index }}/{{ sessionState.activeBatch.batch_count }}
-            </el-tag>
+            <div class="section-tags">
+              <el-tag v-if="sessionState.candidateDocumentSelection" type="info">
+                候选 {{ sessionState.candidateDocumentSelection.candidate_documents?.length || sessionState.candidateDocumentSelection.candidate_count || 0 }}
+              </el-tag>
+              <el-tag v-if="sessionState.candidateDocumentSelection" type="success">
+                已选 {{ sessionState.candidateDocumentSelection.selected_documents?.length || sessionState.candidateDocumentSelection.selected_count || 0 }}
+              </el-tag>
+              <el-tag v-if="sessionState.parallelDocumentLimit" type="warning">
+                并发 {{ sessionState.parallelDocumentLimit }}
+              </el-tag>
+            </div>
           </div>
           <div class="batch-cache">
+            <div v-if="sessionState.candidateDocumentSelection" class="batch-card coordinator-card">
+              <strong>主 Agent 候选选择</strong>
+              <p>
+                {{ sessionState.candidateDocumentSelection.strategy || "retrieval_plus_llm" }}
+                <span v-if="sessionState.candidateDocumentSelection.query">
+                  · {{ shortText(sessionState.candidateDocumentSelection.query, 80) }}
+                </span>
+              </p>
+              <div class="candidate-doc-list">
+                <el-tag
+                  v-for="doc in selectedCoordinatorDocs(sessionState.candidateDocumentSelection)"
+                  :key="doc.document_id"
+                  size="small"
+                  type="success"
+                  effect="plain"
+                >
+                  {{ doc.document_name || doc.document_id }}
+                  <span v-if="doc.candidate_pages"> · {{ doc.candidate_pages.length }} 页</span>
+                </el-tag>
+                <el-text
+                  v-if="!selectedCoordinatorDocs(sessionState.candidateDocumentSelection).length"
+                  type="warning"
+                  size="small"
+                >
+                  主 Agent 未选择可处理文档
+                </el-text>
+              </div>
+            </div>
             <div v-if="sessionState.activeBatch" class="batch-card active-batch">
-              <strong>当前批次</strong>
+              <strong>运行中的文档 Agent</strong>
               <p>{{ (sessionState.activeBatch.document_names || []).join("；") }}</p>
               <pre v-if="sessionState.activeBatchAnswer">{{ sessionState.activeBatchAnswer }}</pre>
             </div>
-            <el-collapse v-if="sessionState.batchSummaries.length">
+            <el-collapse v-if="sessionState.documentSummaries.length">
+              <el-collapse-item
+                v-for="summary in sessionState.documentSummaries"
+                :key="summary.document_id"
+                :title="summary.document_name || summary.document_id"
+              >
+                <div class="document-summary-meta">
+                  <el-tag size="small" :type="statusTagType(summary.status)">
+                    {{ summary.status || "pending" }}
+                  </el-tag>
+                  <el-tag
+                    v-for="page in summary.candidate_pages || []"
+                    :key="`${summary.document_id}-${page.page_no || page.file_path}`"
+                    size="small"
+                    type="info"
+                    effect="plain"
+                  >
+                    p{{ page.page_no || "?" }}
+                  </el-tag>
+                </div>
+                <pre>{{ summary.temporary_answer || "等待该文档临时答案..." }}</pre>
+                <el-tag
+                  v-for="source in summary.cited_sources || []"
+                  :key="source"
+                  size="small"
+                  type="info"
+                >
+                  {{ source }}
+                </el-tag>
+              </el-collapse-item>
+            </el-collapse>
+            <el-collapse v-if="sessionState.batchSummaries.length && !sessionState.documentSummaries.length">
               <el-collapse-item
                 v-for="batch in sessionState.batchSummaries"
                 :key="batch.batch_index"
@@ -597,8 +832,13 @@ function scrollAnswerToBottom() {
               </el-collapse-item>
             </el-collapse>
             <div v-if="sessionState.cumulativeAnswer" class="batch-card">
-              <strong>累计答案</strong>
+              <strong>临时答案汇总</strong>
               <pre>{{ sessionState.cumulativeAnswer }}</pre>
+            </div>
+            <div v-if="sessionState.finalSynthesisActive || sessionState.finalSynthesisDraft" class="batch-card synthesis-card">
+              <strong>最终综合</strong>
+              <p>{{ sessionState.finalSynthesisActive ? "主 Agent 正在综合所有文档临时答案" : "综合完成" }}</p>
+              <pre v-if="sessionState.finalSynthesisDraft">{{ sessionState.finalSynthesisDraft }}</pre>
             </div>
           </div>
         </section>

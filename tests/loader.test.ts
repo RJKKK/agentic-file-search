@@ -13,6 +13,7 @@ describe("skill loader", () => {
 
     assert.ok(names.includes("glob"));
     assert.ok(names.includes("read"));
+    assert.ok(names.includes("page_boundary_context"));
     assert.ok(names.includes("get_document"));
     assert.ok(!names.includes("scan_folder"));
     assert.ok(!names.includes("semantic_search"));

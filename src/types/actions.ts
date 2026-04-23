@@ -9,6 +9,7 @@ export const LEGACY_TOOL_NAMES = [
   "read",
   "grep",
   "glob",
+  "page_boundary_context",
   "scan_folder",
   "preview_file",
   "semantic_search",

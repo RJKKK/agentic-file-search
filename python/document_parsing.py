@@ -1,4 +1,4 @@
-"""
+﻿"""
 Reference: legacy/python/src/fs_explorer/document_parsing.py
 
 Document parsing adapters and cache-oriented parsing helpers.
@@ -993,8 +993,8 @@ def _is_page_number_footer(text: str, *, page_no: int) -> bool:
     escaped_page_no = re.escape(str(int(page_no)))
     patterns = (
         rf"^{escaped_page_no}$",
-        rf"^[-_~·•]*{escaped_page_no}[-_~·•]*$",
-        rf"^第{escaped_page_no}页$",
+        rf"^[-_~.*]*{escaped_page_no}[-_~.*]*$",
+        rf"^第{escaped_page_no}页?$",
         rf"^{escaped_page_no}/\d+$",
         rf"^\d+/{escaped_page_no}$",
         rf"^{escaped_page_no}-\d+$",
@@ -1112,12 +1112,12 @@ def _normalize_markdown(value: str) -> str:
 def _normalize_pdf_table_markdown(value: str) -> str:
     """Normalize unstable PyMuPDF markdown tables into a model-friendly shape.
 
-    Reference: keep table titles, flatten multiline headers, remove synthetic
+    Reference: preserve title rows as markdown rows, flatten multiline headers, remove synthetic
     placeholder columns, and merge obviously fragmented header columns so the
     downstream model does not invent hidden fields from malformed table grids.
     """
 
-    placeholder_values = {"-", "--", "—", "N/A", "n/a", "null", "None"}
+    placeholder_values = {"-", "--", "N/A", "n/a", "null", "None"}
 
     def normalize_inline_text(text: str) -> str:
         normalized = re.sub(r"(?i)<br\s*/?>", "", str(text or ""))
@@ -1156,7 +1156,7 @@ def _normalize_pdf_table_markdown(value: str) -> str:
             not stripped
             or stripped in placeholder_values
             or bool(re.fullmatch(r":?-{3,}:?", stripped))
-            or bool(re.fullmatch(r"Col\d+", stripped, flags=re.IGNORECASE))
+            or bool(re.fullmatch(r"Col(?:\[\d+\]|\d+)", stripped, flags=re.IGNORECASE))
         )
 
     def meaningful_cell(value: str) -> bool:
@@ -1175,13 +1175,19 @@ def _normalize_pdf_table_markdown(value: str) -> str:
             return right
         return smart_join_text([left, right])
 
-    def maybe_extract_caption(rows: list[list[str]]) -> tuple[str | None, list[list[str]]]:
+    def maybe_extract_caption(rows: list[list[str]]) -> tuple[list[str] | None, list[list[str]]]:
         if len(rows) < 3 or not is_separator_line(rows[1]):
             return None, rows
         meaningful = [normalize_inline_text(cell) for cell in rows[0] if meaningful_cell(cell)]
         if len(meaningful) != 1:
             return None, rows
-        return meaningful[0], rows[2:]
+        return rows[0], rows[2:]
+
+    def normalize_caption_row(row: list[str]) -> list[str]:
+        return [
+            "" if is_placeholder_cell(cell) else normalize_inline_text(cell)
+            for cell in row
+        ]
 
     def merge_fragmented_header_columns(
         header: list[str],
@@ -1238,8 +1244,8 @@ def _normalize_pdf_table_markdown(value: str) -> str:
         if width < 2:
             return lines
         rows = [row + [""] * (width - len(row)) for row in rows]
-        caption, rows = maybe_extract_caption(rows)
-        if caption:
+        caption_row, rows = maybe_extract_caption(rows)
+        if caption_row:
             if len(rows) < 2:
                 return lines
             header = rows[0]
@@ -1252,7 +1258,7 @@ def _normalize_pdf_table_markdown(value: str) -> str:
         placeholder_indexes = [
             index
             for index, cell in enumerate(header)
-            if re.fullmatch(r"Col\d+", normalize_inline_text(cell), flags=re.IGNORECASE)
+            if re.fullmatch(r"Col(?:\[\d+\]|\d+)", normalize_inline_text(cell), flags=re.IGNORECASE)
         ]
         keep_indexes = list(range(width))
         for index in placeholder_indexes:
@@ -1299,8 +1305,10 @@ def _normalize_pdf_table_markdown(value: str) -> str:
             return lines
 
         rendered_lines: list[str] = []
-        if caption:
-            rendered_lines.extend([f"表格标题：{caption}", ""])
+        if caption_row:
+            normalized_caption = normalize_caption_row(caption_row)
+            rendered_lines.append(render_row(normalized_caption))
+            rendered_lines.append(render_row(["---"] * len(normalized_caption)))
         rendered_lines.append(render_row(header))
         rendered_lines.append(render_row(["---"] * len(header)))
         rendered_lines.extend(render_row(row) for row in body_rows)
@@ -1383,3 +1391,4 @@ def _image_mime_type(value: object) -> str | None:
     if "/" in ext:
         return ext
     return f"image/{ext.lower()}"
+

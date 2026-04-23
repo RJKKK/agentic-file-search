@@ -447,6 +447,76 @@ export class ContextState {
     };
   }
 
+  ingestPageBoundaryContext(input: {
+    documentId: string;
+    filePath: string;
+    label: string;
+    mode: "single" | "range";
+    direction: "previous" | "next" | "both";
+    pageNo?: number | null;
+    startPage?: number | null;
+    endPage?: number | null;
+    rendered: string;
+  }): Record<string, unknown> {
+    const turn = this.bumpTurn();
+    this.ensureCoverage(input.documentId, input.filePath, input.label);
+    const rangeLabel =
+      input.mode === "range"
+        ? `${input.startPage ?? "?"}-${input.endPage ?? "?"}`
+        : `${input.pageNo ?? "?"}`;
+    const evidenceId = `${input.documentId}:boundary:${input.mode}:${rangeLabel}:${input.direction}`;
+    const excerpt = snippet(input.rendered, 320);
+    const anchorUnitNo =
+      input.mode === "range"
+        ? input.startPage != null
+          ? Number(input.startPage)
+          : null
+        : input.pageNo != null
+          ? Number(input.pageNo)
+          : null;
+    const sourceLocator =
+      input.mode === "range"
+        ? `pages-${input.startPage ?? "?"}-${input.endPage ?? "?"}:boundary-${input.direction}`
+        : `page-${input.pageNo ?? "?"}:boundary-${input.direction}`;
+    const heading =
+      input.mode === "range"
+        ? `Boundary context for pages ${input.startPage ?? "?"}-${input.endPage ?? "?"}`
+        : `Boundary context for page ${input.pageNo ?? "?"}`;
+    this.evidenceUnits.set(evidenceId, {
+      evidenceId,
+      kind: "page_boundary_context",
+      documentId: input.documentId,
+      filePath: input.filePath,
+      unitNo: anchorUnitNo,
+      sourceLocator,
+      heading,
+      text: input.rendered,
+      snippet: excerpt,
+      score: null,
+      cited: false,
+      promoted: false,
+      lastUsedTurn: turn,
+    });
+    const summary =
+      input.mode === "range"
+        ? `Loaded page boundary context for ${input.label} pages ${input.startPage ?? "?"}-${input.endPage ?? "?"} (direction=${input.direction}).`
+        : `Loaded page boundary context for ${input.label} page ${input.pageNo ?? "?"} (direction=${input.direction}).`;
+    this.workingSummary.push(summary);
+    this.trimSummary();
+    return {
+      document_id: input.documentId,
+      file_path: input.filePath,
+      mode: input.mode,
+      page_no: input.pageNo ?? null,
+      start_page: input.startPage ?? null,
+      end_page: input.endPage ?? null,
+      direction: input.direction,
+      summary_for_model: summary,
+      snippet: excerpt,
+      evidence_id: evidenceId,
+    };
+  }
+
   releaseDocumentEvidence(input: {
     documentId: string;
     summarizedRanges?: Array<{ start: number; end: number }>;

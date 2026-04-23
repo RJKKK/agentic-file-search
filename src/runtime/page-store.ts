@@ -5,36 +5,37 @@ Reference: legacy/python/src/fs_explorer/page_store.py
 import type { ParsedDocument, ParsedUnit } from "../types/parsing.js";
 import type { BlobStore, StoredPage } from "../types/library.js";
 
-const INVALID_STORAGE_FILENAME_CHARS = new Set('\\/:*?"<>|'.split(""));
-
 export function validateStorageFilename(filename: string): string {
   const base = filename.split(/[\\/]/).pop() ?? "";
   if (!base || base === "." || base === "..") {
     throw new Error("Uploaded file must include a valid filename.");
   }
-  if ([...base].some((char) => INVALID_STORAGE_FILENAME_CHARS.has(char))) {
-    throw new Error(
-      "Filename contains characters that cannot be used as an exact storage directory name.",
-    );
-  }
   return base;
 }
 
-export function buildDocumentPrefix(filename: string): string {
-  return `documents/${validateStorageFilename(filename)}`;
+function validateStorageKey(storageKey: string): string {
+  const normalized = String(storageKey || "").trim().replace(/^[\\/]+|[\\/]+$/g, "");
+  if (!normalized || normalized === "." || normalized === ".." || /[\\/]/.test(normalized)) {
+    throw new Error("A valid storage key is required.");
+  }
+  return normalized;
 }
 
-export function buildDocumentSourceKey(filename: string): string {
-  const validated = validateStorageFilename(filename);
-  return `${buildDocumentPrefix(validated)}/source/${validated}`;
+export function buildDocumentPrefix(storageKey: string): string {
+  return `documents/${validateStorageKey(storageKey)}`;
 }
 
-export function buildDocumentPagesPrefix(filename: string): string {
-  return `${buildDocumentPrefix(filename)}/pages`;
+export function buildDocumentSourceKey(storageKey: string, filename = "source.bin"): string {
+  const base = validateStorageFilename(filename);
+  return `${buildDocumentPrefix(storageKey)}/source/${encodeURIComponent(base)}`;
 }
 
-export function buildDocumentPageKey(filename: string, pageNo: number): string {
-  return `${buildDocumentPagesPrefix(filename)}/page-${String(Math.trunc(pageNo)).padStart(4, "0")}.md`;
+export function buildDocumentPagesPrefix(storageKey: string): string {
+  return `${buildDocumentPrefix(storageKey)}/pages`;
+}
+
+export function buildDocumentPageKey(storageKey: string, pageNo: number): string {
+  return `${buildDocumentPagesPrefix(storageKey)}/page-${String(Math.trunc(pageNo)).padStart(4, "0")}.md`;
 }
 
 export function renderPageMarkdown(input: {
@@ -54,7 +55,7 @@ export function renderPageMarkdown(input: {
   void input.contentType;
   void input.sourceLocator;
   void input.heading;
-  const normalizedBody = String(input.body || "").trim();
+  const normalizedBody = sanitizeStoredPageMarkdown(String(input.body || "")).trim();
   return normalizedBody ? `${normalizedBody}\n` : "";
 }
 
@@ -90,8 +91,47 @@ export function parsePageFrontMatter(markdown: string): [Record<string, string>,
   return [header, text.slice(marker + 5).replace(/^\n+/, "")];
 }
 
+function splitMarkdownBlocks(markdown: string): string[] {
+  return String(markdown || "")
+    .replace(/\r\n/g, "\n")
+    .trim()
+    .split(/\n{2,}/)
+    .map((block) => block.trim())
+    .filter(Boolean);
+}
+
+export function sanitizeStoredPageMarkdown(markdown: string): string {
+  return String(markdown || "")
+    .split("\n")
+    .map((line) => {
+      if (!line.includes("|")) {
+        return line;
+      }
+      return line.replace(/(?<=\|)\s*Col(?:\[\d+\]|\d+)\s*(?=\|)/gi, "");
+    })
+    .join("\n");
+}
+
+export function extractBoundaryBlocks(markdown: string): {
+  leadingBlockMarkdown: string | null;
+  trailingBlockMarkdown: string | null;
+} {
+  const blocks = splitMarkdownBlocks(markdown);
+  if (blocks.length === 0) {
+    return {
+      leadingBlockMarkdown: null,
+      trailingBlockMarkdown: null,
+    };
+  }
+  return {
+    leadingBlockMarkdown: blocks[0] ? sanitizeStoredPageMarkdown(blocks[0]) : null,
+    trailingBlockMarkdown: blocks.at(-1) ? sanitizeStoredPageMarkdown(blocks.at(-1)!) : null,
+  };
+}
+
 async function persistPage(input: {
   blobStore: BlobStore;
+  storageKey: string;
   documentId: string;
   originalFilename: string;
   contentType?: string | null;
@@ -99,8 +139,9 @@ async function persistPage(input: {
   pageNo: number;
   syntheticPages: boolean;
 }): Promise<StoredPage> {
-  const objectKey = buildDocumentPageKey(input.originalFilename, input.pageNo);
+  const objectKey = buildDocumentPageKey(input.storageKey, input.pageNo);
   const pageLabel = input.syntheticPages ? `synthetic-${input.pageNo}` : String(input.pageNo);
+  const sanitizedMarkdown = sanitizeStoredPageMarkdown(input.unit.markdown);
   const payload = renderPageMarkdown({
     documentId: input.documentId,
     originalFilename: input.originalFilename,
@@ -109,8 +150,9 @@ async function persistPage(input: {
     contentType: input.contentType ?? null,
     sourceLocator: input.unit.source_locator ?? null,
     heading: input.unit.heading ?? null,
-    body: input.unit.markdown,
+    body: sanitizedMarkdown,
   });
+  const boundaryBlocks = extractBoundaryBlocks(sanitizedMarkdown);
   await input.blobStore.put({
     objectKey,
     data: Buffer.from(payload, "utf8"),
@@ -121,20 +163,23 @@ async function persistPage(input: {
     heading: input.unit.heading ?? null,
     sourceLocator: input.unit.source_locator ?? null,
     contentHash: input.unit.content_hash,
-    charCount: input.unit.markdown.length,
+    charCount: sanitizedMarkdown.length,
     isSyntheticPage: input.syntheticPages,
+    leadingBlockMarkdown: boundaryBlocks.leadingBlockMarkdown,
+    trailingBlockMarkdown: boundaryBlocks.trailingBlockMarkdown,
   };
 }
 
 export async function persistDocumentPages(input: {
   blobStore: BlobStore;
+  storageKey: string;
   documentId: string;
   originalFilename: string;
   contentType?: string | null;
   parsedDocument: ParsedDocument;
   syntheticPages: boolean;
 }): Promise<StoredPage[]> {
-  const pagesPrefix = buildDocumentPagesPrefix(input.originalFilename);
+  const pagesPrefix = buildDocumentPagesPrefix(input.storageKey);
   await input.blobStore.deletePrefix({ prefix: pagesPrefix });
   const storedPages: StoredPage[] = [];
   const orderedUnits = [...input.parsedDocument.units].sort((left, right) => left.unit_no - right.unit_no);
@@ -142,6 +187,7 @@ export async function persistDocumentPages(input: {
     storedPages.push(
       await persistPage({
         blobStore: input.blobStore,
+        storageKey: input.storageKey,
         documentId: input.documentId,
         originalFilename: input.originalFilename,
         contentType: input.contentType ?? null,
@@ -153,4 +199,3 @@ export async function persistDocumentPages(input: {
   }
   return storedPages;
 }
-

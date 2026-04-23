@@ -109,7 +109,7 @@ export class DocumentLibraryService {
 
     const docId = randomDocumentId();
     const sourceObjectKey = buildDocumentObjectKey(docId, filename);
-    const pagesPrefix = buildDocumentPagesKeyPrefix(filename);
+    const pagesPrefix = buildDocumentPagesKeyPrefix(docId);
     let storedSource = false;
     let storedPages = false;
     try {
@@ -126,11 +126,12 @@ export class DocumentLibraryService {
         filename,
         data: input.data,
       });
-      const pages = await persistDocumentPages({
-        blobStore: this.blobStore,
-        documentId: docId,
-        originalFilename: filename,
-        contentType: input.contentType ?? null,
+        const pages = await persistDocumentPages({
+          blobStore: this.blobStore,
+          storageKey: docId,
+          documentId: docId,
+          originalFilename: filename,
+          contentType: input.contentType ?? null,
         parsedDocument,
         syntheticPages: extname(filename).toLowerCase() !== ".pdf",
       });
@@ -227,6 +228,7 @@ export class DocumentLibraryService {
     });
     const storedPages = await persistDocumentPages({
       blobStore: this.blobStore,
+      storageKey: document.id,
       documentId: document.id,
       originalFilename: document.original_filename || document.relative_path,
       contentType: document.content_type,

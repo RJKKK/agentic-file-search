@@ -10,6 +10,7 @@ const PREFERRED_TOOL_ORDER = [
   "search_candidates",
   "grep",
   "read",
+  "page_boundary_context",
   "list_indexed_documents",
   "get_document",
 ] as const;

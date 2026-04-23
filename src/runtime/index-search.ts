@@ -18,6 +18,11 @@ import type {
   LazyIndexingStats,
   PageBatchReadGroup,
   PageBatchReadInput,
+  PageBoundaryContextInput,
+  PageBoundaryContextResult,
+  PageBoundaryDirection,
+  PageBoundaryMode,
+  PageBoundarySnapshot,
   PageScopeSummary,
   PageSearchForTargetResult,
   PageSearchHit,
@@ -132,6 +137,118 @@ function scopeResult(
 
 function normalizeTarget(value: string): string {
   return resolve(String(value || "")).toLowerCase();
+}
+
+function boundaryTextEqual(left: string | null, right: string | null): boolean {
+  return String(left ?? "").trim() === String(right ?? "").trim();
+}
+
+function directionIncludesPrevious(direction: PageBoundaryDirection): boolean {
+  return direction === "previous" || direction === "both";
+}
+
+function directionIncludesNext(direction: PageBoundaryDirection): boolean {
+  return direction === "next" || direction === "both";
+}
+
+function sideTitle(mode: PageBoundaryMode, side: "head" | "tail", pageNo: number, edge = false): string {
+  if (mode === "range") {
+    const prefix = edge ? "OUTER " : "";
+    return `${prefix}${side === "head" ? "START PAGE HEAD" : "END PAGE TAIL"} (${pageNo})`;
+  }
+  return `CURRENT PAGE ${side === "head" ? "HEAD" : "TAIL"} (${pageNo})`;
+}
+
+function renderBoundaryContext(input: {
+  document: StoredDocument;
+  mode: PageBoundaryMode;
+  direction: PageBoundaryDirection;
+  anchorPage: PageBoundarySnapshot | null;
+  startPage: PageBoundarySnapshot | null;
+  endPage: PageBoundarySnapshot | null;
+  currentPages: PageBoundarySnapshot[];
+  previousPage: PageBoundarySnapshot | null;
+  nextPage: PageBoundarySnapshot | null;
+  missing: string[];
+}): string {
+  const anchorPage = input.mode === "single" ? input.anchorPage : input.startPage;
+  if (!anchorPage) {
+    return "";
+  }
+  const lines = [
+    "=== PAGE BOUNDARY CONTEXT ===",
+    `document: ${input.document.original_filename || input.document.relative_path || input.document.id}`,
+    `doc_id: ${input.document.id}`,
+    `mode: ${input.mode}`,
+    input.mode === "single"
+      ? `page: ${anchorPage.page_no}`
+      : `pages: ${input.startPage!.page_no}-${input.endPage!.page_no}`,
+    `direction: ${input.direction}`,
+    "",
+  ];
+
+  if (input.currentPages.length > 0) {
+    if (input.mode === "single") {
+      const currentPage = input.currentPages[0]!;
+      lines.push(
+        `--- CURRENT PAGE CONTENT (${currentPage.page_no}) ---`,
+        currentPage.markdown || "[missing current page content]",
+        "",
+      );
+    } else {
+      lines.push("--- CURRENT RANGE CONTENT ---", "");
+      for (const page of input.currentPages) {
+        lines.push(
+          `--- PAGE ${page.page_no} ---`,
+          page.markdown || "[missing current page content]",
+          "",
+        );
+      }
+    }
+  }
+
+  const startLeading = anchorPage.leading_block_markdown;
+  const endPage = input.mode === "range" ? input.endPage ?? input.startPage : input.anchorPage;
+  const endTrailing = endPage?.trailing_block_markdown ?? null;
+  const previousTrailing = input.previousPage?.trailing_block_markdown ?? null;
+  const nextLeading = input.nextPage?.leading_block_markdown ?? null;
+
+  if (directionIncludesPrevious(input.direction)) {
+    if (previousTrailing && !boundaryTextEqual(previousTrailing, startLeading)) {
+      lines.push(`--- PREVIOUS PAGE TAIL (${input.previousPage!.page_no}) ---`, previousTrailing, "");
+    }
+    lines.push(
+      `--- ${sideTitle(input.mode, "head", anchorPage.page_no)} ---`,
+      startLeading || "[missing leading block]",
+      "",
+    );
+  }
+
+  const shouldRenderCurrentTail =
+    directionIncludesNext(input.direction) &&
+    (!directionIncludesPrevious(input.direction) ||
+      endPage?.page_no !== anchorPage.page_no ||
+      !boundaryTextEqual(startLeading, endTrailing) ||
+      !startLeading);
+  if (shouldRenderCurrentTail) {
+    lines.push(
+      `--- ${sideTitle(input.mode, "tail", endPage!.page_no, input.mode === "range")} ---`,
+      endTrailing || "[missing trailing block]",
+      "",
+    );
+  }
+
+  if (directionIncludesNext(input.direction)) {
+    if (nextLeading && !boundaryTextEqual(nextLeading, endTrailing)) {
+      lines.push(`--- NEXT PAGE HEAD (${input.nextPage!.page_no}) ---`, nextLeading, "");
+    }
+  }
+
+  if (input.missing.length > 0) {
+    lines.push("--- MISSING ---", ...input.missing.map((item) => `- ${item}`), "");
+  }
+
+  return lines.join("\n").trim();
 }
 
 function formatImageSemanticCache(input: {
@@ -726,6 +843,189 @@ export class IndexSearchService implements IndexSearchServiceContract {
       }
     }
     return limitedGroups;
+  }
+
+  async getPageBoundaryContext(input: PageBoundaryContextInput): Promise<PageBoundaryContextResult | null> {
+    const filePath = String(input.filePath ?? "").trim();
+    const documentId = String(input.documentId ?? "").trim();
+    const pageNo = Number(input.pageNo ?? 0);
+    const startPage = Number(input.startPage ?? 0);
+    const endPage = Number(input.endPage ?? 0);
+    const isRange =
+      !filePath &&
+      documentId &&
+      Number.isFinite(startPage) &&
+      startPage > 0 &&
+      Number.isFinite(endPage) &&
+      endPage >= startPage;
+
+    let currentDocument: StoredDocument | null = null;
+    let anchorPage: PageBoundarySnapshot | null = null;
+    let startSnapshot: PageBoundarySnapshot | null = null;
+    let endSnapshot: PageBoundarySnapshot | null = null;
+    let currentPages: PageBoundarySnapshot[] = [];
+    let previousSnapshot: PageBoundarySnapshot | null = null;
+    let nextSnapshot: PageBoundarySnapshot | null = null;
+
+    const toSnapshot = (
+      page:
+        | LoadedDocumentPage
+        | {
+            page_no: number;
+            heading: string | null;
+            source_locator: string | null;
+            leading_block_markdown: string | null;
+            trailing_block_markdown: string | null;
+            object_key?: string;
+          }
+        | null,
+      fallbackFilePath: string | null = null,
+    ): PageBoundarySnapshot | null => {
+      if (!page) {
+        return null;
+      }
+      return {
+        page_no: page.page_no,
+        file_path:
+          "file_path" in page
+            ? page.file_path
+            : page.object_key
+              ? null
+              : fallbackFilePath,
+        heading: page.heading ?? null,
+        source_locator: page.source_locator ?? null,
+        markdown: "markdown" in page ? page.markdown : null,
+        leading_block_markdown: page.leading_block_markdown ?? null,
+        trailing_block_markdown: page.trailing_block_markdown ?? null,
+      };
+    };
+
+    if (filePath) {
+      const resolved = await this.findPageByPath(filePath);
+      if (!resolved) {
+        return null;
+      }
+      currentDocument = resolved.document;
+      anchorPage = toSnapshot(resolved.page, resolved.page.file_path);
+      startSnapshot = anchorPage;
+      endSnapshot = anchorPage;
+      currentPages = anchorPage ? [anchorPage] : [];
+
+      const pageMap = new Map(
+        this.options.storage
+          .listDocumentPages(currentDocument.id, [resolved.page.page_no - 1, resolved.page.page_no + 1])
+          .map((item) => [item.page_no, item] as const),
+      );
+      previousSnapshot = toSnapshot(pageMap.get(resolved.page.page_no - 1) ?? null);
+      nextSnapshot = toSnapshot(pageMap.get(resolved.page.page_no + 1) ?? null);
+    } else if (isRange || (documentId && Number.isFinite(pageNo) && pageNo > 0)) {
+      const scope = this.resolveScope();
+      if (!scope.documentIds.includes(documentId)) {
+        throw new Error(`Document ${documentId} is outside the currently selected document scope.`);
+      }
+      currentDocument = scope.documents.find((item) => item.id === documentId) ?? null;
+      if (!currentDocument) {
+        return null;
+      }
+      const anchorStart = isRange ? startPage : pageNo;
+      const anchorEnd = isRange ? endPage : pageNo;
+      const requestedPageNos = Array.from(
+        { length: anchorEnd - anchorStart + 1 },
+        (_unused, index) => anchorStart + index,
+      );
+      const loadedCurrentPages = await loadDocumentPages({
+        storage: this.options.storage,
+        blobStore: this.options.blobStore,
+        documentId: currentDocument.id,
+        pageNos: requestedPageNos,
+      });
+      currentPages = loadedCurrentPages
+        .map((page) => toSnapshot(page, page.file_path))
+        .filter((page): page is PageBoundarySnapshot => page != null);
+      const pageMap = new Map(
+        this.options.storage
+          .listDocumentPages(currentDocument.id, [anchorStart - 1, anchorStart, anchorEnd, anchorEnd + 1])
+          .map((item) => [item.page_no, item] as const),
+      );
+      startSnapshot =
+        currentPages.find((page) => page.page_no === anchorStart) ??
+        toSnapshot(pageMap.get(anchorStart) ?? null);
+      endSnapshot =
+        currentPages.find((page) => page.page_no === anchorEnd) ??
+        toSnapshot(pageMap.get(anchorEnd) ?? null);
+      anchorPage = isRange ? null : startSnapshot;
+      previousSnapshot = toSnapshot(pageMap.get(anchorStart - 1) ?? null);
+      nextSnapshot = toSnapshot(pageMap.get(anchorEnd + 1) ?? null);
+    }
+
+    if (!currentDocument || !startSnapshot || !endSnapshot) {
+      return null;
+    }
+
+    const mode: PageBoundaryMode = isRange ? "range" : "single";
+    const missing: string[] = [];
+
+    if (directionIncludesPrevious(input.direction)) {
+      if (!previousSnapshot) {
+        missing.push(
+          mode === "single"
+            ? "Previous page is unavailable for this page."
+            : "Previous page is unavailable for the start page of this range.",
+        );
+      } else if (!previousSnapshot.trailing_block_markdown) {
+        missing.push(`Previous page ${previousSnapshot.page_no} has no stored trailing block.`);
+      }
+      if (!startSnapshot.leading_block_markdown) {
+        missing.push(
+          mode === "single"
+            ? `Current page ${startSnapshot.page_no} has no stored leading block.`
+            : `Start page ${startSnapshot.page_no} has no stored leading block.`,
+        );
+      }
+    }
+
+    if (directionIncludesNext(input.direction)) {
+      if (!endSnapshot.trailing_block_markdown) {
+        missing.push(
+          mode === "single"
+            ? `Current page ${endSnapshot.page_no} has no stored trailing block.`
+            : `End page ${endSnapshot.page_no} has no stored trailing block.`,
+        );
+      }
+      if (!nextSnapshot) {
+        missing.push(
+          mode === "single"
+            ? "Next page is unavailable for this page."
+            : "Next page is unavailable for the end page of this range.",
+        );
+      } else if (!nextSnapshot.leading_block_markdown) {
+        missing.push(`Next page ${nextSnapshot.page_no} has no stored leading block.`);
+      }
+    }
+
+    return {
+      document: currentDocument,
+      mode,
+      direction: input.direction,
+      anchor_page: anchorPage,
+      start_page: startSnapshot,
+      end_page: endSnapshot,
+      previous_page: previousSnapshot,
+      next_page: nextSnapshot,
+      missing,
+        rendered: renderBoundaryContext({
+          document: currentDocument,
+          mode,
+          direction: input.direction,
+          anchorPage,
+          startPage: startSnapshot,
+          endPage: endSnapshot,
+          currentPages,
+          previousPage: previousSnapshot,
+          nextPage: nextSnapshot,
+          missing,
+        }),
+      };
   }
 
   async findPageByPath(

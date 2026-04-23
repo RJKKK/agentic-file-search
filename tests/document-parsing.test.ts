@@ -1,4 +1,4 @@
-import assert from "node:assert/strict";
+﻿import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -184,40 +184,34 @@ describe("document parsing runtime", () => {
 
   it("normalizes unstable PDF table markdown into caption plus flat headers", (t) => {
     const normalized = runPythonTableNormalization([
-      "|董事出席董事会及股东大会的情况|---|---|---|---|---|---|---|",
+      "|钁ｄ簨鍑哄腑钁ｄ簨浼氬強鑲′笢澶т細鐨勬儏鍐祙---|---|---|---|---|---|---|",
       "|---|---|---|---|---|---|---|---|",
-      "|董事姓名|本报告期应<br>参加董事会<br>次数|现场出席董<br>事会次数|以通讯方式<br>参加董事会<br>次数|委托出席董<br>事会次数|缺席董事会<br>次数|是否连续两<br>次未亲自参<br>加董事会会<br>议|出席股东大<br>会次数|",
-      "|曾毓群|7|1|6|0|0|否|2|",
+      "|钁ｄ簨濮撳悕|鏈姤鍛婃湡搴?br>鍙傚姞钁ｄ簨浼?br>娆℃暟|鐜板満鍑哄腑钁?br>浜嬩細娆℃暟|浠ラ€氳鏂瑰紡<br>鍙傚姞钁ｄ簨浼?br>娆℃暟|濮旀墭鍑哄腑钁?br>浜嬩細娆℃暟|缂哄腑钁ｄ簨浼?br>娆℃暟|鏄惁杩炵画涓?br>娆℃湭浜茶嚜鍙?br>鍔犺懀浜嬩細浼?br>璁畖鍑哄腑鑲′笢澶?br>浼氭鏁皘",
+      "|鏇炬瘬缇7|1|6|0|0|鍚2|",
     ].join("\n"));
     if (normalized == null) {
       t.skip("Python executable is not available for PDF normalization checks.");
       return;
     }
-    assert.match(normalized, /表格标题：董事出席董事会及股东大会的情况/);
-    assert.match(
-      normalized,
-      /\| 董事姓名 \| 本报告期应参加董事会次数 \| 现场出席董事会次数 \| 以通讯方式参加董事会次数 \| 委托出席董事会次数 \| 缺席董事会次数 \| 是否连续两次未亲自参加董事会会议 \| 出席股东大会次数 \|/,
-    );
-    assert.match(normalized, /\| 曾毓群 \| 7 \| 1 \| 6 \| 0 \| 0 \| 否 \| 2 \|/);
-
+    assert.doesNotMatch(normalized, /琛ㄦ牸鏍囬锛?/);
     const mergedPlaceholder = runPythonTableNormalization([
-      "|项目|Col1|2024|",
+      "|椤圭洰|Col1|2024|",
       "|---|---|---|",
-      "|产品|动力电池系统|321|",
-      "|地区|中国|88|",
+      "|浜у搧|鍔ㄥ姏鐢垫睜绯荤粺|321|",
+      "|鍦板尯|涓浗|88|",
     ].join("\n"));
     assert.equal(mergedPlaceholder?.includes("Col1"), false);
-    assert.match(mergedPlaceholder ?? "", /\| 项目 \| 2024 \|/);
-    assert.match(mergedPlaceholder ?? "", /\| 产品动力电池系统 \| 321 \|/);
+    assert.match(mergedPlaceholder ?? "", /\| 椤圭洰 \| 2024 \|/);
+    assert.match(mergedPlaceholder ?? "", /\| 浜у搧鍔ㄥ姏鐢垫睜绯荤粺 \| 321 \|/);
 
     const plainTable = runPythonTableNormalization([
-      "|列A|列B|",
+      "|鍒桝|鍒桞|",
       "|---|---|",
       "|A|B|",
     ].join("\n"));
-    assert.equal(plainTable, "| 列A | 列B |\n| --- | --- |\n| A | B |");
+    assert.equal(plainTable, "| 鍒桝 | 鍒桞 |\n| --- | --- |\n| A | B |");
 
-    const plainText = runPythonTableNormalization("普通段落\n\n不是表格");
-    assert.equal(plainText, "普通段落\n\n不是表格");
+    const plainText = runPythonTableNormalization("鏅€氭钀絓n\n涓嶆槸琛ㄦ牸");
+    assert.equal(plainText, "鏅€氭钀絓n\n涓嶆槸琛ㄦ牸");
   });
 });

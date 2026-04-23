@@ -104,6 +104,12 @@ export class ExploreSession {
     embeddings_written: 0,
   };
 
+  candidateDocumentSelection: Record<string, unknown> | null = null;
+
+  documentSummaries: Array<Record<string, unknown>> = [];
+
+  parallelDocumentLimit = 3;
+
   batchSummaries: Array<Record<string, unknown>> = [];
 
   cumulativeAnswer: string | null = null;
@@ -155,6 +161,9 @@ export class ExploreSession {
       db_path: this.dbPath,
       enable_semantic: this.enableSemantic,
       enable_metadata: this.enableMetadata,
+      candidate_document_selection: this.candidateDocumentSelection,
+      document_summaries: [...this.documentSummaries],
+      parallel_document_limit: this.parallelDocumentLimit,
       batch_summaries: [...this.batchSummaries],
       cumulative_answer: this.cumulativeAnswer,
       batch_mode: this.batchMode,

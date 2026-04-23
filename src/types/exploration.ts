@@ -38,6 +38,9 @@ export interface ExploreSessionSnapshot {
   db_path: string | null;
   enable_semantic: boolean;
   enable_metadata: boolean;
+  candidate_document_selection: Record<string, unknown> | null;
+  document_summaries: Array<Record<string, unknown>>;
+  parallel_document_limit: number;
   batch_summaries: Array<Record<string, unknown>>;
   cumulative_answer: string | null;
   batch_mode: BatchMode;

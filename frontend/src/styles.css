@@ -180,6 +180,13 @@ body {
   font-size: 12px;
 }
 
+.section-tags {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 .trace-list,
 .batch-cache,
 .answer-scroll {
@@ -203,6 +210,24 @@ body {
 
 .active-batch {
   background: #fff7ed;
+}
+
+.coordinator-card {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+}
+
+.synthesis-card {
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+}
+
+.candidate-doc-list,
+.document-summary-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
 }
 
 .batch-card p,

@@ -103,7 +103,7 @@ describe("document library service", () => {
     const catalog = service.createDocumentCatalog();
     const listed = await catalog.listDocuments();
     assert.equal(listed[0]?.id, result.document.id);
-    assert.match(String(listed[0]?.pagesDir), /documents[\\/]alpha\.docx[\\/]pages$/);
+    assert.match(String(listed[0]?.pagesDir), /documents[\\/][a-f0-9]{32}[\\/]pages$/);
     const fullDocument = await catalog.getDocument(String(result.document.id));
     assert.match(String(fullDocument?.content), /Purchase price is 42/);
 
@@ -114,6 +114,10 @@ describe("document library service", () => {
     });
     assert.equal(loadedPages[0]?.markdown, "# Overview\nAlpha overview.\n");
     assert.equal(loadedPages[0]?.is_synthetic_page, true);
+    assert.equal(loadedPages[0]?.leading_block_markdown, "# Overview\nAlpha overview.");
+    assert.equal(loadedPages[0]?.trailing_block_markdown, "# Overview\nAlpha overview.");
+    assert.equal(loadedPages[1]?.leading_block_markdown, "# Price\nPurchase price is 42.");
+    assert.equal(loadedPages[1]?.trailing_block_markdown, "# Price\nPurchase price is 42.");
 
     storage.close();
   });
@@ -173,6 +177,41 @@ describe("document library service", () => {
       objectKey: buildDocumentObjectKey(String(uploaded.document.id), filename),
     });
     await access(sourcePath, fsConstants.F_OK);
+
+    storage.close();
+  });
+
+  it("accepts filenames with display-only punctuation while storing blobs under the document id", async () => {
+    const root = await mkdtemp(join(tmpdir(), "afs-library-service-display-name-"));
+    const dbPath = join(root, "library.sqlite");
+    const objectRoot = join(root, "object-store");
+    const storage = new SqliteStorage({ dbPath });
+    const blobStore = new LocalBlobStore(objectRoot);
+    const parser = new FakeParser(buildParsedDocument());
+    storage.initialize();
+    const service = new DocumentLibraryService(storage, blobStore, parser);
+
+    const filename = "宁德时代：2024年年度报告.pdf";
+    const uploaded = await service.uploadDocument({
+      filename,
+      data: Buffer.from("%PDF fake", "utf8"),
+      contentType: "application/pdf",
+    });
+
+    assert.equal(uploaded.document.original_filename, filename);
+    assert.equal(uploaded.document.pages_prefix, buildDocumentPagesKeyPrefix(String(uploaded.document.id)));
+
+    const sourceObjectKey = buildDocumentObjectKey(String(uploaded.document.id), filename);
+    assert.match(sourceObjectKey, /^documents\/[a-f0-9]{32}\/source\/source\.pdf$/);
+    const sourcePath = await blobStore.materialize({ objectKey: sourceObjectKey });
+    await access(sourcePath, fsConstants.F_OK);
+
+    const pages = await loadDocumentPages({
+      storage,
+      blobStore,
+      documentId: String(uploaded.document.id),
+    });
+    assert.equal(pages[0]?.object_key, `${buildDocumentPagesKeyPrefix(String(uploaded.document.id))}/page-0001.md`);
 
     storage.close();
   });

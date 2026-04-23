@@ -40,6 +40,8 @@ export interface StoredPage {
   contentHash: string;
   charCount: number;
   isSyntheticPage: boolean;
+  leadingBlockMarkdown: string | null;
+  trailingBlockMarkdown: string | null;
 }
 
 export interface LoadedDocumentPage {
@@ -54,6 +56,8 @@ export interface LoadedDocumentPage {
   page_label: string;
   markdown: string;
   file_path: string;
+  leading_block_markdown: string | null;
+  trailing_block_markdown: string | null;
 }
 
 export interface DocumentScope {

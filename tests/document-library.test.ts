@@ -24,8 +24,8 @@ describe("document library helpers", () => {
 
     const corpusId = ensureLibraryCorpus(storage);
     assert.equal(getLibraryCorpusId(storage), corpusId);
-    assert.equal(buildDocumentObjectKey("doc-1", "alpha.pdf"), "documents/alpha.pdf/source/alpha.pdf");
-    assert.equal(buildDocumentPagesKeyPrefix("alpha.pdf"), "documents/alpha.pdf/pages");
+    assert.equal(buildDocumentObjectKey("doc-1", "alpha.pdf"), "documents/doc-1/source/source.pdf");
+    assert.equal(buildDocumentPagesKeyPrefix("doc-1"), "documents/doc-1/pages");
 
     const docId = SqliteStorage.makeDocumentId(corpusId, "alpha.pdf");
     storage.upsertDocumentStub({
@@ -94,10 +94,9 @@ describe("document library helpers", () => {
       document: storage.getDocument(docId)!,
     });
 
-    assert.match(materialized.absolute_path, /documents[\\/]alpha\.pdf[\\/]source[\\/]alpha\.pdf$/);
+    assert.match(materialized.absolute_path, /documents[\\/]doc_[a-f0-9]+[\\/]source[\\/]source\.pdf$/);
     assert.equal(storage.getDocument(docId)?.absolute_path, materialized.absolute_path);
 
     storage.close();
   });
 });
-

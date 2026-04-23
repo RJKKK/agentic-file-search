@@ -42,6 +42,10 @@ export const skillModule: SkillModule = {
                 span: Math.abs((endPage ?? startPage) - startPage) + 1,
               }
             : null;
+        const boundaryHint =
+          requestedRange != null
+            ? "use page_boundary_context(previous|next|both) if the first/last page looks truncated"
+            : null;
         const maxPages = Math.min(Math.max(toNumberOrNull(input.max_pages) ?? 3, 1), 5);
         const groups = await context.services.indexSearch?.resolvePageBatch({
           filePaths: batchFilePaths,
@@ -94,6 +98,9 @@ export const skillModule: SkillModule = {
             read_pages: group.pages.map((page) => page.page_no),
             omitted_pages: group.omittedPages,
             truncated: group.truncated,
+            range_start_page: requestedRange?.start ?? null,
+            range_end_page: requestedRange?.end ?? null,
+            boundary_hint: boundaryHint,
           });
           const returned = renderRanges(parseSummary.returned_ranges);
           const reactivated = Number(parseSummary.new_units_added ?? 0) === 0;
@@ -103,6 +110,7 @@ export const skillModule: SkillModule = {
               : "";
           receiptParts.push(
             `document=${label}; returned=${returned}; new_units=${String(parseSummary.new_units_added ?? 0)}` +
+              `${requestedRange ? `; range_start_page=${requestedRange.start}; range_end_page=${requestedRange.end}; boundary_hint=${boundaryHint}` : ""}` +
               `${reactivated ? "; reactivated evidence" : ""}` +
               `${group.omittedPages.length ? `; omitted=${group.omittedPages.join(", ")}` : ""}` +
               wideRangeWarning,
@@ -203,6 +211,8 @@ export const skillModule: SkillModule = {
       const renderedRanges = renderRanges(parseSummary.returned_ranges);
 
       if (resolvedPageNo !== null) {
+        const singlePageBoundaryHint =
+          "use page_boundary_context(previous|next) before reading more pages when this page looks truncated or like part of a continued table/list";
         return {
           output: [
             `=== PAGE ${resolvedPageNo} of ${label} ===`,
@@ -211,7 +221,9 @@ export const skillModule: SkillModule = {
             "",
             indexedPage?.page.markdown ?? body,
           ].join("\n").trim(),
-          receipt: `Parse receipt: path=${indexedPage?.page.file_path ?? filePath}; returned=${renderedRanges}; new_units=${String(parseSummary.new_units_added ?? 0)}; total_units=${String(parseSummary.total_units ?? "?")}; structured evidence has been stored for the next reasoning step.`,
+          receipt:
+            `Parse receipt: path=${indexedPage?.page.file_path ?? filePath}; returned=${renderedRanges}; new_units=${String(parseSummary.new_units_added ?? 0)}; total_units=${String(parseSummary.total_units ?? "?")}; ` +
+            `boundary_hint=${singlePageBoundaryHint}; structured evidence has been stored for the next reasoning step.`,
         };
       }
 

@@ -1,0 +1,46 @@
+{
+  "id": "page-boundary-context-skill",
+  "name": "Page Boundary Context Skill",
+  "status": "active",
+  "description": "Load neighboring boundary blocks for one page or one consecutive page window without expanding candidate pages.",
+  "entry": "./index.ts",
+  "tools": [
+    {
+      "name": "page_boundary_context",
+      "description": "Load the previous-page tail and/or next-page head around one page or one consecutive page range.",
+      "parameters": [
+        {
+          "name": "file_path",
+          "description": "The page markdown file to inspect.",
+          "required": false
+        },
+        {
+          "name": "document_id",
+          "description": "Document id when file_path is not available.",
+          "required": false
+        },
+        {
+          "name": "page_no",
+          "description": "Current page number when using document_id.",
+          "required": false
+        },
+        {
+          "name": "start_page",
+          "description": "Start page number when checking the outer boundary of a consecutive range.",
+          "required": false
+        },
+        {
+          "name": "end_page",
+          "description": "End page number when checking the outer boundary of a consecutive range.",
+          "required": false
+        },
+        {
+          "name": "direction",
+          "description": "Which side to inspect: previous, next, or both.",
+          "required": true
+        }
+      ]
+    }
+  ],
+  "enabledByDefault": true
+}

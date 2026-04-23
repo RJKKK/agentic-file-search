@@ -77,6 +77,7 @@ async function createWorkflowFixture() {
   const pagesDir = join(objectRoot, pagesPrefix);
   await mkdir(pagesDir, { recursive: true });
   const pagePath = join(pagesDir, "page-0001.md");
+  const pageTwoPath = join(pagesDir, "page-0002.md");
   await writeFile(
     pagePath,
     [
@@ -91,6 +92,20 @@ async function createWorkflowFixture() {
       "The purchase price is $45,000,000.",
     ].join("\n"),
   );
+  await writeFile(
+    pageTwoPath,
+    [
+      "---",
+      "document_id: doc-alpha",
+      "page_no: 2",
+      "original_filename: alpha.pdf",
+      "heading: Closing",
+      "source_locator: page-2",
+      "---",
+      "",
+      "Closing follows later.",
+    ].join("\n"),
+  );
   storage.upsertDocumentStub({
     id: "doc-alpha",
     corpusId,
@@ -103,7 +118,7 @@ async function createWorkflowFixture() {
     contentSha256: "sha-alpha",
     originalFilename: "alpha.pdf",
     pagesPrefix,
-    pageCount: 1,
+    pageCount: 2,
     uploadStatus: "uploaded",
     parsedContentSha256: "sha-alpha",
     parsedIsComplete: true,
@@ -118,6 +133,20 @@ async function createWorkflowFixture() {
       isSyntheticPage: false,
       heading: "Purchase Price",
       sourceLocator: "page-1",
+      leadingBlockMarkdown: "The purchase price is $45,000,000.",
+      trailingBlockMarkdown: "The purchase price is $45,000,000.",
+    },
+    {
+      documentId: "doc-alpha",
+      pageNo: 2,
+      objectKey: `${pagesPrefix}/page-0002.md`,
+      contentHash: "hash-page-2",
+      charCount: 22,
+      isSyntheticPage: false,
+      heading: "Closing",
+      sourceLocator: "page-2",
+      leadingBlockMarkdown: "Closing follows later.",
+      trailingBlockMarkdown: "Closing follows later.",
     },
   ]);
 
@@ -127,6 +156,7 @@ async function createWorkflowFixture() {
     blobStore,
     pagesDir,
     pagePath,
+    pageTwoPath,
   };
 }
 
@@ -173,6 +203,7 @@ describe("exploration workflow service", () => {
       "complete",
     ]);
     assert.match(model.requests[0].messages.map((message) => message.content).join("\n"), /Start with `glob\(directory="scope"\)`/);
+    assert.match(model.requests[0].systemPrompt, /page_boundary_context/);
     assert.match(model.requests[1].messages.map((message) => message.content).join("\n"), /Given the tool result/);
 
     const completeEvent = session.history.at(-1)!;
@@ -189,6 +220,40 @@ describe("exploration workflow service", () => {
       (session.contextStateSnapshot.context_scope as Record<string, unknown>).active_document_id,
       "doc-alpha",
     );
+
+    fixture.storage.close();
+  });
+
+  it("publishes page boundary events when the agent requests boundary context", async () => {
+    const fixture = await createWorkflowFixture();
+    const model = new SequenceModel([
+      toolCall("read", { file_path: fixture.pagePath }),
+      toolCall("page_boundary_context", { file_path: fixture.pagePath, direction: "next" }),
+      stop("The purchase price is $45,000,000. [Source: alpha.pdf, page 1]"),
+    ]);
+    const service = new ExplorationWorkflowService({
+      storage: fixture.storage,
+      blobStore: fixture.blobStore,
+      model,
+      skillsRoot: join(process.cwd(), "skills"),
+      rootDirectory: fixture.root,
+    });
+
+    const started = await service.startSession({
+      task: "What is the purchase price?",
+      documentIds: ["doc-alpha"],
+    });
+    await service.waitForSession(started.session_id);
+
+    const session = service.getSession(started.session_id)!;
+    assert.equal(session.status, "completed");
+    assert.ok(session.history.some((event) => event.type === "page_boundary_loaded"));
+    const completeEvent = session.history.at(-1)!;
+    const trace = completeEvent.data.trace as Record<string, unknown>;
+    assert.equal((trace.page_boundary_loads as Array<Record<string, unknown>>).length, 1);
+    assert.equal((trace.page_boundary_loads as Array<Record<string, unknown>>)[0]?.direction, "next");
+    assert.equal((trace.page_boundary_loads as Array<Record<string, unknown>>)[0]?.mode, "single");
+    assert.equal((trace.page_boundary_loads as Array<Record<string, unknown>>)[0]?.anchor_page, 1);
 
     fixture.storage.close();
   });
@@ -275,7 +340,16 @@ describe("exploration workflow service", () => {
   it("runs forced batch mode and publishes batch cache events", async () => {
     const fixture = await createWorkflowFixture();
     const model = new SequenceModel([
-      stop("Batch answer: the purchase price is $45,000,000. [Source: alpha.pdf, page 1]"),
+      {
+        selected_documents: [
+          {
+            document_id: "doc-alpha",
+            reason: "The retrieval hit contains the purchase price.",
+          },
+        ],
+      },
+      stop("Document answer: the purchase price is $45,000,000. [Source: alpha.pdf, page 1]"),
+      stop("Final synthesis: the purchase price is $45,000,000. [Source: alpha.pdf, page 1]"),
     ]);
     const service = new ExplorationWorkflowService({
       storage: fixture.storage,
@@ -286,7 +360,7 @@ describe("exploration workflow service", () => {
     });
 
     const started = await service.startSession({
-      task: "Summarize all selected documents.",
+      task: "What is the purchase price?",
       documentIds: ["doc-alpha"],
       batchMode: "force",
       batchSize: 1,
@@ -297,14 +371,66 @@ describe("exploration workflow service", () => {
     const session = service.getSession(started.session_id)!;
     const eventTypes = session.history.map((event) => event.type);
     assert.equal(session.status, "completed");
+    assert.ok(eventTypes.includes("candidate_documents_found"));
+    assert.ok(eventTypes.includes("document_agent_started"));
+    assert.ok(eventTypes.includes("document_answer_done"));
+    assert.ok(eventTypes.includes("document_agent_completed"));
+    assert.ok(eventTypes.includes("final_synthesis_started"));
+    assert.ok(eventTypes.includes("final_synthesis_done"));
     assert.ok(eventTypes.includes("batch_started"));
     assert.ok(eventTypes.includes("batch_answer_done"));
     assert.ok(eventTypes.includes("cumulative_answer_updated"));
     assert.ok(eventTypes.includes("batch_completed"));
     assert.ok(eventTypes.includes("batch_context_released"));
+    assert.equal(session.documentSummaries.length, 1);
     assert.equal(session.batchSummaries.length, 1);
-    assert.match(session.cumulativeAnswer ?? "", /Batch answer/);
+    assert.match(session.cumulativeAnswer ?? "", /Document answer/);
+    assert.match(session.finalResult ?? "", /Final synthesis/);
     assert.equal(session.snapshot().batch_mode, "force");
+    assert.equal(session.snapshot().parallel_document_limit, 3);
+
+    fixture.storage.close();
+  });
+
+  it("does not run document agents for invalid coordinator selections", async () => {
+    const fixture = await createWorkflowFixture();
+    const model = new SequenceModel([
+      {
+        selected_documents: [
+          {
+            document_id: "doc-missing",
+            reason: "This id is outside the retrieval candidate set.",
+          },
+        ],
+      },
+      stop("No selected candidate document supports the answer."),
+    ]);
+    const service = new ExplorationWorkflowService({
+      storage: fixture.storage,
+      blobStore: fixture.blobStore,
+      model,
+      skillsRoot: join(process.cwd(), "skills"),
+      rootDirectory: fixture.root,
+    });
+
+    const started = await service.startSession({
+      task: "What is the purchase price?",
+      documentIds: ["doc-alpha"],
+      batchMode: "force",
+      batchSize: 1,
+      batchThreshold: 10,
+    });
+    await service.waitForSession(started.session_id);
+
+    const session = service.getSession(started.session_id)!;
+    const eventTypes = session.history.map((event) => event.type);
+    assert.equal(session.status, "completed");
+    assert.ok(eventTypes.includes("candidate_documents_found"));
+    assert.equal(eventTypes.includes("document_agent_started"), false);
+    assert.ok(eventTypes.includes("final_synthesis_done"));
+    assert.equal(session.documentSummaries.length, 0);
+    assert.equal(session.batchSummaries.length, 0);
+    assert.match(session.finalResult ?? "", /No selected candidate document/);
 
     fixture.storage.close();
   });

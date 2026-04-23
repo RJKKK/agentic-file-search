@@ -43,6 +43,8 @@ describe("system prompt", () => {
     assert.match(prompt, /Narrow Read Window Rules/);
     assert.match(prompt, /Avoid broad speculative reads/);
     assert.match(prompt, /1-3 pages/);
+    assert.match(prompt, /keep page 48 as the anchor/i);
+    assert.match(prompt, /page_boundary_context\(direction="next"\).*page 48/i);
     assert.match(prompt, /Three-Phase Page Exploration Strategy/);
     assert.match(prompt, /Providing Detailed Reasoning/);
     assert.match(prompt, /Citation Requirements for Final Answers/i);

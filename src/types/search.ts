@@ -91,6 +91,41 @@ export interface PageBatchReadGroup {
   omittedPages: number[];
 }
 
+export type PageBoundaryDirection = "previous" | "next" | "both";
+export type PageBoundaryMode = "single" | "range";
+
+export interface PageBoundarySnapshot {
+  page_no: number;
+  file_path: string | null;
+  heading: string | null;
+  source_locator: string | null;
+  markdown?: string | null;
+  leading_block_markdown: string | null;
+  trailing_block_markdown: string | null;
+}
+
+export interface PageBoundaryContextInput {
+  filePath?: string | null;
+  documentId?: string | null;
+  pageNo?: number | null;
+  startPage?: number | null;
+  endPage?: number | null;
+  direction: PageBoundaryDirection;
+}
+
+export interface PageBoundaryContextResult {
+  document: StoredDocument;
+  mode: PageBoundaryMode;
+  direction: PageBoundaryDirection;
+  anchor_page: PageBoundarySnapshot | null;
+  start_page: PageBoundarySnapshot | null;
+  end_page: PageBoundarySnapshot | null;
+  previous_page: PageBoundarySnapshot | null;
+  next_page: PageBoundarySnapshot | null;
+  missing: string[];
+  rendered: string;
+}
+
 export interface PageBatchReadInput {
   filePaths?: string[];
   documentId?: string | null;
@@ -126,6 +161,7 @@ export interface IndexSearchServiceContract {
     options?: { maxHitsPerDocument?: number; maxTotalHits?: number; regex?: boolean },
   ): Promise<PageSearchForTargetResult>;
   resolvePageBatch(input: PageBatchReadInput): Promise<PageBatchReadGroup[]>;
+  getPageBoundaryContext(input: PageBoundaryContextInput): Promise<PageBoundaryContextResult | null>;
   findPageByPath(filePath: string): Promise<{ document: StoredDocument; page: LoadedDocumentPage } | null>;
   emit(eventType: string, data: Record<string, unknown>): void;
 }

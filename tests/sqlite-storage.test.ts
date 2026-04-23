@@ -269,6 +269,8 @@ describe("sqlite storage", () => {
         isSyntheticPage: false,
         heading: "Overview",
         sourceLocator: "page-1",
+        leadingBlockMarkdown: "# Overview",
+        trailingBlockMarkdown: "Overview tail.",
       },
       {
         documentId: docId,
@@ -279,6 +281,8 @@ describe("sqlite storage", () => {
         isSyntheticPage: false,
         heading: "Price",
         sourceLocator: "page-2",
+        leadingBlockMarkdown: "# Price",
+        trailingBlockMarkdown: "Price tail.",
       },
     ]);
     assert.deepEqual(first, { upserted: 2, untouched: 0, deleted: 0 });
@@ -293,10 +297,14 @@ describe("sqlite storage", () => {
         isSyntheticPage: false,
         heading: "Overview",
         sourceLocator: "page-1",
+        leadingBlockMarkdown: "# Overview",
+        trailingBlockMarkdown: "Overview tail.",
       },
     ]);
     assert.deepEqual(second, { upserted: 0, untouched: 1, deleted: 1 });
     assert.equal(storage.getDocument(docId)?.page_count, 1);
+    assert.equal(storage.listDocumentPages(docId)[0]?.leading_block_markdown, "# Overview");
+    assert.equal(storage.listDocumentPages(docId)[0]?.trailing_block_markdown, "Overview tail.");
 
     const written = storage.upsertImageSemantics([
       {

@@ -3,6 +3,8 @@ Reference: legacy/python/src/fs_explorer/document_library.py
 Reference: legacy/python/src/fs_explorer/server.py
 */
 
+import { extname } from "node:path";
+
 import type { DocumentCatalog, DocumentRecord, DocumentSummary } from "../types/skills.js";
 import type { BlobStore, DocumentScope, DocumentSummaryPayload } from "../types/library.js";
 import type { PublicCollectionRecord, SqliteStorageBackend, StoredDocument } from "../types/storage.js";
@@ -51,12 +53,13 @@ export function getLibraryCorpusId(
 }
 
 export function buildDocumentObjectKey(docId: string, filename: string): string {
-  void docId;
-  return buildDocumentSourceKey(filename);
+  const validated = validateStorageFilename(filename);
+  const extension = extname(validated) || ".bin";
+  return buildDocumentSourceKey(docId, `source${extension}`);
 }
 
-export function buildDocumentPagesKeyPrefix(filename: string): string {
-  return buildDocumentPagesPrefix(validateStorageFilename(filename));
+export function buildDocumentPagesKeyPrefix(docId: string): string {
+  return buildDocumentPagesPrefix(docId);
 }
 
 export async function materializeDocument(input: {

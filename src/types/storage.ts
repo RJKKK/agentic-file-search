@@ -81,6 +81,8 @@ export interface StoredDocumentPage {
   is_synthetic_page: boolean;
   heading: string | null;
   source_locator: string | null;
+  leading_block_markdown: string | null;
+  trailing_block_markdown: string | null;
 }
 
 export interface StorageDocumentPageRecord {
@@ -92,6 +94,8 @@ export interface StorageDocumentPageRecord {
   isSyntheticPage: boolean;
   heading?: string | null;
   sourceLocator?: string | null;
+  leadingBlockMarkdown?: string | null;
+  trailingBlockMarkdown?: string | null;
 }
 
 export interface StoredImageSemantic {

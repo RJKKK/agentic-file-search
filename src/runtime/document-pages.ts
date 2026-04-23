@@ -33,6 +33,14 @@ export function pageRecordFromManifest(
     charCount: "charCount" in item ? item.charCount : item.char_count,
     isSyntheticPage:
       "isSyntheticPage" in item ? item.isSyntheticPage : item.is_synthetic_page,
+    leadingBlockMarkdown:
+      "leadingBlockMarkdown" in item
+        ? item.leadingBlockMarkdown ?? null
+        : item.leading_block_markdown ?? null,
+    trailingBlockMarkdown:
+      "trailingBlockMarkdown" in item
+        ? item.trailingBlockMarkdown ?? null
+        : item.trailing_block_markdown ?? null,
   };
 }
 
@@ -68,6 +76,8 @@ export async function readPageContent(input: {
     page_label: header.page_label ?? String(input.page.page_no),
     markdown: body,
     file_path: await input.blobStore.materialize({ objectKey: input.page.object_key }),
+    leading_block_markdown: input.page.leading_block_markdown ?? null,
+    trailing_block_markdown: input.page.trailing_block_markdown ?? null,
   };
 }
 

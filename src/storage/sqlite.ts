@@ -111,6 +111,10 @@ function normalizeStoredDocumentPage(row: SqliteRow): StoredDocumentPage {
     is_synthetic_page: Boolean(row.is_synthetic_page),
     heading: row.heading == null ? null : String(row.heading),
     source_locator: row.source_locator == null ? null : String(row.source_locator),
+    leading_block_markdown:
+      row.leading_block_markdown == null ? null : String(row.leading_block_markdown),
+    trailing_block_markdown:
+      row.trailing_block_markdown == null ? null : String(row.trailing_block_markdown),
   };
 }
 
@@ -213,6 +217,8 @@ export class SqliteStorage implements SqliteStorageBackend {
         object_key TEXT NOT NULL,
         heading TEXT,
         source_locator TEXT,
+        leading_block_markdown TEXT,
+        trailing_block_markdown TEXT,
         content_hash TEXT NOT NULL,
         char_count INTEGER NOT NULL DEFAULT 0,
         is_synthetic_page INTEGER NOT NULL DEFAULT 0,
@@ -291,6 +297,8 @@ export class SqliteStorage implements SqliteStorageBackend {
     this.addColumnIfMissing("document_pages", "object_key", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("document_pages", "heading", "TEXT");
     this.addColumnIfMissing("document_pages", "source_locator", "TEXT");
+    this.addColumnIfMissing("document_pages", "leading_block_markdown", "TEXT");
+    this.addColumnIfMissing("document_pages", "trailing_block_markdown", "TEXT");
     this.addColumnIfMissing("document_pages", "content_hash", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("document_pages", "char_count", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("document_pages", "is_synthetic_page", "INTEGER NOT NULL DEFAULT 0");
@@ -588,7 +596,17 @@ export class SqliteStorage implements SqliteStorageBackend {
     }
     const params: Array<string | number> = [documentId];
     let sql = `
-      SELECT document_id, page_no, object_key, heading, source_locator, content_hash, char_count, is_synthetic_page
+      SELECT
+        document_id,
+        page_no,
+        object_key,
+        heading,
+        source_locator,
+        leading_block_markdown,
+        trailing_block_markdown,
+        content_hash,
+        char_count,
+        is_synthetic_page
       FROM document_pages
       WHERE document_id = ?
     `;
@@ -622,6 +640,8 @@ export class SqliteStorage implements SqliteStorageBackend {
           object_key: page.objectKey,
           heading: page.heading ?? null,
           source_locator: page.sourceLocator ?? null,
+          leading_block_markdown: page.leadingBlockMarkdown ?? null,
+          trailing_block_markdown: page.trailingBlockMarkdown ?? null,
           content_hash: page.contentHash,
           char_count: page.charCount,
           is_synthetic_page: page.isSyntheticPage,
@@ -631,6 +651,8 @@ export class SqliteStorage implements SqliteStorageBackend {
           previous.object_key === current.object_key &&
           previous.heading === current.heading &&
           previous.source_locator === current.source_locator &&
+          previous.leading_block_markdown === current.leading_block_markdown &&
+          previous.trailing_block_markdown === current.trailing_block_markdown &&
           previous.content_hash === current.content_hash &&
           previous.char_count === current.char_count &&
           previous.is_synthetic_page === current.is_synthetic_page
@@ -643,13 +665,16 @@ export class SqliteStorage implements SqliteStorageBackend {
             `
               INSERT INTO document_pages (
                 document_id, page_no, object_key, heading, source_locator,
+                leading_block_markdown, trailing_block_markdown,
                 content_hash, char_count, is_synthetic_page, updated_at
               )
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
               ON CONFLICT(document_id, page_no) DO UPDATE SET
                 object_key = excluded.object_key,
                 heading = excluded.heading,
                 source_locator = excluded.source_locator,
+                leading_block_markdown = excluded.leading_block_markdown,
+                trailing_block_markdown = excluded.trailing_block_markdown,
                 content_hash = excluded.content_hash,
                 char_count = excluded.char_count,
                 is_synthetic_page = excluded.is_synthetic_page,
@@ -662,6 +687,8 @@ export class SqliteStorage implements SqliteStorageBackend {
             page.objectKey,
             page.heading ?? null,
             page.sourceLocator ?? null,
+            page.leadingBlockMarkdown ?? null,
+            page.trailingBlockMarkdown ?? null,
             page.contentHash,
             page.charCount,
             page.isSyntheticPage ? 1 : 0,
