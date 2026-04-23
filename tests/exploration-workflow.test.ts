@@ -172,7 +172,7 @@ describe("exploration workflow service", () => {
       "answer_done",
       "complete",
     ]);
-    assert.match(model.requests[0].messages.map((message) => message.content).join("\n"), /Start with `glob\(directory="scope"\)`/);
+    assert.match(model.requests[0].messages.map((message) => message.content).join("\n"), /Start with `glob`/);
     assert.match(model.requests[1].messages.map((message) => message.content).join("\n"), /Given the tool result/);
 
     const completeEvent = session.history.at(-1)!;
@@ -272,40 +272,4 @@ describe("exploration workflow service", () => {
     fixture.storage.close();
   });
 
-  it("runs forced batch mode and publishes batch cache events", async () => {
-    const fixture = await createWorkflowFixture();
-    const model = new SequenceModel([
-      stop("Batch answer: the purchase price is $45,000,000. [Source: alpha.pdf, page 1]"),
-    ]);
-    const service = new ExplorationWorkflowService({
-      storage: fixture.storage,
-      blobStore: fixture.blobStore,
-      model,
-      skillsRoot: join(process.cwd(), "skills"),
-      rootDirectory: fixture.root,
-    });
-
-    const started = await service.startSession({
-      task: "Summarize all selected documents.",
-      documentIds: ["doc-alpha"],
-      batchMode: "force",
-      batchSize: 1,
-      batchThreshold: 10,
-    });
-    await service.waitForSession(started.session_id);
-
-    const session = service.getSession(started.session_id)!;
-    const eventTypes = session.history.map((event) => event.type);
-    assert.equal(session.status, "completed");
-    assert.ok(eventTypes.includes("batch_started"));
-    assert.ok(eventTypes.includes("batch_answer_done"));
-    assert.ok(eventTypes.includes("cumulative_answer_updated"));
-    assert.ok(eventTypes.includes("batch_completed"));
-    assert.ok(eventTypes.includes("batch_context_released"));
-    assert.equal(session.batchSummaries.length, 1);
-    assert.match(session.cumulativeAnswer ?? "", /Batch answer/);
-    assert.equal(session.snapshot().batch_mode, "force");
-
-    fixture.storage.close();
-  });
 });

@@ -15,12 +15,7 @@ describe("explore session manager", () => {
       documentIds: ["doc-1"],
       collectionId: null,
       dbPath: "storage.sqlite",
-      batchMode: "force",
-      batchSize: 2,
-      batchThreshold: 1,
     });
-    session.batchSummaries.push({ batch_index: 1, batch_answer: "Answer 1" });
-    session.cumulativeAnswer = "Answer 1";
 
     const first = session.publish("start", { task: session.task });
     const subscription = manager.subscribe(session.sessionId);
@@ -36,12 +31,6 @@ describe("explore session manager", () => {
     assert.match(encoded, /^event: tool_call\n/);
     assert.match(encoded, /"session_id":/);
     assert.match(encoded, /"tool_name":"glob"/);
-    const snapshot = session.snapshot();
-    assert.equal(snapshot.batch_mode, "force");
-    assert.equal(snapshot.batch_size, 2);
-    assert.equal(snapshot.batch_threshold, 1);
-    assert.deepEqual(snapshot.batch_summaries, [{ batch_index: 1, batch_answer: "Answer 1" }]);
-    assert.equal(snapshot.cumulative_answer, "Answer 1");
 
     manager.unsubscribe(session, subscription.queue!);
     const closed = await subscription.queue!.next();

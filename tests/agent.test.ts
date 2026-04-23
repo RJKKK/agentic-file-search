@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import { createAgent, type ActionModel } from "../src/agent/agent.js";
-import { ContextState } from "../src/agent/context-state.js";
 import { loadSkills } from "../src/runtime/load-skills.js";
 import { buildToolRegistry } from "../src/runtime/registry.js";
 import { toFnArgs } from "../src/types/actions.js";
@@ -144,114 +143,6 @@ describe("agent behavior", () => {
     assert.match(history, /doc_id=doc-123/);
     assert.equal(snapshot.context_scope.active_document_id, "doc-123");
     assert.ok(snapshot.evidence_units.some((item) => item.document_id === "doc-123" && item.kind === "document_body"));
-  });
-
-  it("releases raw evidence for summarized batch documents while preserving snippets and coverage", () => {
-    const state = new ContextState();
-    state.registerDocuments([
-      {
-        documentId: "doc-alpha",
-        label: "alpha.pdf",
-        filePath: "C:/docs/alpha.pdf",
-      },
-    ]);
-    state.ingestParseResult({
-      documentId: "doc-alpha",
-      filePath: "C:/docs/alpha.pdf",
-      label: "alpha.pdf",
-      units: [
-        {
-          unit_no: 1,
-          source_locator: "page-1",
-          heading: "Purchase Price",
-          markdown: "The purchase price is $45,000,000.",
-        },
-        {
-          unit_no: 2,
-          source_locator: "page-2",
-          heading: "Closing",
-          markdown: "Closing follows later.",
-        },
-      ],
-      totalUnits: 2,
-      anchor: 1,
-      window: 1,
-    });
-
-    const released = state.releaseDocumentEvidence({ documentId: "doc-alpha" });
-    const snapshot = state.snapshot();
-    assert.equal(released.released, true);
-    assert.deepEqual(snapshot.context_scope.active_ranges, []);
-    assert.deepEqual(snapshot.coverage_by_document["doc-alpha"].retrieved_ranges, [{ start: 1, end: 2 }]);
-    assert.deepEqual(snapshot.coverage_by_document["doc-alpha"].summarized_ranges, [{ start: 1, end: 2 }]);
-    assert.ok(snapshot.evidence_units.some((item) => item.snippet));
-    assert.ok(!state.buildContextPack(5000).text.includes("Active evidence window (raw excerpts)"));
-  });
-
-  it("warns when a document range read is too wide and keeps only a narrow active window", async () => {
-    const skills = await loadSkills(join(process.cwd(), "skills"));
-    const registry = buildToolRegistry(skills);
-    const readTool = registry.tools.read.handler;
-    const contextState = new ContextState();
-    const events: Array<{ type: string; data: Record<string, unknown> }> = [];
-    contextState.registerDocuments([
-      {
-        documentId: "doc-yangtze",
-        label: "yangtze.pdf",
-        filePath: "C:/docs/yangtze.pdf",
-      },
-    ]);
-
-    const result = await readTool(
-      {
-        document_id: "doc-yangtze",
-        start_page: 30,
-        end_page: 40,
-      },
-      {
-        contextState,
-        services: {
-          indexSearch: {
-            async resolvePageBatch() {
-              return [
-                {
-                  document: {
-                    id: "doc-yangtze",
-                    original_filename: "yangtze.pdf",
-                    relative_path: "yangtze.pdf",
-                    absolute_path: "C:/docs/yangtze.pdf",
-                    page_count: 80,
-                  },
-                  pages: [30, 31, 32].map((pageNo) => ({
-                    page_no: pageNo,
-                    file_path: `C:/docs/pages/page-${String(pageNo).padStart(4, "0")}.md`,
-                    heading: `Page ${pageNo}`,
-                    source_locator: `page-${pageNo}`,
-                    markdown: `董事会成员信息 page ${pageNo}`,
-                    char_count: 20,
-                    page_label: String(pageNo),
-                    is_synthetic_page: false,
-                  })),
-                  truncated: true,
-                  omittedPages: [33, 34, 35, 36, 37, 38, 39, 40],
-                },
-              ];
-            },
-            emit(type: string, data: Record<string, unknown>) {
-              events.push({ type, data });
-            },
-          },
-        },
-      } as never,
-    );
-
-    assert.match(result.receipt ?? "", /WARNING wide range requested/);
-    assert.match(result.receipt ?? "", /omitted=33, 34, 35, 36, 37, 38, 39, 40/);
-    assert.match(result.receipt ?? "", /must not be used as evidence/);
-    assert.match(result.receipt ?? "", /returned=30-32/);
-    assert.ok(!result.output.includes("page 40"));
-    assert.deepEqual(contextState.snapshot().context_scope.active_ranges, [{ start: 30, end: 32 }]);
-    assert.equal(events.find((event) => event.type === "pages_read")?.data.truncated, true);
   });
 
   it("stops after repeated identical tool calls", async () => {

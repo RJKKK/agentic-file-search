@@ -330,9 +330,6 @@ describe("http server", () => {
     assert.equal(snapshot.json().status, "completed");
     assert.deepEqual(snapshot.json().collection_ids, [collection.id]);
     assert.deepEqual(snapshot.json().document_ids, [docId]);
-    assert.equal(snapshot.json().batch_mode, "auto");
-    assert.equal(snapshot.json().batch_size, 5);
-    assert.equal(snapshot.json().batch_threshold, 10);
 
     const reply = await app.inject({
       method: "POST",

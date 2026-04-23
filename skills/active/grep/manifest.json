@@ -2,31 +2,20 @@
   "id": "grep-skill",
   "name": "Grep Skill",
   "status": "active",
-  "description": "Find candidate pages by searching page markdown files or the selected document scope.",
+  "description": "Find candidate pages by searching page markdown files.",
   "entry": "./index.ts",
   "tools": [
     {
       "name": "grep",
-      "description": "Find candidate pages by searching one target or the selected document scope.",
+      "description": "Find candidate pages by searching page markdown files.",
       "parameters": [
         {
           "name": "file_path",
-          "description": "A file path or a page directory. Leave empty or use scope/selected_scope to search all selected documents.",
-          "required": false
+          "description": "A file path or a page directory."
         },
         {
           "name": "pattern",
           "description": "The regex pattern to search."
-        },
-        {
-          "name": "max_total_hits",
-          "description": "Maximum hits across the selected scope.",
-          "required": false
-        },
-        {
-          "name": "max_hits_per_document",
-          "description": "Maximum hits per document in scope mode.",
-          "required": false
         }
       ]
     }

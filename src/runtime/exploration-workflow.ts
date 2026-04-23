@@ -47,9 +47,6 @@ interface ExplorationRuntimeState {
 
 type ResumeReason = "start" | "tool_result" | "go_deeper" | "human_answer";
 
-const DEFAULT_BATCH_SIZE = 5;
-const DEFAULT_BATCH_THRESHOLD = 10;
-
 function defaultSkillsRoot(): string {
   return resolve(process.cwd(), "skills");
 }
@@ -74,37 +71,12 @@ function promptForStart(input: {
       ? input.documentLabels.map((label) => `- ${label}`).join("\n")
       : "- (none)";
   const indexHint =
-    "Only work inside the selected document set. Start with `glob(directory=\"scope\")` to inspect page files, " +
-    "then use `search_candidates` or scope `grep` to find candidate pages, then `read` a few page files.";
+    "Only work inside the selected document set. Start with `glob` to inspect page files, " +
+    "then `grep` to find candidate pages, then `read` a few page files.";
   return (
     `You can only access the current ${scopeName}. The available documents are:\n\n` +
     `\`\`\`text\n${documentSummary}\n\`\`\`\n\n` +
     `The user task is: '${input.task}'. What action should you take first? ${indexHint}`
-  );
-}
-
-function promptForBatchStart(input: {
-  task: string;
-  documentLabels: string[];
-  batchIndex: number;
-  batchCount: number;
-  cumulativeAnswer: string | null;
-}): string {
-  const documentSummary =
-    input.documentLabels.length > 0
-      ? input.documentLabels.map((label) => `- ${label}`).join("\n")
-      : "- (none)";
-  const prior = input.cumulativeAnswer?.trim()
-    ? `Previous cumulative answer from earlier batches:\n\n${input.cumulativeAnswer.trim()}\n\n`
-    : "No previous cumulative answer exists yet.\n\n";
-  return (
-    `You are processing batch ${input.batchIndex} of ${input.batchCount}. ` +
-    "You can only access the documents in this batch:\n\n" +
-    `\`\`\`text\n${documentSummary}\n\`\`\`\n\n` +
-    prior +
-    `Original user task: '${input.task}'. ` +
-    "Use scope glob/search_candidates/grep/read inside this batch, then stop with a batch answer. " +
-    "Include citations and explicitly mention unresolved gaps for this batch."
   );
 }
 
@@ -172,9 +144,6 @@ export class ExplorationWorkflowService {
         dbPath: input.dbPath ?? null,
         enableSemantic: Boolean(input.enableSemantic),
         enableMetadata: Boolean(input.enableMetadata),
-        batchMode: input.batchMode ?? "auto",
-        batchSize: input.batchSize ?? DEFAULT_BATCH_SIZE,
-        batchThreshold: input.batchThreshold ?? DEFAULT_BATCH_THRESHOLD,
       });
     session.workflowTask = this.runSession(session, "start");
     return {
@@ -223,15 +192,12 @@ export class ExplorationWorkflowService {
     return this.cachedRegistry;
   }
 
-  private async createRuntime(
-    session: ExploreSession,
-    overrideDocumentIds: string[] | null = null,
-  ): Promise<ExplorationRuntimeState> {
+  private async createRuntime(session: ExploreSession): Promise<ExplorationRuntimeState> {
     const scope = resolveDocumentScope({
       storage: this.options.storage,
-      documentIds: overrideDocumentIds ?? session.documentIds,
-      collectionId: overrideDocumentIds ? null : session.collectionId,
-      collectionIds: overrideDocumentIds ? [] : session.collectionIds,
+      documentIds: session.documentIds,
+      collectionId: session.collectionId,
+      collectionIds: session.collectionIds,
     });
     if (scope.isEmpty) {
       throw new Error("Question answering requires at least one selected document.");
@@ -348,14 +314,7 @@ export class ExplorationWorkflowService {
           collection_id: runtime.scope.collection?.id ?? null,
           collection_ids: runtime.scope.collections.map((collection) => collection.id),
           document_names: [...runtime.documentNames],
-          batch_mode: session.batchMode,
-          batch_size: session.batchSize,
-          batch_threshold: session.batchThreshold,
         });
-        if (this.shouldRunBatch(session, runtime)) {
-          await this.runBatchSession(session, runtime);
-          return;
-        }
         runtime.agent.configureTask(
           promptForStart({
             task: session.task,
@@ -387,219 +346,6 @@ export class ExplorationWorkflowService {
     } catch (error) {
       this.failSession(session, error);
     }
-  }
-
-  private shouldRunBatch(session: ExploreSession, runtime: ExplorationRuntimeState): boolean {
-    if (session.batchMode === "off") {
-      return false;
-    }
-    if (session.batchMode === "force") {
-      return true;
-    }
-    return runtime.scope.documentIds.length > session.batchThreshold;
-  }
-
-  private chunkDocuments(documents: StoredDocument[], batchSize: number): StoredDocument[][] {
-    const ordered = [...documents].sort(
-      (left, right) =>
-        (left.original_filename || left.relative_path || left.id)
-          .toLowerCase()
-          .localeCompare((right.original_filename || right.relative_path || right.id).toLowerCase()) ||
-        left.id.localeCompare(right.id),
-    );
-    const chunks: StoredDocument[][] = [];
-    for (let index = 0; index < ordered.length; index += batchSize) {
-      chunks.push(ordered.slice(index, index + batchSize));
-    }
-    return chunks;
-  }
-
-  private async runBatchSession(
-    session: ExploreSession,
-    runtime: ExplorationRuntimeState,
-  ): Promise<void> {
-    const batches = this.chunkDocuments(runtime.documents, Math.max(session.batchSize, 1));
-    let cumulativeAnswer = session.cumulativeAnswer ?? "";
-    for (const [batchIndexZero, documents] of batches.entries()) {
-      const batchIndex = batchIndexZero + 1;
-      const batchRuntime = await this.createRuntime(session, documents.map((document) => document.id));
-      session.publish("batch_started", {
-        batch_index: batchIndex,
-        batch_count: batches.length,
-        document_ids: documents.map((document) => document.id),
-        document_names: [...batchRuntime.documentNames],
-        previous_cumulative_answer: cumulativeAnswer || null,
-      });
-      batchRuntime.agent.configureTask(
-        promptForBatchStart({
-          task: session.task,
-          documentLabels: batchRuntime.documentNames,
-          batchIndex,
-          batchCount: batches.length,
-          cumulativeAnswer: cumulativeAnswer || null,
-        }),
-        batchRuntime.documents.map((document) => ({
-          documentId: document.id,
-          label: document.original_filename || document.relative_path || document.id,
-          filePath: document.absolute_path,
-        })),
-        { rawHistory: true },
-      );
-      session.publish("context_scope_updated", {
-        batch_index: batchIndex,
-        context_scope: batchRuntime.agent.getContextState().snapshot().context_scope,
-      });
-
-      const batchDraft = await this.processBatchActions(session, batchRuntime, batchIndex);
-      let batchAnswer = "";
-      try {
-        for await (const chunk of batchRuntime.agent.streamFinalAnswer(batchDraft)) {
-          const deltaText = String(chunk ?? "");
-          if (!deltaText) {
-            continue;
-          }
-          batchAnswer += deltaText;
-          session.publish("batch_answer_delta", {
-            batch_index: batchIndex,
-            delta_text: deltaText,
-            accumulated_text: batchAnswer,
-          });
-        }
-      } catch (error) {
-        session.publish("answer_stream_failed", {
-          batch_index: batchIndex,
-          message: error instanceof Error ? error.message : String(error),
-        });
-      }
-      if (!batchAnswer.trim()) {
-        batchAnswer = batchDraft;
-      }
-      const citedSources = extractCitedSources(batchAnswer);
-      session.publish("batch_answer_done", {
-        batch_index: batchIndex,
-        batch_answer: batchAnswer,
-        cited_sources: citedSources,
-      });
-
-      const releases = documents.map((document) =>
-        batchRuntime.agent.getContextState().releaseDocumentEvidence({
-          documentId: document.id,
-          reason: `batch ${batchIndex} completed`,
-        }),
-      );
-      session.publish("batch_context_released", {
-        batch_index: batchIndex,
-        releases,
-      });
-
-      cumulativeAnswer = [
-        cumulativeAnswer.trim(),
-        `## Batch ${batchIndex}/${batches.length}`,
-        batchAnswer.trim(),
-      ]
-        .filter(Boolean)
-        .join("\n\n");
-      session.cumulativeAnswer = cumulativeAnswer;
-      session.publish("cumulative_answer_updated", {
-        batch_index: batchIndex,
-        cumulative_answer: cumulativeAnswer,
-        cited_sources: extractCitedSources(cumulativeAnswer),
-      });
-
-      const summary = {
-        batch_index: batchIndex,
-        batch_count: batches.length,
-        document_ids: documents.map((document) => document.id),
-        document_names: [...batchRuntime.documentNames],
-        batch_answer: batchAnswer,
-        cited_sources: citedSources,
-        context_released: releases,
-      };
-      session.batchSummaries.push(summary);
-      session.publish("batch_completed", summary);
-    }
-
-    await this.completeSession(session, runtime, session.cumulativeAnswer || "No batch answer was produced.");
-  }
-
-  private async processBatchActions(
-    session: ExploreSession,
-    runtime: ExplorationRuntimeState,
-    batchIndex: number,
-  ): Promise<string> {
-    for (let actionCount = 0; actionCount < 30; actionCount += 1) {
-      const action = await runtime.agent.takeAction();
-      const planResult = runtime.agent.consumeLastContextPlanResult();
-      if (planResult) {
-        session.publish(planResult.applied ? "context_scope_updated" : "context_compacted", {
-          batch_index: batchIndex,
-          operation: planResult.operation,
-          applied: planResult.applied,
-          ...planResult.payload,
-        });
-      }
-
-      const actionType = toActionType(action);
-      if (actionType === "stop" && "final_result" in action.action) {
-        return action.action.final_result;
-      }
-
-      runtime.stepNumber += 1;
-      if (actionType === "toolcall" && "tool_name" in action.action) {
-        const toolInput = toFnArgs(action.action);
-        runtime.trace.recordToolCall({
-          stepNumber: runtime.stepNumber,
-          toolName: action.action.tool_name,
-          toolInput,
-          resolvedDocumentPath: null,
-        });
-        session.publish("tool_call", {
-          batch_index: batchIndex,
-          step: runtime.stepNumber,
-          tool_name: action.action.tool_name,
-          tool_input: toolInput,
-          reason: action.reason,
-          context_plan: contextPlanPayload(action),
-        });
-        await runtime.agent.callTool(action.action.tool_name, toolInput);
-        runtime.agent.configureTask(promptForToolResult(session.task), [], { rawHistory: true });
-        continue;
-      }
-
-      if (actionType === "askhuman" && "question" in action.action) {
-        session.status = "awaiting_human";
-        session.pendingQuestion = action.action.question;
-        session.updatedAt = new Date();
-        session.publish("ask_human", {
-          batch_index: batchIndex,
-          step: runtime.stepNumber,
-          question: action.action.question,
-          reason: action.reason,
-          context_plan: contextPlanPayload(action),
-        });
-        throw new Error("Batch workflow cannot resume ask_human inside a batch yet.");
-      }
-
-      if (actionType === "godeeper" && "directory" in action.action) {
-        session.publish("go_deeper", {
-          batch_index: batchIndex,
-          step: runtime.stepNumber,
-          directory: action.action.directory,
-          reason: action.reason,
-          context_plan: contextPlanPayload(action),
-        });
-        runtime.agent.configureTask(
-          promptForGoDeeper({
-            task: session.task,
-            documentLabels: runtime.documentNames,
-          }),
-          [],
-          { rawHistory: true },
-        );
-        continue;
-      }
-    }
-    return runtime.agent.getContextState().bestEffortAnswer();
   }
 
   private async processActions(
@@ -758,8 +504,6 @@ export class ExplorationWorkflowService {
         lazy_indexing: session.lazyIndexingStats,
         candidate_pages: runtime.candidatePages,
         read_pages: runtime.readPages,
-        batch_summaries: [...session.batchSummaries],
-        cumulative_answer: session.cumulativeAnswer,
       },
       trace: {
         step_path: runtime.trace.stepPath,
@@ -775,8 +519,6 @@ export class ExplorationWorkflowService {
         stale_page_ranges: runtime.stalePageRanges,
         page_query_history: runtime.pageQueryHistory,
         promoted_evidence_units: contextStateSnapshot.promoted_evidence_units,
-        batch_summaries: [...session.batchSummaries],
-        cumulative_answer: session.cumulativeAnswer,
       },
     });
   }

@@ -2,22 +2,20 @@
   "id": "glob-skill",
   "name": "Glob Skill",
   "status": "active",
-  "description": "List page files for one pages directory, or list all page scopes when directory is empty/scope.",
+  "description": "List page files for one selected document pages directory.",
   "entry": "./index.ts",
   "tools": [
     {
       "name": "glob",
-      "description": "List page files for one pages directory, or list all selected document page scopes.",
+      "description": "List page files for one selected document pages directory.",
       "parameters": [
         {
           "name": "directory",
-          "description": "The directory to search. Leave empty or use scope/selected_scope for current document scope.",
-          "required": false
+          "description": "The directory to search."
         },
         {
           "name": "pattern",
-          "description": "The glob pattern to match.",
-          "required": false
+          "description": "The glob pattern to match."
         }
       ]
     }

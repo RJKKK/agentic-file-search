@@ -6,7 +6,6 @@ Reference: legacy/python/src/fs_explorer/server.py
 import { randomUUID } from "node:crypto";
 
 import type {
-  BatchMode,
   ExploreSessionSnapshot,
   ExploreSessionStatus,
   ExploreStreamEventPayload,
@@ -104,10 +103,6 @@ export class ExploreSession {
     embeddings_written: 0,
   };
 
-  batchSummaries: Array<Record<string, unknown>> = [];
-
-  cumulativeAnswer: string | null = null;
-
   readonly createdAt = utcNow();
 
   updatedAt = this.createdAt;
@@ -131,9 +126,6 @@ export class ExploreSession {
     readonly dbPath: string | null,
     readonly enableSemantic: boolean,
     readonly enableMetadata: boolean,
-    readonly batchMode: BatchMode,
-    readonly batchSize: number,
-    readonly batchThreshold: number,
   ) {}
 
   snapshot(): ExploreSessionSnapshot {
@@ -155,11 +147,6 @@ export class ExploreSession {
       db_path: this.dbPath,
       enable_semantic: this.enableSemantic,
       enable_metadata: this.enableMetadata,
-      batch_summaries: [...this.batchSummaries],
-      cumulative_answer: this.cumulativeAnswer,
-      batch_mode: this.batchMode,
-      batch_size: this.batchSize,
-      batch_threshold: this.batchThreshold,
       created_at: isoformatUtc(this.createdAt),
       updated_at: isoformatUtc(this.updatedAt),
     };
@@ -198,9 +185,6 @@ export class ExploreSessionManager {
     dbPath?: string | null;
     enableSemantic?: boolean;
     enableMetadata?: boolean;
-    batchMode?: BatchMode;
-    batchSize?: number | null;
-    batchThreshold?: number | null;
   }): ExploreSession {
     this.cleanup();
     const session = new ExploreSession(
@@ -218,9 +202,6 @@ export class ExploreSessionManager {
       input.dbPath ?? null,
       Boolean(input.enableSemantic),
       Boolean(input.enableMetadata),
-      input.batchMode ?? "auto",
-      Math.max(Number(input.batchSize ?? 5), 1),
-      Math.max(Number(input.batchThreshold ?? 10), 1),
     );
     this.sessions.set(session.sessionId, session);
     return session;

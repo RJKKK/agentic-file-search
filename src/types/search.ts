@@ -59,15 +59,6 @@ export interface ResolvedPageScope {
   pagesDir: string;
 }
 
-export interface PageScopeSummary {
-  doc_id: string;
-  filename: string;
-  source_path: string;
-  pages_dir: string;
-  page_count: number;
-  page_range: { start: number; end: number } | null;
-}
-
 export interface PageSearchHit {
   doc_id: string;
   absolute_path: string;
@@ -78,26 +69,10 @@ export interface PageSearchHit {
 }
 
 export interface PageSearchForTargetResult {
-  document?: StoredDocument;
-  pagesDir?: string;
+  document: StoredDocument;
+  pagesDir: string;
   hits: PageSearchHit[];
   pages: LoadedDocumentPage[];
-}
-
-export interface PageBatchReadGroup {
-  document: StoredDocument;
-  pages: LoadedDocumentPage[];
-  truncated: boolean;
-  omittedPages: number[];
-}
-
-export interface PageBatchReadInput {
-  filePaths?: string[];
-  documentId?: string | null;
-  startPage?: number | null;
-  endPage?: number | null;
-  maxPages?: number | null;
-  maxChars?: number | null;
 }
 
 export interface IndexedDocumentReadResult {
@@ -115,17 +90,11 @@ export type RuntimeEventEmitter = (eventType: string, data: Record<string, unkno
 export interface IndexSearchServiceContract {
   scopeLabel(): string | null;
   listIndexedDocuments(): string;
-  listPageScopes(): Promise<PageScopeSummary[]>;
   getDocument(docId: string): Promise<IndexedDocumentReadResult>;
   search(input: IndexedSearchInput): Promise<IndexedSearchResult>;
   renderSearchResult(result: IndexedSearchResult): string;
   resolveDocumentPageScope(target: string): ResolvedPageScope | null;
   searchPagesForTarget(target: string, pattern: string): Promise<PageSearchForTargetResult | null>;
-  searchPagesAcrossScope(
-    query: string,
-    options?: { maxHitsPerDocument?: number; maxTotalHits?: number; regex?: boolean },
-  ): Promise<PageSearchForTargetResult>;
-  resolvePageBatch(input: PageBatchReadInput): Promise<PageBatchReadGroup[]>;
   findPageByPath(filePath: string): Promise<{ document: StoredDocument; page: LoadedDocumentPage } | null>;
   emit(eventType: string, data: Record<string, unknown>): void;
 }

@@ -112,11 +112,6 @@ function toIntValue(value: unknown, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function toBatchMode(value: unknown): "auto" | "off" | "force" {
-  const mode = String(value ?? "auto").trim();
-  return mode === "off" || mode === "force" ? mode : "auto";
-}
-
 function toStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) {
     return [];
@@ -904,9 +899,6 @@ export async function createHttpServer(
         dbPath: toStringValue(body.db_path, "") || null,
         enableSemantic: toBoolValue(body.enable_semantic, false),
         enableMetadata: toBoolValue(body.enable_metadata, false),
-        batchMode: toBatchMode(body.batch_mode),
-        batchSize: toIntValue(body.batch_size, 5),
-        batchThreshold: toIntValue(body.batch_threshold, 10),
       });
       return result;
     } catch (error) {

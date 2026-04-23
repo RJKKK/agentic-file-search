@@ -52,27 +52,12 @@ ${renderToolCatalog(registry)}
 ## Page Retrieval Strategy
 
 The main QA path is page-first, not full-document reading:
-1. For multi-document scopes, start with \`glob(directory="scope", pattern="page-*.md")\` to inspect all selected document page scopes.
-2. Use \`search_candidates\` across the selected scope for broad natural-language questions.
-3. Use \`grep(file_path="scope", pattern="...")\` when the user provides clear keywords or exact phrases.
-4. Use \`read\` on only a few candidate page files, or use \`read(document_id=..., start_page=..., end_page=...)\` for same-document consecutive pages.
-5. If a candidate page looks incomplete, include BOTH the previous page and the next page as candidate pages before answering.
-6. If the first pages are insufficient, change the query or switch to new pages. Do not keep rereading the same page range.
-7. Page files are already built at upload time. Do not ask for reparsing during normal QA.
-8. Do not repeatedly grep one document at a time unless scope search returns too little evidence.
-9. Never treat pages from different documents as one continuous range.
-
-## Narrow Read Window Rules
-
-Avoid broad speculative reads such as \`read(document_id="...", start_page=30, end_page=40)\`.
-Even if several nearby pages may contain the answer, first identify the strongest candidate pages from \`search_candidates\` or \`grep\`.
-Then read the smallest same-document continuous window that covers the likely evidence:
-- one page for a direct hit
-- two pages when the hit is at a page boundary
-- three pages when a table/list may continue across pages
-
-If the receipt says pages were omitted, those omitted pages were not read and must not be used as evidence.
-Do not compensate by requesting a wider range. Instead, choose the next narrow window around the best remaining candidate page.
+1. Use \`glob\` on the selected document's \`pages_dir\` or source path to see available \`page-XXXX.md\` files.
+2. Use \`grep\` on that document scope to find candidate pages for the user question.
+3. Use \`read\` on only a few candidate page files.
+4. If a candidate page looks incomplete, include BOTH the previous page and the next page as candidate pages before answering.
+5. If the first pages are insufficient, change the query or switch to new pages. Do not keep rereading the same page range.
+6. Page files are already built at upload time. Do not ask for reparsing during normal QA.
 
 ## Structured Context Rules
 
@@ -93,17 +78,17 @@ Use it only when it helps avoid repeated reads or promotes especially relevant e
 ## Three-Phase Page Exploration Strategy
 
 ### PHASE 1: Scope Pages (PARALLEL PAGE LIST)
-1. Start with \`glob\` for the selected scope.
-2. Identify each document id, page directory, and rough page range.
+1. Start with \`glob\` for the selected document.
+2. Identify the page directory and rough page range.
 
 ### PHASE 2: Find Candidate Pages
-1. Use \`search_candidates\` for broad questions, and \`grep(file_path="scope")\` for focused phrases.
-2. Prefer narrow, content-bearing terms over repeatedly searching every document separately.
+1. Use \`grep\` with a focused phrase derived from the user question.
+2. Prefer narrow, content-bearing terms over the full question.
 3. In your **reason**, say which candidate pages look most promising.
 4. When the best page may be a continuation page, the start of a table, the end of a table, or otherwise incomplete, add its previous and next page to your candidate set. Example: if page 33 contains the matching table but the row may continue, consider pages 32, 33, and 34.
 
 ### PHASE 3: Read Only What You Need
-1. Use \`read\` on a few candidate page files. For adjacent pages in the same document, prefer one narrow range read of 1-3 pages.
+1. Use \`read\` on a few candidate page files.
 2. If the answer is incomplete or appears cut off by a page boundary, read the previous and next page for that evidence page before concluding.
 3. Only treat a tool call as repeated when both the tool name and all parameters are identical. Reading different pages with \`read\` is valid progress, not repetition.
 4. If repeated identical reads add no new evidence, BACKTRACK by changing the query, changing pages, or changing documents.

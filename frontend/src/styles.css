@@ -134,7 +134,6 @@ body {
 }
 
 .trace-section,
-.batch-section,
 .answer-section {
   display: flex;
   /* min-height: 0; */
@@ -144,12 +143,6 @@ body {
 .trace-section {
   /* flex: 0 0 36%; */
   /* min-height: 180px; */
-  border-bottom: 1px solid #ebeef5;
-}
-
-.batch-section {
-  flex: 0 0 auto;
-  max-height: 320px;
   border-bottom: 1px solid #ebeef5;
 }
 
@@ -181,46 +174,10 @@ body {
 }
 
 .trace-list,
-.batch-cache,
 .answer-scroll {
   min-height: 0;
   /* overflow: auto; */
   padding: 12px 16px;
-}
-
-.batch-cache {
-  display: grid;
-  gap: 10px;
-  overflow: auto;
-}
-
-.batch-card {
-  padding: 10px 12px;
-  border: 1px solid #e5e7eb;
-  border-radius: 8px;
-  background: #f9fafb;
-}
-
-.active-batch {
-  background: #fff7ed;
-}
-
-.batch-card p,
-.batch-docs {
-  margin: 6px 0;
-  color: #606266;
-  font-size: 12px;
-}
-
-.batch-card pre,
-.batch-cache pre {
-  margin: 8px 0;
-  overflow: auto;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  font-family: "JetBrains Mono", Consolas, monospace;
-  font-size: 12px;
-  line-height: 1.55;
 }
 
 .trace-title {

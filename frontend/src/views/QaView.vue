@@ -42,10 +42,6 @@ const sessionState = reactive({
   error: "",
   trace: null,
   stats: null,
-  batchSummaries: [],
-  cumulativeAnswer: "",
-  activeBatch: null,
-  activeBatchAnswer: "",
   showHumanModal: false,
   humanQuestion: "",
   humanResponse: "",
@@ -136,10 +132,6 @@ async function startAskSession() {
   sessionState.error = "";
   sessionState.trace = null;
   sessionState.stats = null;
-  sessionState.batchSummaries = [];
-  sessionState.cumulativeAnswer = "";
-  sessionState.activeBatch = null;
-  sessionState.activeBatchAnswer = "";
   activeTraceNames.value = [];
 
   try {
@@ -154,9 +146,6 @@ async function startAskSession() {
         db_path: appState.dbPath.trim() || null,
         enable_semantic: askForm.enableSemantic,
         enable_metadata: askForm.enableMetadata,
-        batch_mode: "auto",
-        batch_size: 5,
-        batch_threshold: 10,
       }),
     });
     activeSessionId.value = payload.session_id;
@@ -193,12 +182,6 @@ function openEventStream(sessionId) {
     "answer_started",
     "answer_delta",
     "answer_done",
-    "batch_started",
-    "batch_answer_delta",
-    "batch_answer_done",
-    "cumulative_answer_updated",
-    "batch_completed",
-    "batch_context_released",
     "complete",
     "error",
   ];
@@ -228,33 +211,12 @@ function openEventStream(sessionId) {
         sessionState.finalAnswer = payload.data.final_result || sessionState.finalAnswer;
         sessionState.displayedAnswer = sessionState.finalAnswer;
         nextTick(scrollAnswerToBottom);
-      } else if (type === "batch_started") {
-        sessionState.status = "running";
-        sessionState.activeBatch = payload.data;
-        sessionState.activeBatchAnswer = "";
-      } else if (type === "batch_answer_delta") {
-        sessionState.status = "running";
-        sessionState.activeBatchAnswer = payload.data.accumulated_text || "";
-      } else if (type === "batch_answer_done") {
-        sessionState.activeBatchAnswer = payload.data.batch_answer || sessionState.activeBatchAnswer;
-      } else if (type === "cumulative_answer_updated") {
-        sessionState.cumulativeAnswer = payload.data.cumulative_answer || "";
-      } else if (type === "batch_completed") {
-        const batchIndex = payload.data.batch_index;
-        sessionState.batchSummaries = [
-          ...sessionState.batchSummaries.filter((item) => item.batch_index !== batchIndex),
-          payload.data,
-        ].sort((left, right) => (left.batch_index || 0) - (right.batch_index || 0));
       } else if (type === "complete") {
         sessionState.status = "completed";
         sessionState.finalAnswer = payload.data.final_result || sessionState.finalAnswer;
         sessionState.displayedAnswer = sessionState.finalAnswer;
         sessionState.trace = payload.data.trace || null;
         sessionState.stats = payload.data.stats || null;
-        sessionState.batchSummaries =
-          payload.data.stats?.batch_summaries || payload.data.trace?.batch_summaries || sessionState.batchSummaries;
-        sessionState.cumulativeAnswer =
-          payload.data.stats?.cumulative_answer || payload.data.trace?.cumulative_answer || sessionState.cumulativeAnswer;
         sessionState.showHumanModal = false;
         closeEventStream();
         nextTick(scrollAnswerToBottom);
@@ -287,8 +249,6 @@ async function hydrateSessionSnapshot(sessionId) {
   try {
     const snapshot = await requestJson(`/api/explore/sessions/${encodeURIComponent(sessionId)}`);
     if (activeSessionId.value !== sessionId) return;
-    sessionState.batchSummaries = snapshot.batch_summaries || sessionState.batchSummaries;
-    sessionState.cumulativeAnswer = snapshot.cumulative_answer || sessionState.cumulativeAnswer;
     if (snapshot.status === "completed") {
       sessionState.status = "completed";
       sessionState.finalAnswer = snapshot.final_result || "";
@@ -334,7 +294,6 @@ function traceSummary(event) {
   const data = event.data || {};
   const pieces = [];
   if (data.tool_name) pieces.push(data.tool_name);
-  if (data.batch_index) pieces.push(`Batch ${data.batch_index}${data.batch_count ? `/${data.batch_count}` : ""}`);
   if (data.document_id) pieces.push(`文档 ${shortText(data.document_id, 16)}`);
   if (data.step) pieces.push(`步骤 ${data.step}`);
   if (data.reason) pieces.push(shortText(data.reason, 42));
@@ -383,30 +342,6 @@ function traceDetails(event) {
     case "complete":
       add("最终答案", shortText(data.final_result, 600));
       add("统计", data.stats);
-      break;
-    case "batch_started":
-      add("Batch", `${data.batch_index}/${data.batch_count}`);
-      add("Documents", data.document_names || data.document_ids);
-      add("Previous cumulative answer", data.previous_cumulative_answer);
-      break;
-    case "batch_answer_done":
-      add("Batch", data.batch_index);
-      add("Batch answer", data.batch_answer);
-      add("Citations", data.cited_sources);
-      break;
-    case "cumulative_answer_updated":
-      add("Batch", data.batch_index);
-      add("Cumulative answer", data.cumulative_answer);
-      add("Citations", data.cited_sources);
-      break;
-    case "batch_completed":
-      add("Batch", `${data.batch_index}/${data.batch_count}`);
-      add("Documents", data.document_names || data.document_ids);
-      add("Batch answer", data.batch_answer);
-      break;
-    case "batch_context_released":
-      add("Batch", data.batch_index);
-      add("Releases", data.releases);
       break;
     case "error":
       add("错误", data.message);
@@ -556,50 +491,6 @@ function scrollAnswerToBottom() {
                 </div>
               </el-collapse-item>
             </el-collapse>
-          </div>
-        </section>
-
-        <section
-          v-if="sessionState.activeBatch || sessionState.batchSummaries.length || sessionState.cumulativeAnswer"
-          class="batch-section"
-        >
-          <div class="section-title">
-            <div>
-              <h2>批次答案缓存</h2>
-              <span>大文档集分批处理时显示每批答案、累计答案和引用</span>
-            </div>
-            <el-tag v-if="sessionState.activeBatch" type="warning">
-              Batch {{ sessionState.activeBatch.batch_index }}/{{ sessionState.activeBatch.batch_count }}
-            </el-tag>
-          </div>
-          <div class="batch-cache">
-            <div v-if="sessionState.activeBatch" class="batch-card active-batch">
-              <strong>当前批次</strong>
-              <p>{{ (sessionState.activeBatch.document_names || []).join("；") }}</p>
-              <pre v-if="sessionState.activeBatchAnswer">{{ sessionState.activeBatchAnswer }}</pre>
-            </div>
-            <el-collapse v-if="sessionState.batchSummaries.length">
-              <el-collapse-item
-                v-for="batch in sessionState.batchSummaries"
-                :key="batch.batch_index"
-                :title="`Batch ${batch.batch_index}/${batch.batch_count}`"
-              >
-                <p class="batch-docs">{{ (batch.document_names || batch.document_ids || []).join("；") }}</p>
-                <pre>{{ batch.batch_answer }}</pre>
-                <el-tag
-                  v-for="source in batch.cited_sources || []"
-                  :key="source"
-                  size="small"
-                  type="info"
-                >
-                  {{ source }}
-                </el-tag>
-              </el-collapse-item>
-            </el-collapse>
-            <div v-if="sessionState.cumulativeAnswer" class="batch-card">
-              <strong>累计答案</strong>
-              <pre>{{ sessionState.cumulativeAnswer }}</pre>
-            </div>
           </div>
         </section>
 

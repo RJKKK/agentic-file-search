@@ -27,7 +27,7 @@ class FakeParserExecutor implements PythonDocumentParserExecutor {
 function buildDocument(): ParsedDocument {
   return {
     parser_name: "fake",
-    parser_version: "m2-v2",
+    parser_version: "m2-v3",
     units: [
       {
         unit_no: 1,
@@ -182,7 +182,7 @@ describe("document parsing runtime", () => {
     assert.deepEqual(parsed, { ok: true, document: { units: [] } });
   });
 
-  it("normalizes unstable PDF table markdown into caption plus flat headers", (t) => {
+  it("normalizes unstable PDF table markdown without synthetic captions or Col placeholders", (t) => {
     const normalized = runPythonTableNormalization([
       "|董事出席董事会及股东大会的情况|---|---|---|---|---|---|---|",
       "|---|---|---|---|---|---|---|---|",
@@ -193,12 +193,12 @@ describe("document parsing runtime", () => {
       t.skip("Python executable is not available for PDF normalization checks.");
       return;
     }
-    assert.match(normalized, /表格标题：董事出席董事会及股东大会的情况/);
+    assert.equal(normalized.includes("表格标题："), false);
+    assert.match(normalized, /\| 董事出席董事会及股东大会的情况 \| --- \| --- \| --- \| --- \| --- \| --- \| --- \|/);
     assert.match(
       normalized,
       /\| 董事姓名 \| 本报告期应参加董事会次数 \| 现场出席董事会次数 \| 以通讯方式参加董事会次数 \| 委托出席董事会次数 \| 缺席董事会次数 \| 是否连续两次未亲自参加董事会会议 \| 出席股东大会次数 \|/,
     );
-    assert.match(normalized, /\| 曾毓群 \| 7 \| 1 \| 6 \| 0 \| 0 \| 否 \| 2 \|/);
 
     const mergedPlaceholder = runPythonTableNormalization([
       "|项目|Col1|2024|",
@@ -207,8 +207,10 @@ describe("document parsing runtime", () => {
       "|地区|中国|88|",
     ].join("\n"));
     assert.equal(mergedPlaceholder?.includes("Col1"), false);
-    assert.match(mergedPlaceholder ?? "", /\| 项目 \| 2024 \|/);
-    assert.match(mergedPlaceholder ?? "", /\| 产品动力电池系统 \| 321 \|/);
+    assert.equal(
+      mergedPlaceholder,
+      "| 项目 |  | 2024 |\n| --- | --- | --- |\n| 产品 | 动力电池系统 | 321 |\n| 地区 | 中国 | 88 |",
+    );
 
     const plainTable = runPythonTableNormalization([
       "|列A|列B|",

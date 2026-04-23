@@ -76,8 +76,8 @@ export const skillModule: SkillModule = {
     async grep(input, context) {
       const filePath = String(input.file_path ?? "");
       const pattern = String(input.pattern ?? "");
-      if (!pattern) {
-        return { output: "grep requires pattern." };
+      if (!filePath || !pattern) {
+        return { output: "grep requires file_path and pattern." };
       }
 
       let regex: RegExp;
@@ -85,71 +85,6 @@ export const skillModule: SkillModule = {
         regex = new RegExp(pattern, "gim");
       } catch (error) {
         return { output: `Invalid regex pattern ${pattern}: ${String(error)}` };
-      }
-
-      const scopeMode = !filePath || ["scope", "selected_scope"].includes(filePath.trim().toLowerCase());
-      if (scopeMode) {
-        try {
-          const maxTotalHits = Math.max(Number(input.max_total_hits ?? 24), 1);
-          const maxHitsPerDocument = Math.max(Number(input.max_hits_per_document ?? 5), 1);
-          const result = await context.services.indexSearch?.searchPagesAcrossScope(pattern, {
-            maxTotalHits,
-            maxHitsPerDocument,
-            regex: true,
-          });
-          if (!result) {
-            return { output: "grep scope mode requires an indexed document scope." };
-          }
-          const summary = context.contextState.ingestSearchResults({
-            query: pattern,
-            filters: null,
-            hits: result.hits.map((hit) => ({
-              doc_id: hit.doc_id,
-              absolute_path: hit.absolute_path,
-              source_unit_no: hit.source_unit_no,
-              score: hit.score,
-              text: hit.text,
-            })),
-            limit: Math.min(maxTotalHits, Math.max(1, result.hits.length)),
-          });
-          const candidatePages = result.hits.map((hit) => ({
-            document_id: hit.doc_id,
-            page_no: hit.source_unit_no,
-            file_path: hit.absolute_path,
-            score: hit.score,
-          }));
-          context.services.indexSearch?.emit("candidate_pages_found", {
-            query: pattern,
-            scope: "selected_scope",
-            candidate_pages: candidatePages,
-            documents: [...new Set(result.hits.map((hit) => hit.doc_id))],
-          });
-          context.services.indexSearch?.emit("context_scope_updated", {
-            context_scope: context.contextState.snapshot().context_scope,
-          });
-          if (result.hits.length === 0) {
-            return {
-              output: "No matches found",
-              receipt: `Grep receipt: selected_scope; pattern=${JSON.stringify(pattern)}; candidate_pages=-.`,
-            };
-          }
-          return {
-            output: [
-              `CANDIDATE PAGES for ${pattern} in selected scope:`,
-              "",
-              ...result.hits.map(
-                (hit) =>
-                  `- doc_id=${hit.doc_id} page=${hit.source_unit_no} hits=${hit.match_count} path=${hit.absolute_path}\n  snippet: ${snippet(hit.text)}`,
-              ),
-            ].join("\n"),
-            receipt:
-              `Grep receipt: selected_scope; pattern=${JSON.stringify(pattern)}; ` +
-              `candidate_pages=${candidatePages.length}; documents=${new Set(result.hits.map((hit) => hit.doc_id)).size}; ` +
-              `${String(summary.summary_for_model ?? "stored candidate pages for later reasoning.")}`,
-          };
-        } catch (error) {
-          return { output: `Error searching selected scope: ${String(error)}` };
-        }
       }
 
       let info;
