@@ -114,6 +114,31 @@ function closeEventStream() {
   }
 }
 
+function unwrapFinalAnswer(value) {
+  const text = String(value || "");
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{")) return text;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object") {
+      if (typeof parsed.final_result === "string" && parsed.final_result.trim()) {
+        return parsed.final_result;
+      }
+      if (
+        parsed.action &&
+        typeof parsed.action === "object" &&
+        typeof parsed.action.final_result === "string" &&
+        parsed.action.final_result.trim()
+      ) {
+        return parsed.action.final_result;
+      }
+    }
+  } catch {
+    // Keep the original text when it is not valid JSON.
+  }
+  return text;
+}
+
 async function startAskSession() {
   if (!askForm.documentIds.length && !askForm.collectionIds.length) {
     ElMessage.warning("请先选择至少一个文档或 Collection");
@@ -208,12 +233,12 @@ function openEventStream(sessionId) {
         sessionState.displayedAnswer = sessionState.finalAnswer;
         nextTick(scrollAnswerToBottom);
       } else if (type === "answer_done") {
-        sessionState.finalAnswer = payload.data.final_result || sessionState.finalAnswer;
+        sessionState.finalAnswer = unwrapFinalAnswer(payload.data.final_result || sessionState.finalAnswer);
         sessionState.displayedAnswer = sessionState.finalAnswer;
         nextTick(scrollAnswerToBottom);
       } else if (type === "complete") {
         sessionState.status = "completed";
-        sessionState.finalAnswer = payload.data.final_result || sessionState.finalAnswer;
+        sessionState.finalAnswer = unwrapFinalAnswer(payload.data.final_result || sessionState.finalAnswer);
         sessionState.displayedAnswer = sessionState.finalAnswer;
         sessionState.trace = payload.data.trace || null;
         sessionState.stats = payload.data.stats || null;
@@ -251,7 +276,7 @@ async function hydrateSessionSnapshot(sessionId) {
     if (activeSessionId.value !== sessionId) return;
     if (snapshot.status === "completed") {
       sessionState.status = "completed";
-      sessionState.finalAnswer = snapshot.final_result || "";
+      sessionState.finalAnswer = unwrapFinalAnswer(snapshot.final_result || "");
       sessionState.displayedAnswer = sessionState.finalAnswer;
       sessionState.showHumanModal = false;
       closeEventStream();

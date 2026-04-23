@@ -8,7 +8,7 @@ Reference: legacy/python/src/fs_explorer/explore_sessions.py
 import { resolve } from "node:path";
 
 import { createAgent, type FsExplorerAgent } from "../agent/agent.js";
-import { toActionType, toFnArgs, type Action } from "../types/actions.js";
+import { toActionType, toFnArgs, unwrapFinalAnswerEnvelope, type Action } from "../types/actions.js";
 import type {
   CreateExploreSessionInput,
   ExplorationWorkflowServiceOptions,
@@ -104,7 +104,7 @@ function promptForToolResult(task: string): string {
     "Given the tool result and structured context you just received, " +
     "choose the next action. Do not assume the previously active pages still contain the answer. " +
     "If the current page appears incomplete, cut off, or part of a continued table/list, " +
-    "treat the previous and next page as candidate pages before answering. " +
+    "identify whether the missing evidence is likely on the previous page, next page, or both, then read only those needed adjacent pages before answering. " +
     "If the current range is stale or insufficient, run a fresh search or read genuinely new adjacent/candidate pages. " +
     "If repeated tool calls would be needed, stop and answer from the evidence already collected with any uncertainty noted."
   );
@@ -443,9 +443,9 @@ export class ExplorationWorkflowService {
     runtime: ExplorationRuntimeState,
     finalResult: string,
   ): Promise<void> {
-    let resolvedFinalResult = finalResult;
+    let resolvedFinalResult = unwrapFinalAnswerEnvelope(finalResult);
     session.publish("answer_started", {
-      draft_final_result: finalResult,
+      draft_final_result: resolvedFinalResult,
     });
     let streamedFinalResult = "";
     try {
@@ -466,7 +466,7 @@ export class ExplorationWorkflowService {
       });
     }
     if (streamedFinalResult.trim()) {
-      resolvedFinalResult = streamedFinalResult;
+      resolvedFinalResult = unwrapFinalAnswerEnvelope(streamedFinalResult);
     }
     session.publish("answer_done", {
       final_result: resolvedFinalResult,

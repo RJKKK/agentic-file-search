@@ -33,6 +33,7 @@ import {
   renderActionRepairPrompt,
   renderFinalAnswerSystemPrompt,
   renderFinalAnswerUserPrompt,
+  renderRedundantReadPrompt,
   renderSystemPrompt,
 } from "./prompts.js";
 
@@ -80,6 +81,10 @@ export class FsExplorerAgent {
   private lastToolSignature: string | null = null;
 
   private repeatGuardHits = 0;
+
+  private redundantReadGuardHits = 0;
+
+  private readonly readTargetIndex = new Map<string, { documentId: string; unitNo: number }>();
 
   private lastContextPlanResult: ContextPlanResult | null = null;
 
@@ -213,6 +218,27 @@ export class FsExplorerAgent {
 
     const toolAction = action.action;
     const toolInput = toFnArgs(toolAction);
+    const redundantReadPrompt = this.redundantReadPrompt(toolAction.tool_name, toolInput);
+    if (redundantReadPrompt) {
+      this.redundantReadGuardHits += 1;
+      if (this.redundantReadGuardHits >= 2) {
+        this.history.push({
+          role: "user",
+          content: BEST_EFFORT_FINAL_PROMPT,
+        });
+        const finalResult = await this.takeAction(true);
+        if ("final_result" in finalResult.action) {
+          return finalResult;
+        }
+        return this.bestEffortStopAction();
+      }
+      this.history.push({
+        role: "user",
+        content: redundantReadPrompt,
+      });
+      return this.takeAction();
+    }
+    this.redundantReadGuardHits = 0;
     const signature = this.toolSignature(toolAction.tool_name, toolInput);
     if (signature === this.lastToolSignature) {
       this.repeatGuardHits += 1;
@@ -316,6 +342,7 @@ export class FsExplorerAgent {
       resultText = `An error occurred while calling tool ${toolName} with ${JSON.stringify(toolInput)}: ${String(error)}`;
     }
     this.lastToolSignature = this.toolSignature(toolName, toolInput);
+    this.noteReadTarget(toolName, toolInput);
     if (!historyReceipt) {
       historyReceipt = `Tool result for ${toolName}:\n\n${resultText}`;
     }
@@ -374,6 +401,73 @@ export class FsExplorerAgent {
       tool_name: toolName,
       tool_input: toolInput,
     });
+  }
+
+  private redundantReadPrompt(toolName: string, toolInput: Record<string, unknown>): string | null {
+    if (toolName !== "read") {
+      return null;
+    }
+    const filePath = typeof toolInput.file_path === "string" ? toolInput.file_path.trim() : "";
+    if (!filePath) {
+      return null;
+    }
+    const readTarget = this.readTargetIndex.get(filePath);
+    if (!readTarget) {
+      return null;
+    }
+
+    const snapshot = this.contextState.snapshot();
+    const activeDocumentId = snapshot.context_scope.active_document_id;
+    const activeRanges = snapshot.context_scope.active_ranges;
+    const hasMergedWindow = activeRanges.some((range) => range.end > range.start) || activeRanges.length > 1;
+    if (!hasMergedWindow || activeDocumentId !== readTarget.documentId) {
+      return null;
+    }
+
+    const alreadyActive = activeRanges.some(
+      (range) => readTarget.unitNo >= range.start && readTarget.unitNo <= range.end,
+    );
+    if (!alreadyActive) {
+      return null;
+    }
+
+    const minUnit = Math.min(...activeRanges.map((range) => range.start));
+    const maxUnit = Math.max(...activeRanges.map((range) => range.end));
+    const outwardPages = [minUnit > 1 ? minUnit - 1 : null, maxUnit + 1].filter(
+      (value): value is number => value != null && value !== readTarget.unitNo,
+    );
+
+    return renderRedundantReadPrompt({
+      filePath,
+      unitNo: readTarget.unitNo,
+      activeRanges,
+      outwardPages,
+    });
+  }
+
+  private noteReadTarget(toolName: string, toolInput: Record<string, unknown>): void {
+    if (toolName !== "read") {
+      return;
+    }
+    const filePath = typeof toolInput.file_path === "string" ? toolInput.file_path.trim() : "";
+    const unitNo = this.extractReadUnitNo(filePath);
+    const documentId = this.contextState.snapshot().context_scope.active_document_id;
+    if (!filePath || unitNo == null || !documentId) {
+      return;
+    }
+    this.readTargetIndex.set(filePath, {
+      documentId,
+      unitNo,
+    });
+  }
+
+  private extractReadUnitNo(filePath: string): number | null {
+    const match = /page-(\d+)\.md$/i.exec(filePath.trim());
+    if (!match) {
+      return null;
+    }
+    const unitNo = Number.parseInt(match[1] ?? "", 10);
+    return Number.isFinite(unitNo) && unitNo > 0 ? unitNo : null;
   }
 }
 

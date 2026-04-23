@@ -175,6 +175,78 @@ describe("agent behavior", () => {
     assert.match(history, /Loop guard: you repeated the same tool call multiple times/);
   });
 
+  it("blocks rereading a page that is already inside the merged active window", async () => {
+    const root = join(tmpdir(), `afs-ping-pong-${Date.now()}`);
+    await mkdir(root, { recursive: true });
+    const page53Path = join(root, "page-0053.md");
+    const page54Path = join(root, "page-0054.md");
+    await writeFile(
+      page53Path,
+      [
+        "---",
+        "page_no: 53",
+        "original_filename: alpha.md",
+        "heading: Board Table Start",
+        "source_locator: page-53",
+        "---",
+        "",
+        "Board attendance table header starts here.",
+      ].join("\n"),
+    );
+    await writeFile(
+      page54Path,
+      [
+        "---",
+        "page_no: 54",
+        "original_filename: alpha.md",
+        "heading: Board Table Continued",
+        "source_locator: page-54",
+        "---",
+        "",
+        "Board attendance rows continue here.",
+      ].join("\n"),
+    );
+
+    const skills = await loadSkills(join(process.cwd(), "skills"));
+    const registry = buildToolRegistry(skills);
+    const agent = createAgent(
+      {
+        model: new SequenceModel([
+          toolCall("read", { file_path: page54Path }),
+          toolCall("read", { file_path: page53Path }),
+          toolCall("read", { file_path: page54Path }),
+          {
+            action: {
+              final_result: "Use the merged evidence from pages 53-54.",
+            },
+            reason: "The active window already covers both pages.",
+          },
+        ]),
+      },
+      registry,
+    );
+    agent.configureTask("Read the board attendance table.");
+
+    const first = await agent.takeAction();
+    assert.ok("tool_name" in first.action);
+    await agent.callTool(first.action.tool_name, toFnArgs(first.action));
+
+    const second = await agent.takeAction();
+    assert.ok("tool_name" in second.action);
+    await agent.callTool(second.action.tool_name, toFnArgs(second.action));
+
+    const snapshotAfterMerge = agent.getContextState().snapshot();
+    assert.deepEqual(snapshotAfterMerge.context_scope.active_ranges, [{ start: 53, end: 54 }]);
+
+    const third = await agent.takeAction();
+    const history = agent.getHistory().map((item) => item.content).join("\n");
+
+    assert.ok("final_result" in third.action);
+    assert.equal(third.action.final_result, "Use the merged evidence from pages 53-54.");
+    assert.match(history, /already inside the current active evidence window/);
+    assert.match(history, /Do not reread a page that is already in the active coverage window/);
+  });
+
   it("repairs one invalid action response with the repair prompt", async () => {
     const root = join(tmpdir(), `afs-repair-${Date.now()}`);
     await mkdir(root, { recursive: true });

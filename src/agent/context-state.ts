@@ -90,6 +90,26 @@ export function renderRanges(ranges: Array<{ start: number; end: number }>): str
     .join(", ");
 }
 
+function rangesTouch(
+  left: { start: number; end: number },
+  right: { start: number; end: number },
+): boolean {
+  return left.start <= right.end + 1 && right.start <= left.end + 1;
+}
+
+function mergeRangeSets(
+  left: Array<{ start: number; end: number }>,
+  right: Array<{ start: number; end: number }>,
+): Array<{ start: number; end: number }> {
+  const units: number[] = [];
+  for (const range of [...left, ...right]) {
+    for (let unitNo = range.start; unitNo <= range.end; unitNo += 1) {
+      units.push(unitNo);
+    }
+  }
+  return compressUnitRanges(units);
+}
+
 function pythonLikeRepr(value: string): string {
   return `'${String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
 }
@@ -191,11 +211,19 @@ export class ContextState {
 
     const newUnits = this.noteRetrievedUnits(coverage, returnedUnitNos);
     const returnedRanges = compressUnitRanges(returnedUnitNos);
-    coverage.activeRanges = [...returnedRanges];
+    const existingActiveRanges =
+      this.activeDocumentId === input.documentId ? [...this.activeRanges] : [];
+    const nextActiveRanges =
+      existingActiveRanges.length > 0 &&
+      returnedRanges.length > 0 &&
+      existingActiveRanges.some((left) => returnedRanges.some((right) => rangesTouch(left, right)))
+        ? mergeRangeSets(existingActiveRanges, returnedRanges)
+        : returnedRanges;
+    coverage.activeRanges = [...nextActiveRanges];
     this.setActiveScope({
       documentId: input.documentId,
       filePath: input.filePath,
-      ranges: returnedRanges,
+      ranges: nextActiveRanges,
     });
 
     const topSnippets: string[] = [];
@@ -264,7 +292,9 @@ export class ContextState {
       });
     }
 
-    let summary = `Focused parse for ${input.label}: units ${renderRanges(returnedRanges)}; new units=${newUnits.size}; total_units=${input.totalUnits ?? "?"}.`;
+    let summary =
+      `Focused parse for ${input.label}: units ${renderRanges(returnedRanges)}; ` +
+      `active_window=${renderRanges(nextActiveRanges)}; new units=${newUnits.size}; total_units=${input.totalUnits ?? "?"}.`;
     if (input.focusHint) {
       summary += ` Focus hint=${pythonLikeRepr(String(input.focusHint))}.`;
     }
@@ -279,7 +309,7 @@ export class ContextState {
       max_units: input.maxUnits ?? null,
       focus_hint: input.focusHint ?? null,
       returned_unit_nos: returnedUnitNos,
-      returned_ranges: returnedRanges,
+      returned_ranges: nextActiveRanges,
       total_units: input.totalUnits ?? null,
       new_units_added: newUnits.size,
       top_snippets: topSnippets,

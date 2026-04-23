@@ -38,6 +38,17 @@ class StreamingSequenceModel extends SequenceModel {
   }
 }
 
+class JsonEnvelopeStreamingModel extends SequenceModel {
+  async *streamFinalAnswer(): AsyncIterable<string> {
+    yield JSON.stringify({
+      action: {
+        final_result: "## Clean Answer\n\nThis should render as markdown.",
+        reason: "Wrapped incorrectly by the model.",
+      },
+    });
+  }
+}
+
 function toolCall(toolName: string, toolInput: Record<string, unknown>) {
   return {
     action: {
@@ -173,7 +184,11 @@ describe("exploration workflow service", () => {
       "complete",
     ]);
     assert.match(model.requests[0].messages.map((message) => message.content).join("\n"), /Start with `glob`/);
-    assert.match(model.requests[1].messages.map((message) => message.content).join("\n"), /Given the tool result/);
+    const toolResultPrompt = model.requests[1].messages.map((message) => message.content).join("\n");
+    assert.match(toolResultPrompt, /Given the tool result/);
+    assert.match(toolResultPrompt, /previous page, next page, or both/);
+    assert.match(toolResultPrompt, /read only those needed adjacent pages/);
+    assert.ok(!toolResultPrompt.includes("treat the previous and next page as candidate pages"));
 
     const completeEvent = session.history.at(-1)!;
     const trace = completeEvent.data.trace as Record<string, unknown>;
@@ -267,6 +282,42 @@ describe("exploration workflow service", () => {
     assert.equal(
       session.finalResult,
       "The purchase price is $45,000,000. [Source: alpha.pdf, page 1]",
+    );
+
+    fixture.storage.close();
+  });
+
+  it("unwraps JSON-wrapped final answers before completing the session", async () => {
+    const fixture = await createWorkflowFixture();
+    const model = new JsonEnvelopeStreamingModel([
+      toolCall("glob", { directory: fixture.pagesDir, pattern: "page-*.md" }),
+      toolCall("read", { file_path: fixture.pagePath }),
+      stop("Draft answer that should be replaced by the streamed output."),
+    ]);
+    const service = new ExplorationWorkflowService({
+      storage: fixture.storage,
+      blobStore: fixture.blobStore,
+      model,
+      skillsRoot: join(process.cwd(), "skills"),
+      rootDirectory: fixture.root,
+    });
+
+    const started = await service.startSession({
+      task: "Return the answer as markdown.",
+      documentIds: ["doc-alpha"],
+    });
+    await service.waitForSession(started.session_id);
+
+    const session = service.getSession(started.session_id)!;
+    assert.equal(session.status, "completed");
+    assert.equal(session.finalResult, "## Clean Answer\n\nThis should render as markdown.");
+    assert.equal(
+      session.history.find((event) => event.type === "answer_done")?.data.final_result,
+      "## Clean Answer\n\nThis should render as markdown.",
+    );
+    assert.equal(
+      session.history.at(-1)?.data.final_result,
+      "## Clean Answer\n\nThis should render as markdown.",
     );
 
     fixture.storage.close();

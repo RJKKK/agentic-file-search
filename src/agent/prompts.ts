@@ -9,6 +9,15 @@ function renderToolNameList(registry: ToolRegistry): string {
   return registry.order.map((name) => `- \`${name}\``).join("\n");
 }
 
+function renderRanges(ranges: Array<{ start: number; end: number }>): string {
+  if (!ranges.length) {
+    return "-";
+  }
+  return ranges
+    .map((item) => (item.start === item.end ? `${item.start}` : `${item.start}-${item.end}`))
+    .join(", ");
+}
+
 const CITATION_REQUIREMENTS_BLOCK = `
 ## CRITICAL: Citation Requirements for Final Answers
 
@@ -55,7 +64,7 @@ The main QA path is page-first, not full-document reading:
 1. Use \`glob\` on the selected document's \`pages_dir\` or source path to see available \`page-XXXX.md\` files.
 2. Use \`grep\` on that document scope to find candidate pages for the user question.
 3. Use \`read\` on only a few candidate page files.
-4. If a candidate page looks incomplete, include BOTH the previous page and the next page as candidate pages before answering.
+4. If a candidate page looks incomplete, choose the previous page, next page, or both based on the evidence gap before answering.
 5. If the first pages are insufficient, change the query or switch to new pages. Do not keep rereading the same page range.
 6. Page files are already built at upload time. Do not ask for reparsing during normal QA.
 
@@ -85,14 +94,15 @@ Use it only when it helps avoid repeated reads or promotes especially relevant e
 1. Use \`grep\` with a focused phrase derived from the user question.
 2. Prefer narrow, content-bearing terms over the full question.
 3. In your **reason**, say which candidate pages look most promising.
-4. When the best page may be a continuation page, the start of a table, the end of a table, or otherwise incomplete, add its previous and next page to your candidate set. Example: if page 33 contains the matching table but the row may continue, consider pages 32, 33, and 34.
+4. When the best page may be incomplete, choose adjacent pages by the gap direction: read the previous page if the table/list start is missing, the next page if a row/sentence continues, or both only when both boundaries look incomplete or the direction is unclear.
 
 ### PHASE 3: Read Only What You Need
 1. Use \`read\` on a few candidate page files.
-2. If the answer is incomplete or appears cut off by a page boundary, read the previous and next page for that evidence page before concluding.
-3. Only treat a tool call as repeated when both the tool name and all parameters are identical. Reading different pages with \`read\` is valid progress, not repetition.
-4. If repeated identical reads add no new evidence, BACKTRACK by changing the query, changing pages, or changing documents.
-5. If no trustworthy evidence appears after backtracking, provide a best-effort answer from existing evidence and clearly state what remains uncertain. Do not return a generic tool-loop failure message.
+2. If the answer is incomplete or appears cut off by a page boundary, state which side is missing in your reason, then read the previous page, next page, or both for that evidence page as needed.
+3. If adjacent pages are already present in the current active coverage window, do not reread them. Use the merged window as evidence, or expand outward to a new boundary page only if a real gap remains.
+4. Only treat a tool call as repeated when both the tool name and all parameters are identical. Reading different pages with \`read\` is valid progress, not repetition.
+5. If repeated identical reads add no new evidence, BACKTRACK by changing the query, changing pages, or changing documents.
+6. If no trustworthy evidence appears after backtracking, provide a best-effort answer from existing evidence and clearly state what remains uncertain. Do not return a generic tool-loop failure message.
 
 ## Providing Detailed Reasoning
 
@@ -181,6 +191,31 @@ Other valid shapes are:
 {"action":{"final_result":"..."},"reason":"..."}
 
 An optional top-level \`"context_plan"\` object is allowed when relevant.
+`.trim();
+}
+
+export function renderRedundantReadPrompt(input: {
+  filePath: string;
+  unitNo: number;
+  activeRanges: Array<{ start: number; end: number }>;
+  outwardPages: number[];
+}): string {
+  const outwardHint =
+    input.outwardPages.length > 0
+      ? `If a boundary gap still remains, expand outward to a genuinely new page such as ${input.outwardPages.join(" or ")} instead.`
+      : "If a boundary gap still remains, expand outward to a genuinely new page instead.";
+  return `
+The page you selected to read is already inside the current active evidence window.
+
+Current active window: ${renderRanges(input.activeRanges)}
+Requested page: ${input.unitNo}
+File path: ${input.filePath}
+
+Do not reread a page that is already in the active coverage window.
+Use the merged active window as your evidence, answer from it, or search elsewhere.
+${outwardHint}
+
+Return exactly one JSON Action object and nothing else.
 `.trim();
 }
 

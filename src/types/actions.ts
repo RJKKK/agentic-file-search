@@ -234,6 +234,19 @@ function iterActionJsonCandidates(rawText: string): Array<string | Record<string
   return candidates;
 }
 
+function extractFinalResultCandidate(value: unknown): string | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  if (typeof value.final_result === "string" && value.final_result.trim()) {
+    return value.final_result.trim();
+  }
+  if (isRecord(value.action) && typeof value.action.final_result === "string" && value.action.final_result.trim()) {
+    return value.action.final_result.trim();
+  }
+  return null;
+}
+
 export function parseAction(input: unknown): Action {
   if (typeof input !== "string") {
     const normalized = isRecord(input) ? normalizeActionCandidate(input) : input;
@@ -272,4 +285,30 @@ export function fallbackStopAction(rawText: string): Action | null {
     reason:
       "Model returned unstructured text instead of the required JSON action. Treating that text as the final answer.",
   };
+}
+
+export function unwrapFinalAnswerEnvelope(rawText: string): string {
+  const text = rawText.trim();
+  if (!text) {
+    return rawText;
+  }
+
+  for (const candidate of iterActionJsonCandidates(text)) {
+    const extracted = extractFinalResultCandidate(
+      typeof candidate === "string"
+        ? (() => {
+            try {
+              return JSON.parse(candidate);
+            } catch {
+              return null;
+            }
+          })()
+        : candidate,
+    );
+    if (extracted) {
+      return extracted;
+    }
+  }
+
+  return rawText;
 }

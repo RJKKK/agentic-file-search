@@ -42,6 +42,11 @@ describe("system prompt", () => {
     assert.match(prompt, /Structured Context Rules/);
     assert.match(prompt, /Three-Phase Page Exploration Strategy/);
     assert.match(prompt, /Providing Detailed Reasoning/);
+    assert.match(prompt, /choose the previous page, next page, or both based on the evidence gap/);
+    assert.match(prompt, /state which side is missing/);
+    assert.match(prompt, /do not reread them/i);
+    assert.ok(!prompt.includes("include BOTH the previous page and the next page"));
+    assert.ok(!prompt.includes("read the previous and next page for that evidence page"));
     assert.match(prompt, /Citation Requirements for Final Answers/i);
   });
 
