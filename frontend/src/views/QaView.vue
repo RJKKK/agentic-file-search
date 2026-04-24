@@ -9,11 +9,12 @@ import {
   formatValue,
   requestJson,
   shortText,
-  withQuery,
 } from "../api.js";
 
 const markdown = new MarkdownIt({ html: false, linkify: true, breaks: true });
 const appState = inject("appState");
+
+const queryMode = ref("agent");
 const activeTraceNames = ref([]);
 const activeSessionId = ref("");
 let eventSource = null;
@@ -32,6 +33,9 @@ const askForm = reactive({
   collectionIds: [],
   enableSemantic: false,
   enableMetadata: false,
+  retrievalMode: "hybrid",
+  keywordWeight: 0.5,
+  semanticWeight: 0.5,
 });
 
 const sessionState = reactive({
@@ -40,12 +44,18 @@ const sessionState = reactive({
   finalAnswer: "",
   displayedAnswer: "",
   error: "",
-  trace: null,
-  stats: null,
   showHumanModal: false,
   humanQuestion: "",
   humanResponse: "",
   replying: false,
+});
+
+const ragState = reactive({
+  loading: false,
+  answer: "",
+  usedChunks: [],
+  warnings: [],
+  error: "",
 });
 
 const isAsking = computed(() =>
@@ -59,12 +69,9 @@ const selectedCollections = computed(() => {
   const selected = new Set(askForm.collectionIds);
   return askOptions.collections.filter((item) => selected.has(item.id));
 });
-const renderedAnswer = computed(() => markdown.render(sessionState.displayedAnswer || ""));
-const traceStatusType = computed(() => {
-  if (sessionState.status === "completed") return "success";
-  if (sessionState.status === "error") return "danger";
-  if (isAsking.value) return "warning";
-  return "info";
+const renderedAnswer = computed(() => {
+  const source = queryMode.value === "agent" ? sessionState.displayedAnswer : ragState.answer;
+  return markdown.render(source || "");
 });
 
 onMounted(async () => {
@@ -85,7 +92,9 @@ async function refreshAskDocuments(query = askOptions.documentQuery) {
   askOptions.documentQuery = query || "";
   try {
     const params = buildDbParams(appState.dbPath, { page: 1, page_size: 100 });
-    if (askOptions.documentQuery.trim()) params.set("q", askOptions.documentQuery.trim());
+    if (askOptions.documentQuery.trim()) {
+      params.set("q", askOptions.documentQuery.trim());
+    }
     const payload = await requestJson(`/api/documents?${params.toString()}`);
     askOptions.documents = payload.items || [];
   } catch (error) {
@@ -117,46 +126,77 @@ function closeEventStream() {
 function unwrapFinalAnswer(value) {
   const text = String(value || "");
   const trimmed = text.trim();
-  if (!trimmed.startsWith("{")) return text;
+  if (!trimmed.startsWith("{")) {
+    return text;
+  }
   try {
     const parsed = JSON.parse(trimmed);
-    if (parsed && typeof parsed === "object") {
-      if (typeof parsed.final_result === "string" && parsed.final_result.trim()) {
-        return parsed.final_result;
-      }
-      if (
-        parsed.action &&
-        typeof parsed.action === "object" &&
-        typeof parsed.action.final_result === "string" &&
-        parsed.action.final_result.trim()
-      ) {
-        return parsed.action.final_result;
-      }
+    if (parsed?.final_result) {
+      return parsed.final_result;
+    }
+    if (parsed?.action?.final_result) {
+      return parsed.action.final_result;
     }
   } catch {
-    // Keep the original text when it is not valid JSON.
+    // Keep raw text.
   }
   return text;
 }
 
-async function startAskSession() {
+async function submitQuestion() {
   if (!askForm.documentIds.length && !askForm.collectionIds.length) {
-    ElMessage.warning("请先选择至少一个文档或 Collection");
+    ElMessage.warning("Please select at least one document or collection.");
     return;
   }
   if (!askForm.task.trim()) {
-    ElMessage.warning("请输入问题");
+    ElMessage.warning("Please enter a question.");
     return;
   }
+  if (queryMode.value === "agent") {
+    await startAgentSession();
+    return;
+  }
+  await startTraditionalQuery();
+}
 
+async function startTraditionalQuery() {
+  ragState.loading = true;
+  ragState.answer = "";
+  ragState.usedChunks = [];
+  ragState.warnings = [];
+  ragState.error = "";
+  try {
+    const payload = await requestJson("/api/rag/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        question: askForm.task.trim(),
+        mode: askForm.retrievalMode,
+        document_ids: askForm.documentIds,
+        collection_ids: askForm.collectionIds,
+        keyword_weight: Number(askForm.keywordWeight || 0.5),
+        semantic_weight: Number(askForm.semanticWeight || 0.5),
+      }),
+    });
+    ragState.answer = payload.answer || "";
+    ragState.usedChunks = payload.used_chunks || [];
+    ragState.warnings = payload.warnings || [];
+  } catch (error) {
+    ragState.error = error.message;
+    ElMessage.error(error.message);
+  } finally {
+    ragState.loading = false;
+    nextTick(scrollAnswerToBottom);
+  }
+}
+
+async function startAgentSession() {
   closeEventStream();
   sessionState.status = "creating";
   sessionState.events = [];
   sessionState.finalAnswer = "";
   sessionState.displayedAnswer = "";
   sessionState.error = "";
-  sessionState.trace = null;
-  sessionState.stats = null;
   activeTraceNames.value = [];
 
   try {
@@ -227,9 +267,8 @@ function openEventStream(sessionId) {
         sessionState.displayedAnswer = "";
         sessionState.showHumanModal = false;
       } else if (type === "answer_delta") {
-        const deltaText = payload.data.delta_text || "";
         sessionState.status = "answering";
-        sessionState.finalAnswer += deltaText;
+        sessionState.finalAnswer += payload.data.delta_text || "";
         sessionState.displayedAnswer = sessionState.finalAnswer;
         nextTick(scrollAnswerToBottom);
       } else if (type === "answer_done") {
@@ -240,9 +279,6 @@ function openEventStream(sessionId) {
         sessionState.status = "completed";
         sessionState.finalAnswer = unwrapFinalAnswer(payload.data.final_result || sessionState.finalAnswer);
         sessionState.displayedAnswer = sessionState.finalAnswer;
-        sessionState.trace = payload.data.trace || null;
-        sessionState.stats = payload.data.stats || null;
-        sessionState.showHumanModal = false;
         closeEventStream();
         nextTick(scrollAnswerToBottom);
       } else if (type === "error") {
@@ -257,47 +293,17 @@ function openEventStream(sessionId) {
   }
 
   eventSource.onerror = () => {
-    void hydrateSessionSnapshot(sessionId);
     if (!["completed", "error"].includes(sessionState.status)) {
-      sessionState.error = sessionState.error || "事件流连接已断开";
+      sessionState.error = sessionState.error || "Event stream disconnected.";
       ElMessage.warning(sessionState.error);
     }
   };
-
-  window.setTimeout(() => {
-    void hydrateSessionSnapshot(sessionId);
-  }, 300);
-}
-
-async function hydrateSessionSnapshot(sessionId) {
-  if (!sessionId || activeSessionId.value !== sessionId) return;
-  try {
-    const snapshot = await requestJson(`/api/explore/sessions/${encodeURIComponent(sessionId)}`);
-    if (activeSessionId.value !== sessionId) return;
-    if (snapshot.status === "completed") {
-      sessionState.status = "completed";
-      sessionState.finalAnswer = unwrapFinalAnswer(snapshot.final_result || "");
-      sessionState.displayedAnswer = sessionState.finalAnswer;
-      sessionState.showHumanModal = false;
-      closeEventStream();
-      nextTick(scrollAnswerToBottom);
-    } else if (snapshot.status === "error") {
-      sessionState.status = "error";
-      sessionState.error = snapshot.error || "Session failed.";
-      sessionState.showHumanModal = false;
-      closeEventStream();
-    } else if (snapshot.status === "awaiting_human") {
-      sessionState.status = "awaiting_human";
-      sessionState.showHumanModal = true;
-      sessionState.humanQuestion = snapshot.pending_question || sessionState.humanQuestion;
-    }
-  } catch {
-    // Best-effort sync for sessions that finish before SSE renders.
-  }
 }
 
 async function submitHumanReply() {
-  if (!activeSessionId.value || !sessionState.humanResponse.trim()) return;
+  if (!activeSessionId.value || !sessionState.humanResponse.trim()) {
+    return;
+  }
   sessionState.replying = true;
   try {
     await requestJson(`/api/explore/sessions/${encodeURIComponent(activeSessionId.value)}/reply`, {
@@ -319,17 +325,11 @@ function traceSummary(event) {
   const data = event.data || {};
   const pieces = [];
   if (data.tool_name) pieces.push(data.tool_name);
-  if (data.document_id) pieces.push(`文档 ${shortText(data.document_id, 16)}`);
-  if (data.step) pieces.push(`步骤 ${data.step}`);
+  if (data.document_id) pieces.push(`doc ${shortText(data.document_id, 16)}`);
+  if (data.step) pieces.push(`step ${data.step}`);
   if (data.reason) pieces.push(shortText(data.reason, 42));
   if (data.question) pieces.push(shortText(data.question, 42));
   if (data.message) pieces.push(shortText(data.message, 42));
-  if (data.task) pieces.push(shortText(data.task, 42));
-  if (data.context_scope?.active_document_id) {
-    pieces.push(`当前 ${shortText(data.context_scope.active_document_id, 16)}`);
-  }
-  if (Array.isArray(data.candidate_pages)) pieces.push(`候选页 ${data.candidate_pages.length}`);
-  if (Array.isArray(data.pages)) pieces.push(`读取页 ${data.pages.length}`);
   return pieces.length ? pieces.join(" / ") : shortText(readableFallback(data), 68);
 }
 
@@ -341,51 +341,21 @@ function traceDetails(event) {
     if (Array.isArray(value) && !value.length) return;
     details.push({ label, value: formatValue(value) });
   };
-
-  switch (event.type) {
-    case "tool_call":
-      add("工具", data.tool_name);
-      add("输入", data.tool_input);
-      add("原因", data.reason);
-      add("上下文计划", data.context_plan);
-      break;
-    case "pages_read":
-      add("文档", data.document_id || data.active_document_id || data.file_path);
-      add("页码", data.pages || data.page_numbers || data.active_ranges);
-      add("摘要", data.summary || data.reason || data.content_preview);
-      break;
-    case "candidate_pages_found":
-      add("文档", data.document_id);
-      add("候选页", data.candidate_pages);
-      add("查询", data.query || data.search_terms);
-      break;
-    case "context_scope_updated":
-      add("当前文档", data.context_scope?.active_document_id || data.context_scope?.active_file_path);
-      add("活动范围", data.context_scope?.active_ranges);
-      add("范围", data.context_scope);
-      break;
-    case "complete":
-      add("最终答案", shortText(data.final_result, 600));
-      add("统计", data.stats);
-      break;
-    case "error":
-      add("错误", data.message);
-      break;
-    default:
-      add("任务", data.task);
-      add("消息", data.message);
-      add("原因", data.reason);
-      add("问题", data.question);
-      add("内容", readableFallback(data));
-      break;
-  }
+  add("type", event.type);
+  add("tool", data.tool_name);
+  add("reason", data.reason);
+  add("message", data.message);
+  add("question", data.question);
+  add("payload", readableFallback(data));
   return details;
 }
 
 function readableFallback(data) {
   if (!data || typeof data !== "object") return String(data || "");
-  const keys = ["message", "reason", "question", "task", "tool_name", "document_id", "summary", "final_result"];
-  return keys.filter((key) => data[key]).map((key) => `${key}: ${formatValue(data[key])}`).join("\n");
+  return Object.entries(data)
+    .filter(([, value]) => value !== undefined && value !== null && value !== "")
+    .map(([key, value]) => `${key}: ${formatValue(value)}`)
+    .join("\n");
 }
 
 function scrollTraceToBottom() {
@@ -404,14 +374,14 @@ function scrollAnswerToBottom() {
     <div class="qa-picker">
       <el-card shadow="never" class="toolbar-card">
         <el-form label-position="top" class="scope-form">
-          <el-form-item label="选择 Collection">
+          <el-form-item label="Collections">
             <el-select
               v-model="askForm.collectionIds"
               multiple
               filterable
               clearable
               :loading="askOptions.loadingCollections"
-              placeholder="选择一个或多个 Collection"
+              placeholder="Select one or more collections"
               class="document-select"
             >
               <el-option
@@ -422,13 +392,13 @@ function scrollAnswerToBottom() {
               >
                 <div class="select-option">
                   <span>{{ item.name }}</span>
-                  <el-tag size="small" type="info">{{ item.document_count || 0 }} 文档</el-tag>
+                  <el-tag size="small" type="info">{{ item.document_count || 0 }} docs</el-tag>
                 </div>
               </el-option>
             </el-select>
           </el-form-item>
 
-          <el-form-item label="选择文档">
+          <el-form-item label="Documents">
             <el-select
               v-model="askForm.documentIds"
               multiple
@@ -438,7 +408,7 @@ function scrollAnswerToBottom() {
               clearable
               :remote-method="refreshAskDocuments"
               :loading="askOptions.loadingDocuments"
-              placeholder="搜索并选择额外文档"
+              placeholder="Search and add documents"
               class="document-select"
             >
               <el-option
@@ -450,7 +420,7 @@ function scrollAnswerToBottom() {
                 <div class="select-option">
                   <span>{{ item.original_filename }}</span>
                   <el-tag size="small" :type="documentStatusType(item.status)">{{ item.status }}</el-tag>
-                  <span class="option-meta">{{ item.page_count }} 页</span>
+                  <span class="option-meta">{{ item.page_count }} pages</span>
                 </div>
               </el-option>
             </el-select>
@@ -476,25 +446,58 @@ function scrollAnswerToBottom() {
           >
             {{ doc.original_filename }}
           </el-tag>
-          <el-text v-if="!selectedCollections.length && !selectedDocuments.length" type="info">
-            请选择文档或 Collection 后开始问答
-          </el-text>
+        </div>
+
+        <div class="qa-mode-bar">
+          <el-radio-group v-model="queryMode">
+            <el-radio-button label="agent">Agent 检索</el-radio-button>
+            <el-radio-button label="traditional">传统检索</el-radio-button>
+          </el-radio-group>
+
+          <div v-if="queryMode === 'traditional'" class="rag-controls">
+            <el-select v-model="askForm.retrievalMode" class="rag-mode-select">
+              <el-option label="混合检索" value="hybrid" />
+              <el-option label="关键字检索" value="keyword" />
+              <el-option label="语义检索" value="semantic" />
+            </el-select>
+            <el-input-number
+              v-if="askForm.retrievalMode === 'hybrid'"
+              v-model="askForm.keywordWeight"
+              :min="0"
+              :max="1"
+              :step="0.1"
+              controls-position="right"
+            />
+            <el-input-number
+              v-if="askForm.retrievalMode === 'hybrid'"
+              v-model="askForm.semanticWeight"
+              :min="0"
+              :max="1"
+              :step="0.1"
+              controls-position="right"
+            />
+          </div>
+
+          <div v-else class="rag-controls">
+            <el-checkbox v-model="askForm.enableSemantic">Semantic</el-checkbox>
+            <el-checkbox v-model="askForm.enableMetadata">Metadata</el-checkbox>
+          </div>
         </div>
       </el-card>
     </div>
 
     <div class="qa-workspace">
       <div class="trace-answer-panel">
-        <section class="trace-section">
+        <section v-if="queryMode === 'agent'" class="trace-section">
           <div class="section-title">
             <div>
               <h2>Trace</h2>
-              <span>运行过程实时追加，展开可查看完整信息</span>
+              <span>Live agent execution events</span>
             </div>
-            <el-tag :type="traceStatusType">{{ sessionState.status }}</el-tag>
+            <el-tag>{{ sessionState.status }}</el-tag>
           </div>
           <div class="trace-list">
-            <el-empty v-if="!sessionState.events.length" description="暂无 trace" :image-size="72" />
+            <el-empty v-if="!sessionState.events.length" description="No trace yet" :image-size="72" />
             <el-collapse v-else v-model="activeTraceNames">
               <el-collapse-item
                 v-for="event in sessionState.events"
@@ -522,13 +525,45 @@ function scrollAnswerToBottom() {
         <section class="answer-section">
           <div class="section-title">
             <div>
-              <h2>答案</h2>
-              <span>{{ sessionState.error || "完成后以 Markdown 渲染" }}</span>
+              <h2>Answer</h2>
+              <span>{{ queryMode === "agent" ? sessionState.error || "Markdown answer stream" : ragState.error || "Traditional RAG answer" }}</span>
             </div>
           </div>
           <div class="answer-scroll">
-            <el-empty v-if="!sessionState.displayedAnswer" description="答案会显示在这里" :image-size="82" />
+            <el-alert
+              v-for="warning in ragState.warnings"
+              v-if="queryMode === 'traditional'"
+              :key="warning"
+              type="warning"
+              :closable="false"
+              show-icon
+              class="rag-warning"
+              :title="warning"
+            />
+            <el-empty
+              v-if="!(queryMode === 'agent' ? sessionState.displayedAnswer : ragState.answer)"
+              description="Answer will appear here"
+              :image-size="82"
+            />
             <article v-else class="markdown-body answer-markdown" v-html="renderedAnswer" />
+
+            <div v-if="queryMode === 'traditional' && ragState.usedChunks.length" class="rag-citations">
+              <h3>Used Chunks</h3>
+              <div v-for="chunk in ragState.usedChunks" :key="chunk.document_chunk_id" class="citation-card">
+                <div class="citation-meta">
+                  <span>chunk {{ chunk.document_chunk_id }}</span>
+                  <span>score {{ Number(chunk.score || 0).toFixed(4) }}</span>
+                  <span>pages {{ (chunk.page_nos || []).join(", ") }}</span>
+                  <span>compression {{ chunk.compression_applied ? "yes" : "no" }}</span>
+                </div>
+                <pre class="page-markdown">{{ chunk.content }}</pre>
+                <pre v-if="chunk.summary_text" class="page-markdown">{{ chunk.summary_text }}</pre>
+                <div class="citation-links">
+                  <span>retrieval ids: {{ (chunk.retrieval_chunk_ids || []).join(", ") || "-" }}</span>
+                  <a :href="chunk.source_link" target="_blank" rel="noreferrer">Open Chunk</a>
+                </div>
+              </div>
+            </div>
           </div>
         </section>
       </div>
@@ -540,28 +575,31 @@ function scrollAnswerToBottom() {
         type="textarea"
         :autosize="{ minRows: 2, maxRows: 5 }"
         resize="none"
-        placeholder="请输入问题，例如：请总结这些文档里的核心条款"
-        @keydown.ctrl.enter.prevent="startAskSession"
+        placeholder="Ask a question about the selected documents"
+        @keydown.ctrl.enter.prevent="submitQuestion"
       />
       <div class="ask-actions">
-        <el-checkbox v-model="askForm.enableSemantic">语义检索</el-checkbox>
-        <el-checkbox v-model="askForm.enableMetadata">Metadata 过滤</el-checkbox>
         <el-button :icon="Refresh" @click="Promise.all([refreshAskDocuments(), refreshCollections()])">
-          刷新
+          Refresh
         </el-button>
-        <el-button type="primary" :loading="isAsking" :icon="ChatDotRound" @click="startAskSession">
-          提问
+        <el-button
+          type="primary"
+          :loading="queryMode === 'agent' ? isAsking : ragState.loading"
+          :icon="ChatDotRound"
+          @click="submitQuestion"
+        >
+          Ask
         </el-button>
       </div>
     </div>
   </section>
 
-  <el-dialog v-model="sessionState.showHumanModal" title="需要人工回复" width="560px">
+  <el-dialog v-model="sessionState.showHumanModal" title="Human Input Needed" width="560px">
     <p class="human-question">{{ sessionState.humanQuestion }}</p>
-    <el-input v-model="sessionState.humanResponse" type="textarea" :rows="5" placeholder="请输入回复" />
+    <el-input v-model="sessionState.humanResponse" type="textarea" :rows="5" placeholder="Type your reply" />
     <template #footer>
-      <el-button @click="sessionState.showHumanModal = false">稍后</el-button>
-      <el-button type="primary" :loading="sessionState.replying" @click="submitHumanReply">发送回复</el-button>
+      <el-button @click="sessionState.showHumanModal = false">Later</el-button>
+      <el-button type="primary" :loading="sessionState.replying" @click="submitHumanReply">Send</el-button>
     </template>
   </el-dialog>
 </template>

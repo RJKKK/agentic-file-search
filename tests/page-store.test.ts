@@ -56,6 +56,7 @@ describe("page store", () => {
             heading: "Second",
             source_locator: "page-2",
             images: [],
+            blocks: [],
           },
           {
             unit_no: 1,
@@ -64,6 +65,7 @@ describe("page store", () => {
             heading: "First",
             source_locator: "page-1",
             images: [],
+            blocks: [],
           },
         ],
       },

@@ -12,16 +12,28 @@ import Database from "better-sqlite3";
 
 import type { DocumentCatalog, DocumentRecord, DocumentSummary } from "../types/skills.js";
 import type {
+  DocumentParseTaskStatus,
+  DocumentParseTaskType,
+  DocumentChunkSizeClass,
   PublicCollectionRecord,
+  RetrievalChunkKeywordHit,
   SqliteStorageBackend,
+  StorageDocumentParseTaskRecord,
+  StorageDocumentChunkRecord,
   SqliteStorageOptions,
   StorageDocumentPageRecord,
   StorageDocumentRecord,
+  StorageImageSemanticCacheRecord,
   StorageImageSemanticRecord,
+  StorageRetrievalChunkRecord,
   StoredCollection,
   StoredDocument,
+  StoredDocumentChunk,
+  StoredDocumentParseTask,
   StoredDocumentPage,
+  StoredImageSemanticCache,
   StoredImageSemantic,
+  StoredRetrievalChunk,
 } from "../types/storage.js";
 
 type SqliteRow = Record<string, unknown>;
@@ -47,6 +59,18 @@ function normalizeMetadataJson(raw: string): string {
   }
 }
 
+function normalizeJsonText(raw: string | null | undefined, fallback = "[]"): string {
+  const value = String(raw ?? "").trim();
+  if (!value) {
+    return fallback;
+  }
+  try {
+    return JSON.stringify(JSON.parse(value));
+  } catch {
+    return fallback;
+  }
+}
+
 function normalizeStoredDocument(row: SqliteRow): StoredDocument {
   return {
     id: String(row.id),
@@ -69,6 +93,9 @@ function normalizeStoredDocument(row: SqliteRow): StoredDocument {
     parsed_content_sha256:
       row.parsed_content_sha256 == null ? null : String(row.parsed_content_sha256),
     parsed_is_complete: Boolean(row.parsed_is_complete),
+    embedding_enabled: Boolean(row.embedding_enabled ?? 1),
+    has_embeddings: Boolean(row.has_embeddings ?? 0),
+    image_semantic_enabled: Boolean(row.image_semantic_enabled ?? 1),
     last_indexed_at: String(row.last_indexed_at ?? ""),
     is_deleted: Boolean(row.is_deleted),
   };
@@ -108,6 +135,7 @@ function normalizeStoredDocumentPage(row: SqliteRow): StoredDocumentPage {
     object_key: String(row.object_key ?? ""),
     content_hash: String(row.content_hash ?? ""),
     char_count: Number(row.char_count ?? 0),
+    chunk_count: Number(row.chunk_count ?? 0),
     is_synthetic_page: Boolean(row.is_synthetic_page),
     heading: row.heading == null ? null : String(row.heading),
     source_locator: row.source_locator == null ? null : String(row.source_locator),
@@ -123,8 +151,82 @@ function normalizeStoredImageSemantic(row: SqliteRow): StoredImageSemantic {
     mime_type: row.mime_type == null ? null : String(row.mime_type),
     width: row.width == null ? null : Number(row.width),
     height: row.height == null ? null : Number(row.height),
+    bbox_json: row.bbox_json == null ? null : String(row.bbox_json),
+    object_key: row.object_key == null ? null : String(row.object_key),
+    storage_uri: row.storage_uri == null ? null : String(row.storage_uri),
+    has_text: row.has_text == null ? null : Boolean(row.has_text),
+    interference_score: row.interference_score == null ? null : Number(row.interference_score),
+    is_dropped: Boolean(row.is_dropped),
+    recognizable: row.recognizable == null ? null : Boolean(row.recognizable),
+    accessible_url: row.accessible_url == null ? null : String(row.accessible_url),
     semantic_text: row.semantic_text == null ? null : String(row.semantic_text),
     semantic_model: row.semantic_model == null ? null : String(row.semantic_model),
+  };
+}
+
+function normalizeStoredDocumentChunk(row: SqliteRow): StoredDocumentChunk {
+  return {
+    id: String(row.id),
+    document_id: String(row.document_id),
+    page_no: Number(row.page_no),
+    document_index: Number(row.document_index),
+    page_index: Number(row.page_index),
+    block_type: String(row.block_type),
+    bbox_json: String(row.bbox_json ?? "[]"),
+    content_md: String(row.content_md ?? ""),
+    size_class: String(row.size_class ?? "normal") as DocumentChunkSizeClass,
+    summary_text: row.summary_text == null ? null : String(row.summary_text),
+    merged_page_nos_json: normalizeJsonText(String(row.merged_page_nos_json ?? "[]")),
+    merged_bboxes_json: normalizeJsonText(String(row.merged_bboxes_json ?? "[]")),
+  };
+}
+
+function normalizeStoredRetrievalChunk(row: SqliteRow): StoredRetrievalChunk {
+  return {
+    id: String(row.id),
+    document_id: String(row.document_id),
+    source_document_chunk_id: String(row.source_document_chunk_id),
+    ordinal: Number(row.ordinal ?? 0),
+    chunk_text: String(row.chunk_text ?? ""),
+    size_class: String(row.size_class ?? "normal") as DocumentChunkSizeClass,
+    is_split_from_oversized: Boolean(row.is_split_from_oversized),
+  };
+}
+
+function normalizeStoredImageSemanticCache(row: SqliteRow): StoredImageSemanticCache {
+  return {
+    image_hash: String(row.image_hash),
+    prompt_version: String(row.prompt_version),
+    recognizable: Boolean(row.recognizable),
+    image_kind: row.image_kind == null ? null : String(row.image_kind),
+    contains_text: row.contains_text == null ? null : Boolean(row.contains_text),
+    visible_text: row.visible_text == null ? null : String(row.visible_text),
+    summary: row.summary == null ? null : String(row.summary),
+    entities_json: normalizeJsonText(String(row.entities_json ?? "[]")),
+    keywords_json: normalizeJsonText(String(row.keywords_json ?? "[]")),
+    qa_hints_json: normalizeJsonText(String(row.qa_hints_json ?? "[]")),
+    drop_reason: row.drop_reason == null ? null : String(row.drop_reason),
+    semantic_model: row.semantic_model == null ? null : String(row.semantic_model),
+  };
+}
+
+function normalizeStoredDocumentParseTask(row: SqliteRow): StoredDocumentParseTask {
+  return {
+    id: String(row.id),
+    document_id: row.document_id == null ? null : String(row.document_id),
+    document_filename: String(row.document_filename ?? ""),
+    task_type: String(row.task_type ?? "upload_parse") as DocumentParseTaskType,
+    status: String(row.status ?? "queued") as DocumentParseTaskStatus,
+    progress_percent: Number(row.progress_percent ?? 0),
+    current_stage: row.current_stage == null ? null : String(row.current_stage),
+    options_json: normalizeJsonText(String(row.options_json ?? "{}"), "{}"),
+    stage_timings_json: normalizeJsonText(String(row.stage_timings_json ?? "[]")),
+    error_message: row.error_message == null ? null : String(row.error_message),
+    created_at: String(row.created_at ?? ""),
+    started_at: row.started_at == null ? null : String(row.started_at),
+    finished_at: row.finished_at == null ? null : String(row.finished_at),
+    updated_at: String(row.updated_at ?? ""),
+    total_duration_ms: row.total_duration_ms == null ? null : Number(row.total_duration_ms),
   };
 }
 
@@ -196,6 +298,9 @@ export class SqliteStorage implements SqliteStorageBackend {
         content_sha256 TEXT NOT NULL,
         parsed_content_sha256 TEXT,
         parsed_is_complete INTEGER NOT NULL DEFAULT 0,
+        embedding_enabled INTEGER NOT NULL DEFAULT 1,
+        has_embeddings INTEGER NOT NULL DEFAULT 0,
+        image_semantic_enabled INTEGER NOT NULL DEFAULT 1,
         last_indexed_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0,
         UNIQUE(corpus_id, relative_path)
@@ -215,9 +320,39 @@ export class SqliteStorage implements SqliteStorageBackend {
         source_locator TEXT,
         content_hash TEXT NOT NULL,
         char_count INTEGER NOT NULL DEFAULT 0,
+        chunk_count INTEGER NOT NULL DEFAULT 0,
         is_synthetic_page INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL,
         PRIMARY KEY (document_id, page_no)
+      );
+
+      CREATE TABLE IF NOT EXISTS document_chunks (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        page_no INTEGER NOT NULL,
+        document_index INTEGER NOT NULL,
+        page_index INTEGER NOT NULL,
+        block_type TEXT NOT NULL,
+        bbox_json TEXT NOT NULL,
+        content_md TEXT NOT NULL,
+        size_class TEXT NOT NULL,
+        summary_text TEXT,
+        merged_page_nos_json TEXT NOT NULL DEFAULT '[]',
+        merged_bboxes_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS retrieval_chunks (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        source_document_chunk_id TEXT NOT NULL REFERENCES document_chunks(id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL,
+        chunk_text TEXT NOT NULL,
+        size_class TEXT NOT NULL,
+        is_split_from_oversized INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS image_semantics (
@@ -228,9 +363,59 @@ export class SqliteStorage implements SqliteStorageBackend {
         mime_type TEXT,
         width INTEGER,
         height INTEGER,
+        bbox_json TEXT,
+        object_key TEXT,
+        storage_uri TEXT,
+        has_text INTEGER,
+        interference_score REAL,
+        is_dropped INTEGER NOT NULL DEFAULT 0,
+        recognizable INTEGER,
+        accessible_url TEXT,
         semantic_text TEXT,
         semantic_model TEXT,
         last_enhanced_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS image_semantic_cache (
+        image_hash TEXT NOT NULL,
+        prompt_version TEXT NOT NULL,
+        recognizable INTEGER NOT NULL,
+        image_kind TEXT,
+        contains_text INTEGER,
+        visible_text TEXT,
+        summary TEXT,
+        entities_json TEXT NOT NULL DEFAULT '[]',
+        keywords_json TEXT NOT NULL DEFAULT '[]',
+        qa_hints_json TEXT NOT NULL DEFAULT '[]',
+        drop_reason TEXT,
+        semantic_model TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (image_hash, prompt_version)
+      );
+
+      CREATE TABLE IF NOT EXISTS document_parse_tasks (
+        id TEXT PRIMARY KEY,
+        document_id TEXT REFERENCES documents(id) ON DELETE SET NULL,
+        document_filename TEXT NOT NULL,
+        task_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        progress_percent INTEGER NOT NULL DEFAULT 0,
+        current_stage TEXT,
+        options_json TEXT NOT NULL DEFAULT '{}',
+        stage_timings_json TEXT NOT NULL DEFAULT '[]',
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT,
+        updated_at TEXT NOT NULL,
+        total_duration_ms INTEGER
+      );
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS retrieval_chunks_fts USING fts5(
+        chunk_id UNINDEXED,
+        document_id UNINDEXED,
+        chunk_text
       );
     `);
   }
@@ -254,8 +439,26 @@ export class SqliteStorage implements SqliteStorageBackend {
       CREATE INDEX IF NOT EXISTS idx_document_pages_document
       ON document_pages (document_id, page_no);
 
+      CREATE INDEX IF NOT EXISTS idx_document_chunks_document
+      ON document_chunks (document_id, document_index);
+
+      CREATE INDEX IF NOT EXISTS idx_retrieval_chunks_document
+      ON retrieval_chunks (document_id, ordinal);
+
+      CREATE INDEX IF NOT EXISTS idx_retrieval_chunks_source
+      ON retrieval_chunks (source_document_chunk_id);
+
       CREATE INDEX IF NOT EXISTS idx_image_semantics_source_page
       ON image_semantics (source_document_id, source_page_no);
+
+      CREATE INDEX IF NOT EXISTS idx_image_semantic_cache_hash
+      ON image_semantic_cache (image_hash, prompt_version);
+
+      CREATE INDEX IF NOT EXISTS idx_document_parse_tasks_status
+      ON document_parse_tasks (status, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_document_parse_tasks_document
+      ON document_parse_tasks (document_id, created_at DESC);
     `);
   }
 
@@ -285,6 +488,9 @@ export class SqliteStorage implements SqliteStorageBackend {
     this.addColumnIfMissing("documents", "content_sha256", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("documents", "parsed_content_sha256", "TEXT");
     this.addColumnIfMissing("documents", "parsed_is_complete", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("documents", "embedding_enabled", "INTEGER NOT NULL DEFAULT 1");
+    this.addColumnIfMissing("documents", "has_embeddings", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("documents", "image_semantic_enabled", "INTEGER NOT NULL DEFAULT 1");
     this.addColumnIfMissing("documents", "last_indexed_at", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("documents", "is_deleted", "INTEGER NOT NULL DEFAULT 0");
 
@@ -293,6 +499,7 @@ export class SqliteStorage implements SqliteStorageBackend {
     this.addColumnIfMissing("document_pages", "source_locator", "TEXT");
     this.addColumnIfMissing("document_pages", "content_hash", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("document_pages", "char_count", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("document_pages", "chunk_count", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("document_pages", "is_synthetic_page", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("document_pages", "updated_at", "TEXT NOT NULL DEFAULT ''");
 
@@ -302,9 +509,32 @@ export class SqliteStorage implements SqliteStorageBackend {
     this.addColumnIfMissing("image_semantics", "mime_type", "TEXT");
     this.addColumnIfMissing("image_semantics", "width", "INTEGER");
     this.addColumnIfMissing("image_semantics", "height", "INTEGER");
+    this.addColumnIfMissing("image_semantics", "bbox_json", "TEXT");
+    this.addColumnIfMissing("image_semantics", "object_key", "TEXT");
+    this.addColumnIfMissing("image_semantics", "storage_uri", "TEXT");
+    this.addColumnIfMissing("image_semantics", "has_text", "INTEGER");
+    this.addColumnIfMissing("image_semantics", "interference_score", "REAL");
+    this.addColumnIfMissing("image_semantics", "is_dropped", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("image_semantics", "recognizable", "INTEGER");
+    this.addColumnIfMissing("image_semantics", "accessible_url", "TEXT");
     this.addColumnIfMissing("image_semantics", "semantic_text", "TEXT");
     this.addColumnIfMissing("image_semantics", "semantic_model", "TEXT");
     this.addColumnIfMissing("image_semantics", "last_enhanced_at", "TEXT");
+
+    this.addColumnIfMissing("document_parse_tasks", "document_id", "TEXT");
+    this.addColumnIfMissing("document_parse_tasks", "document_filename", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("document_parse_tasks", "task_type", "TEXT NOT NULL DEFAULT 'upload_parse'");
+    this.addColumnIfMissing("document_parse_tasks", "status", "TEXT NOT NULL DEFAULT 'queued'");
+    this.addColumnIfMissing("document_parse_tasks", "progress_percent", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("document_parse_tasks", "current_stage", "TEXT");
+    this.addColumnIfMissing("document_parse_tasks", "options_json", "TEXT NOT NULL DEFAULT '{}'");
+    this.addColumnIfMissing("document_parse_tasks", "stage_timings_json", "TEXT NOT NULL DEFAULT '[]'");
+    this.addColumnIfMissing("document_parse_tasks", "error_message", "TEXT");
+    this.addColumnIfMissing("document_parse_tasks", "created_at", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("document_parse_tasks", "started_at", "TEXT");
+    this.addColumnIfMissing("document_parse_tasks", "finished_at", "TEXT");
+    this.addColumnIfMissing("document_parse_tasks", "updated_at", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("document_parse_tasks", "total_duration_ms", "INTEGER");
   }
 
   private addColumnIfMissing(tableName: string, columnName: string, definition: string): void {
@@ -328,6 +558,18 @@ export class SqliteStorage implements SqliteStorageBackend {
       UPDATE documents
       SET upload_status = 'uploaded'
       WHERE upload_status = '';
+
+      UPDATE documents
+      SET embedding_enabled = 1
+      WHERE embedding_enabled NOT IN (0, 1);
+
+      UPDATE documents
+      SET has_embeddings = 0
+      WHERE has_embeddings NOT IN (0, 1);
+
+      UPDATE documents
+      SET image_semantic_enabled = 1
+      WHERE image_semantic_enabled NOT IN (0, 1);
 
       UPDATE collections
       SET kind = 'user'
@@ -420,9 +662,10 @@ export class SqliteStorage implements SqliteStorageBackend {
               id, corpus_id, relative_path, absolute_path, original_filename, object_key,
               source_object_key, pages_prefix, storage_uri, content_type, upload_status,
               page_count, content, metadata_json, file_mtime, file_size, content_sha256,
-              parsed_content_sha256, parsed_is_complete, last_indexed_at, is_deleted
+              parsed_content_sha256, parsed_is_complete, embedding_enabled, has_embeddings,
+              image_semantic_enabled, last_indexed_at, is_deleted
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             ON CONFLICT(id) DO UPDATE SET
               corpus_id = excluded.corpus_id,
               relative_path = excluded.relative_path,
@@ -442,6 +685,9 @@ export class SqliteStorage implements SqliteStorageBackend {
               content_sha256 = excluded.content_sha256,
               parsed_content_sha256 = excluded.parsed_content_sha256,
               parsed_is_complete = excluded.parsed_is_complete,
+              embedding_enabled = excluded.embedding_enabled,
+              has_embeddings = excluded.has_embeddings,
+              image_semantic_enabled = excluded.image_semantic_enabled,
               last_indexed_at = excluded.last_indexed_at,
               is_deleted = 0
           `,
@@ -466,11 +712,17 @@ export class SqliteStorage implements SqliteStorageBackend {
           document.contentSha256,
           document.parsedContentSha256 ?? null,
           document.parsedIsComplete ? 1 : 0,
+          document.embeddingEnabled == null ? 1 : document.embeddingEnabled ? 1 : 0,
+          document.hasEmbeddings ? 1 : 0,
+          document.imageSemanticEnabled == null ? 1 : document.imageSemanticEnabled ? 1 : 0,
           now,
         );
 
       // Reference: legacy/python/src/fs_explorer/storage/postgres.py upsert_document_stub clears stale page/image rows.
       this.db.prepare("DELETE FROM document_pages WHERE document_id = ?").run(document.id);
+      this.db.prepare("DELETE FROM retrieval_chunks_fts WHERE document_id = ?").run(document.id);
+      this.db.prepare("DELETE FROM retrieval_chunks WHERE document_id = ?").run(document.id);
+      this.db.prepare("DELETE FROM document_chunks WHERE document_id = ?").run(document.id);
       this.db.prepare("DELETE FROM image_semantics WHERE source_document_id = ?").run(document.id);
     });
 
@@ -533,6 +785,7 @@ export class SqliteStorage implements SqliteStorageBackend {
     if (!existing) {
       return null;
     }
+    this.db.prepare("DELETE FROM retrieval_chunks_fts WHERE document_id = ?").run(docId);
     this.db.prepare("DELETE FROM documents WHERE id = ?").run(docId);
     return existing;
   }
@@ -582,13 +835,59 @@ export class SqliteStorage implements SqliteStorageBackend {
     return this.getDocument(docId);
   }
 
+  updateDocumentUploadStatus(docId: string, uploadStatus: string): StoredDocument | null {
+    const result = this.db
+      .prepare("UPDATE documents SET upload_status = ?, last_indexed_at = ? WHERE id = ?")
+      .run(uploadStatus, utcNowIso(), docId);
+    if (result.changes === 0) {
+      return null;
+    }
+    return this.getDocument(docId);
+  }
+
+  updateDocumentFeatureFlags(
+    docId: string,
+    input: {
+      embeddingEnabled?: boolean;
+      hasEmbeddings?: boolean;
+      imageSemanticEnabled?: boolean;
+    },
+  ): StoredDocument | null {
+    const updates: string[] = [];
+    const params: Array<string | number> = [];
+    if (input.embeddingEnabled != null) {
+      updates.push("embedding_enabled = ?");
+      params.push(input.embeddingEnabled ? 1 : 0);
+    }
+    if (input.hasEmbeddings != null) {
+      updates.push("has_embeddings = ?");
+      params.push(input.hasEmbeddings ? 1 : 0);
+    }
+    if (input.imageSemanticEnabled != null) {
+      updates.push("image_semantic_enabled = ?");
+      params.push(input.imageSemanticEnabled ? 1 : 0);
+    }
+    if (updates.length === 0) {
+      return this.getDocument(docId);
+    }
+    updates.push("last_indexed_at = ?");
+    params.push(utcNowIso(), docId);
+    const result = this.db
+      .prepare(`UPDATE documents SET ${updates.join(", ")} WHERE id = ?`)
+      .run(...params);
+    if (result.changes === 0) {
+      return null;
+    }
+    return this.getDocument(docId);
+  }
+
   listDocumentPages(documentId: string, pageNos?: number[] | null): StoredDocumentPage[] {
     if (pageNos && pageNos.length === 0) {
       return [];
     }
     const params: Array<string | number> = [documentId];
     let sql = `
-      SELECT document_id, page_no, object_key, heading, source_locator, content_hash, char_count, is_synthetic_page
+      SELECT document_id, page_no, object_key, heading, source_locator, content_hash, char_count, chunk_count, is_synthetic_page
       FROM document_pages
       WHERE document_id = ?
     `;
@@ -600,6 +899,178 @@ export class SqliteStorage implements SqliteStorageBackend {
     sql += " ORDER BY page_no ASC";
     const rows = this.db.prepare(sql).all(...params) as SqliteRow[];
     return rows.map(normalizeStoredDocumentPage);
+  }
+
+  replaceDocumentChunks(
+    documentId: string,
+    chunks: StorageDocumentChunkRecord[],
+  ): { inserted: number; deleted: number } {
+    const deleted = Number(
+      this.db.prepare("DELETE FROM document_chunks WHERE document_id = ?").run(documentId).changes ?? 0,
+    );
+    if (chunks.length === 0) {
+      return { inserted: 0, deleted };
+    }
+    const now = utcNowIso();
+    const run = this.db.transaction(() => {
+      const statement = this.db.prepare(
+        `
+          INSERT INTO document_chunks (
+            id, document_id, page_no, document_index, page_index, block_type,
+            bbox_json, content_md, size_class, summary_text, merged_page_nos_json,
+            merged_bboxes_json, created_at, updated_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+      );
+      for (const chunk of chunks) {
+        statement.run(
+          chunk.id,
+          chunk.documentId,
+          chunk.pageNo,
+          chunk.documentIndex,
+          chunk.pageIndex,
+          chunk.blockType,
+          chunk.bboxJson,
+          chunk.contentMd,
+          chunk.sizeClass,
+          chunk.summaryText ?? null,
+          chunk.mergedPageNosJson ?? "[]",
+          chunk.mergedBboxesJson ?? "[]",
+          now,
+          now,
+        );
+      }
+    });
+    run();
+    return { inserted: chunks.length, deleted };
+  }
+
+  listDocumentChunks(documentId: string): StoredDocumentChunk[] {
+    const rows = this.db
+      .prepare(
+        `
+          SELECT *
+          FROM document_chunks
+          WHERE document_id = ?
+          ORDER BY document_index ASC
+        `,
+      )
+      .all(documentId) as SqliteRow[];
+    return rows.map(normalizeStoredDocumentChunk);
+  }
+
+  getDocumentChunk(chunkId: string): StoredDocumentChunk | null {
+    const row = this.db
+      .prepare("SELECT * FROM document_chunks WHERE id = ? LIMIT 1")
+      .get(chunkId) as SqliteRow | undefined;
+    return row ? normalizeStoredDocumentChunk(row) : null;
+  }
+
+  replaceRetrievalChunks(
+    documentId: string,
+    chunks: StorageRetrievalChunkRecord[],
+  ): { inserted: number; deleted: number } {
+    const deletedFts = Number(
+      this.db.prepare("DELETE FROM retrieval_chunks_fts WHERE document_id = ?").run(documentId).changes ?? 0,
+    );
+    const deletedChunks = Number(
+      this.db.prepare("DELETE FROM retrieval_chunks WHERE document_id = ?").run(documentId).changes ?? 0,
+    );
+    if (chunks.length === 0) {
+      return { inserted: 0, deleted: Math.max(deletedFts, deletedChunks) };
+    }
+    const now = utcNowIso();
+    const run = this.db.transaction(() => {
+      const chunkStatement = this.db.prepare(
+        `
+          INSERT INTO retrieval_chunks (
+            id, document_id, source_document_chunk_id, ordinal, chunk_text,
+            size_class, is_split_from_oversized, created_at, updated_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+      );
+      const ftsStatement = this.db.prepare(
+        `
+          INSERT INTO retrieval_chunks_fts (chunk_id, document_id, chunk_text)
+          VALUES (?, ?, ?)
+        `,
+      );
+      for (const chunk of chunks) {
+        chunkStatement.run(
+          chunk.id,
+          chunk.documentId,
+          chunk.sourceDocumentChunkId,
+          chunk.ordinal,
+          chunk.chunkText,
+          chunk.sizeClass,
+          chunk.isSplitFromOversized ? 1 : 0,
+          now,
+          now,
+        );
+        ftsStatement.run(chunk.id, chunk.documentId, chunk.chunkText);
+      }
+    });
+    run();
+    return { inserted: chunks.length, deleted: Math.max(deletedFts, deletedChunks) };
+  }
+
+  listRetrievalChunks(documentId: string): StoredRetrievalChunk[] {
+    const rows = this.db
+      .prepare(
+        `
+          SELECT *
+          FROM retrieval_chunks
+          WHERE document_id = ?
+          ORDER BY ordinal ASC
+        `,
+      )
+      .all(documentId) as SqliteRow[];
+    return rows.map(normalizeStoredRetrievalChunk);
+  }
+
+  keywordSearchRetrievalChunks(input: {
+    query: string;
+    documentIds: string[];
+    limit: number;
+  }): RetrievalChunkKeywordHit[] {
+    const documentIds = [...new Set(input.documentIds.map((item) => String(item).trim()).filter(Boolean))];
+    if (!input.query.trim() || documentIds.length === 0) {
+      return [];
+    }
+    const placeholders = documentIds.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `
+          SELECT
+            rc.id AS retrieval_chunk_id,
+            rc.document_id,
+            rc.source_document_chunk_id,
+            rc.ordinal,
+            rc.chunk_text,
+            rc.size_class,
+            rc.is_split_from_oversized,
+            -bm25(retrieval_chunks_fts) AS score
+          FROM retrieval_chunks_fts
+          JOIN retrieval_chunks rc ON rc.id = retrieval_chunks_fts.chunk_id
+          WHERE retrieval_chunks_fts MATCH ?
+            AND rc.document_id IN (${placeholders})
+          ORDER BY score DESC, rc.ordinal ASC
+          LIMIT ?
+        `,
+      )
+      .all(input.query, ...documentIds, Math.max(Number(input.limit || 10), 1)) as SqliteRow[];
+    return rows.map((row) => ({
+      retrieval_chunk_id: String(row.retrieval_chunk_id),
+      document_id: String(row.document_id),
+      source_document_chunk_id: String(row.source_document_chunk_id),
+      ordinal: Number(row.ordinal ?? 0),
+      chunk_text: String(row.chunk_text ?? ""),
+      size_class: String(row.size_class ?? "normal") as DocumentChunkSizeClass,
+      is_split_from_oversized: Boolean(row.is_split_from_oversized),
+      score: Number(row.score ?? 0),
+    }));
   }
 
   syncDocumentPages(
@@ -624,6 +1095,7 @@ export class SqliteStorage implements SqliteStorageBackend {
           source_locator: page.sourceLocator ?? null,
           content_hash: page.contentHash,
           char_count: page.charCount,
+          chunk_count: page.chunkCount ?? 0,
           is_synthetic_page: page.isSyntheticPage,
         };
         if (
@@ -633,6 +1105,7 @@ export class SqliteStorage implements SqliteStorageBackend {
           previous.source_locator === current.source_locator &&
           previous.content_hash === current.content_hash &&
           previous.char_count === current.char_count &&
+          previous.chunk_count === current.chunk_count &&
           previous.is_synthetic_page === current.is_synthetic_page
         ) {
           untouched += 1;
@@ -643,15 +1116,16 @@ export class SqliteStorage implements SqliteStorageBackend {
             `
               INSERT INTO document_pages (
                 document_id, page_no, object_key, heading, source_locator,
-                content_hash, char_count, is_synthetic_page, updated_at
+                content_hash, char_count, chunk_count, is_synthetic_page, updated_at
               )
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
               ON CONFLICT(document_id, page_no) DO UPDATE SET
                 object_key = excluded.object_key,
                 heading = excluded.heading,
                 source_locator = excluded.source_locator,
                 content_hash = excluded.content_hash,
                 char_count = excluded.char_count,
+                chunk_count = excluded.chunk_count,
                 is_synthetic_page = excluded.is_synthetic_page,
                 updated_at = excluded.updated_at
             `,
@@ -664,6 +1138,7 @@ export class SqliteStorage implements SqliteStorageBackend {
             page.sourceLocator ?? null,
             page.contentHash,
             page.charCount,
+            page.chunkCount ?? 0,
             page.isSyntheticPage ? 1 : 0,
             utcNowIso(),
           );
@@ -707,13 +1182,23 @@ export class SqliteStorage implements SqliteStorageBackend {
         `
           INSERT INTO image_semantics (
             image_hash, source_document_id, source_page_no, source_image_index,
-            mime_type, width, height, semantic_text, semantic_model
+            mime_type, width, height, bbox_json, object_key, storage_uri,
+            has_text, interference_score, is_dropped, recognizable, accessible_url,
+            semantic_text, semantic_model
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(image_hash) DO UPDATE SET
             mime_type = COALESCE(image_semantics.mime_type, excluded.mime_type),
             width = COALESCE(image_semantics.width, excluded.width),
-            height = COALESCE(image_semantics.height, excluded.height)
+            height = COALESCE(image_semantics.height, excluded.height),
+            bbox_json = COALESCE(excluded.bbox_json, image_semantics.bbox_json),
+            object_key = COALESCE(excluded.object_key, image_semantics.object_key),
+            storage_uri = COALESCE(excluded.storage_uri, image_semantics.storage_uri),
+            has_text = COALESCE(excluded.has_text, image_semantics.has_text),
+            interference_score = COALESCE(excluded.interference_score, image_semantics.interference_score),
+            is_dropped = COALESCE(excluded.is_dropped, image_semantics.is_dropped),
+            recognizable = COALESCE(excluded.recognizable, image_semantics.recognizable),
+            accessible_url = COALESCE(excluded.accessible_url, image_semantics.accessible_url)
         `,
       );
       for (const image of images) {
@@ -725,6 +1210,14 @@ export class SqliteStorage implements SqliteStorageBackend {
           image.mimeType ?? null,
           image.width ?? null,
           image.height ?? null,
+          image.bboxJson ?? null,
+          image.objectKey ?? null,
+          image.storageUri ?? null,
+          image.hasText == null ? null : image.hasText ? 1 : 0,
+          image.interferenceScore ?? null,
+          image.isDropped ? 1 : 0,
+          image.recognizable == null ? null : image.recognizable ? 1 : 0,
+          image.accessibleUrl ?? null,
           image.semanticText ?? null,
           image.semanticModel ?? null,
         );
@@ -744,7 +1237,9 @@ export class SqliteStorage implements SqliteStorageBackend {
         `
           SELECT
             image_hash, source_document_id, source_page_no, source_image_index,
-            mime_type, width, height, semantic_text, semantic_model
+            mime_type, width, height, bbox_json, object_key, storage_uri,
+            has_text, interference_score, is_dropped, recognizable, accessible_url,
+            semantic_text, semantic_model
           FROM image_semantics
           WHERE image_hash IN (${placeholders})
         `,
@@ -761,7 +1256,9 @@ export class SqliteStorage implements SqliteStorageBackend {
     let sql = `
       SELECT
         image_hash, source_document_id, source_page_no, source_image_index,
-        mime_type, width, height, semantic_text, semantic_model
+        mime_type, width, height, bbox_json, object_key, storage_uri,
+        has_text, interference_score, is_dropped, recognizable, accessible_url,
+        semantic_text, semantic_model
       FROM image_semantics
       WHERE source_document_id = ?
     `;
@@ -775,6 +1272,13 @@ export class SqliteStorage implements SqliteStorageBackend {
     return rows.map(normalizeStoredImageSemantic);
   }
 
+  deleteImageSemanticsForDocument(documentId: string): number {
+    const result = this.db
+      .prepare("DELETE FROM image_semantics WHERE source_document_id = ?")
+      .run(documentId);
+    return Number(result.changes ?? 0);
+  }
+
   updateImageSemantic(imageHash: string, semanticText: string, semanticModel?: string | null): void {
     this.db
       .prepare(
@@ -785,6 +1289,239 @@ export class SqliteStorage implements SqliteStorageBackend {
         `,
       )
       .run(semanticText, semanticModel ?? null, utcNowIso(), imageHash);
+  }
+
+  getImageSemanticCache(
+    imageHash: string,
+    promptVersion: string,
+  ): StoredImageSemanticCache | null {
+    const row = this.db
+      .prepare(
+        `
+          SELECT *
+          FROM image_semantic_cache
+          WHERE image_hash = ? AND prompt_version = ?
+          LIMIT 1
+        `,
+      )
+      .get(imageHash, promptVersion) as SqliteRow | undefined;
+    return row ? normalizeStoredImageSemanticCache(row) : null;
+  }
+
+  upsertImageSemanticCache(record: StorageImageSemanticCacheRecord): void {
+    const now = utcNowIso();
+    this.db
+      .prepare(
+        `
+          INSERT INTO image_semantic_cache (
+            image_hash, prompt_version, recognizable, image_kind, contains_text,
+            visible_text, summary, entities_json, keywords_json, qa_hints_json,
+            drop_reason, semantic_model, created_at, updated_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(image_hash, prompt_version) DO UPDATE SET
+            recognizable = excluded.recognizable,
+            image_kind = excluded.image_kind,
+            contains_text = excluded.contains_text,
+            visible_text = excluded.visible_text,
+            summary = excluded.summary,
+            entities_json = excluded.entities_json,
+            keywords_json = excluded.keywords_json,
+            qa_hints_json = excluded.qa_hints_json,
+            drop_reason = excluded.drop_reason,
+            semantic_model = excluded.semantic_model,
+            updated_at = excluded.updated_at
+        `,
+      )
+      .run(
+        record.imageHash,
+        record.promptVersion,
+        record.recognizable ? 1 : 0,
+        record.imageKind ?? null,
+        record.containsText == null ? null : record.containsText ? 1 : 0,
+        record.visibleText ?? null,
+        record.summary ?? null,
+        record.entitiesJson ?? "[]",
+        record.keywordsJson ?? "[]",
+        record.qaHintsJson ?? "[]",
+        record.dropReason ?? null,
+        record.semanticModel ?? null,
+        now,
+        now,
+      );
+  }
+
+  createDocumentParseTask(task: StorageDocumentParseTaskRecord): StoredDocumentParseTask {
+    const now = utcNowIso();
+    this.db
+      .prepare(
+        `
+          INSERT INTO document_parse_tasks (
+            id, document_id, document_filename, task_type, status, progress_percent,
+            current_stage, options_json, stage_timings_json, error_message,
+            created_at, started_at, finished_at, updated_at, total_duration_ms
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+      )
+      .run(
+        task.id,
+        task.documentId ?? null,
+        task.documentFilename,
+        task.taskType,
+        task.status,
+        Number(task.progressPercent ?? 0),
+        task.currentStage ?? null,
+        normalizeJsonText(task.optionsJson ?? "{}", "{}"),
+        normalizeJsonText(task.stageTimingsJson ?? "[]"),
+        task.errorMessage ?? null,
+        task.createdAt ?? now,
+        task.startedAt ?? null,
+        task.finishedAt ?? null,
+        task.updatedAt ?? now,
+        task.totalDurationMs ?? null,
+      );
+    const created = this.getDocumentParseTask(task.id);
+    if (!created) {
+      throw new Error("Failed to create document parse task.");
+    }
+    return created;
+  }
+
+  getDocumentParseTask(taskId: string): StoredDocumentParseTask | null {
+    const row = this.db
+      .prepare("SELECT * FROM document_parse_tasks WHERE id = ? LIMIT 1")
+      .get(taskId) as SqliteRow | undefined;
+    return row ? normalizeStoredDocumentParseTask(row) : null;
+  }
+
+  listDocumentParseTasks(input: {
+    status?: DocumentParseTaskStatus | null;
+    taskType?: DocumentParseTaskType | null;
+    documentId?: string | null;
+    limit?: number;
+    offset?: number;
+  } = {}): { items: StoredDocumentParseTask[]; total: number } {
+    const conditions: string[] = [];
+    const params: Array<string | number> = [];
+    if (input.status) {
+      conditions.push("status = ?");
+      params.push(input.status);
+    }
+    if (input.taskType) {
+      conditions.push("task_type = ?");
+      params.push(input.taskType);
+    }
+    if (input.documentId) {
+      conditions.push("document_id = ?");
+      params.push(input.documentId);
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const totalRow = this.db
+      .prepare(`SELECT COUNT(*) AS count FROM document_parse_tasks ${where}`)
+      .get(...params) as SqliteRow | undefined;
+    const limit = Math.max(Number(input.limit ?? 20), 1);
+    const offset = Math.max(Number(input.offset ?? 0), 0);
+    const rows = this.db
+      .prepare(
+        `
+          SELECT *
+          FROM document_parse_tasks
+          ${where}
+          ORDER BY created_at DESC
+          LIMIT ? OFFSET ?
+        `,
+      )
+      .all(...params, limit, offset) as SqliteRow[];
+    return {
+      items: rows.map(normalizeStoredDocumentParseTask),
+      total: Number(totalRow?.count ?? 0),
+    };
+  }
+
+  updateDocumentParseTask(
+    taskId: string,
+    patch: {
+      documentId?: string | null;
+      status?: DocumentParseTaskStatus;
+      progressPercent?: number;
+      currentStage?: string | null;
+      optionsJson?: string;
+      stageTimingsJson?: string;
+      errorMessage?: string | null;
+      startedAt?: string | null;
+      finishedAt?: string | null;
+      totalDurationMs?: number | null;
+    },
+  ): StoredDocumentParseTask | null {
+    const updates: string[] = [];
+    const params: Array<string | number | null> = [];
+    if ("documentId" in patch) {
+      updates.push("document_id = ?");
+      params.push(patch.documentId ?? null);
+    }
+    if (patch.status != null) {
+      updates.push("status = ?");
+      params.push(patch.status);
+    }
+    if (patch.progressPercent != null) {
+      updates.push("progress_percent = ?");
+      params.push(Math.max(0, Math.min(100, Math.round(patch.progressPercent))));
+    }
+    if ("currentStage" in patch) {
+      updates.push("current_stage = ?");
+      params.push(patch.currentStage ?? null);
+    }
+    if (patch.optionsJson != null) {
+      updates.push("options_json = ?");
+      params.push(normalizeJsonText(patch.optionsJson, "{}"));
+    }
+    if (patch.stageTimingsJson != null) {
+      updates.push("stage_timings_json = ?");
+      params.push(normalizeJsonText(patch.stageTimingsJson));
+    }
+    if ("errorMessage" in patch) {
+      updates.push("error_message = ?");
+      params.push(patch.errorMessage ?? null);
+    }
+    if ("startedAt" in patch) {
+      updates.push("started_at = ?");
+      params.push(patch.startedAt ?? null);
+    }
+    if ("finishedAt" in patch) {
+      updates.push("finished_at = ?");
+      params.push(patch.finishedAt ?? null);
+    }
+    if ("totalDurationMs" in patch) {
+      updates.push("total_duration_ms = ?");
+      params.push(patch.totalDurationMs ?? null);
+    }
+    if (updates.length === 0) {
+      return this.getDocumentParseTask(taskId);
+    }
+    updates.push("updated_at = ?");
+    params.push(utcNowIso(), taskId);
+    const result = this.db
+      .prepare(`UPDATE document_parse_tasks SET ${updates.join(", ")} WHERE id = ?`)
+      .run(...params);
+    if (result.changes === 0) {
+      return null;
+    }
+    return this.getDocumentParseTask(taskId);
+  }
+
+  deleteDocumentParseTask(taskId: string): boolean {
+    const result = this.db
+      .prepare("DELETE FROM document_parse_tasks WHERE id = ?")
+      .run(taskId);
+    return Boolean(result.changes);
+  }
+
+  deleteActiveDocumentParseTasks(): number {
+    const result = this.db
+      .prepare("DELETE FROM document_parse_tasks WHERE status IN ('queued', 'running')")
+      .run();
+    return Number(result.changes ?? 0);
   }
 
   createCollection(name: string): PublicCollectionRecord {

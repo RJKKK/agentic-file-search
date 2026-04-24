@@ -9,7 +9,7 @@ import Database from "better-sqlite3";
 import { resolveSqliteDbPath, SqliteStorage } from "../src/index.js";
 
 describe("sqlite storage", () => {
-  it("creates only the five physical tables and no corpora table", async () => {
+  it("creates the traditional rag tables and no corpora table", async () => {
     const root = await mkdtemp(join(tmpdir(), "afs-sqlite-schema-"));
     const dbPath = join(root, "storage.sqlite");
     const storage = new SqliteStorage({ dbPath });
@@ -32,9 +32,18 @@ describe("sqlite storage", () => {
     assert.deepEqual(rows.map((row) => row.name), [
       "collection_documents",
       "collections",
+      "document_chunks",
       "document_pages",
       "documents",
+      "image_semantic_cache",
       "image_semantics",
+      "retrieval_chunks",
+      "retrieval_chunks_fts",
+      "retrieval_chunks_fts_config",
+      "retrieval_chunks_fts_content",
+      "retrieval_chunks_fts_data",
+      "retrieval_chunks_fts_docsize",
+      "retrieval_chunks_fts_idx",
     ]);
   });
 

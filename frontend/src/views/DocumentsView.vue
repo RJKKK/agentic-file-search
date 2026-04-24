@@ -1,5 +1,5 @@
 <script setup>
-import { Delete, Edit, Refresh, Search, Upload, View } from "@element-plus/icons-vue";
+import { Delete, Edit, Promotion, Refresh, Search, Upload, View } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { inject, onMounted, reactive, watch } from "vue";
 import {
@@ -23,12 +23,20 @@ const documentList = reactive({
   loading: false,
 });
 
-const uploadState = reactive({ uploading: false, progress: 0 });
+const uploadState = reactive({
+  visible: false,
+  file: null,
+  enableEmbedding: true,
+  enableImageSemantic: true,
+  submitting: false,
+  progress: 0,
+});
 
 const detailState = reactive({
   visible: false,
   loading: false,
-  rebuildLoading: false,
+  taskLoading: false,
+  embedLoading: false,
   document: null,
   pageSummary: null,
   metadataDraft: "{}",
@@ -64,7 +72,9 @@ async function refreshDocuments(page = documentList.page) {
       page,
       page_size: documentList.pageSize,
     });
-    if (documentList.query.trim()) params.set("q", documentList.query.trim());
+    if (documentList.query.trim()) {
+      params.set("q", documentList.query.trim());
+    }
     const payload = await requestJson(`/api/documents?${params.toString()}`);
     documentList.items = payload.items || [];
     documentList.total = payload.total || 0;
@@ -80,39 +90,48 @@ function handlePageSizeChange(size) {
   refreshDocuments(1);
 }
 
-async function uploadDocument(uploadRequest) {
-  uploadState.uploading = true;
+function openUploadDialog() {
+  uploadState.visible = true;
+  uploadState.file = null;
+  uploadState.enableEmbedding = true;
+  uploadState.enableImageSemantic = true;
+  uploadState.progress = 0;
+}
+
+function handlePendingFile(uploadFile) {
+  uploadState.file = uploadFile.raw || null;
+}
+
+async function submitUpload() {
+  if (!uploadState.file) {
+    ElMessage.warning("请选择文件。");
+    return;
+  }
+  uploadState.submitting = true;
   uploadState.progress = 0;
   try {
     const formData = new FormData();
-    formData.append("file", uploadRequest.file);
-    if (appState.dbPath.trim()) formData.append("db_path", appState.dbPath.trim());
+    formData.append("file", uploadState.file);
+    formData.append("enable_embedding", String(uploadState.enableEmbedding));
+    formData.append("enable_image_semantic", String(uploadState.enableImageSemantic));
     const payload = await uploadWithProgress("/api/documents", formData, (percent) => {
       uploadState.progress = percent;
-      uploadRequest.onProgress({ percent });
     });
-    uploadState.progress = 100;
-    ElMessage.success(`${payload.document.original_filename} 上传完成`);
+    ElMessage.success(`${payload.document.original_filename} 已加入解析队列`);
+    uploadState.visible = false;
     await refreshDocuments(1);
-    uploadRequest.onSuccess(payload);
   } catch (error) {
     ElMessage.error(error.message);
-    uploadRequest.onError(error);
   } finally {
-    uploadState.uploading = false;
+    uploadState.submitting = false;
   }
-}
-
-function handleUploadProgress(event) {
-  uploadState.progress = Math.round(event.percent || 0);
 }
 
 async function openDocumentDetail(row) {
   detailState.visible = true;
   detailState.document = row;
   detailState.pagesPage = 1;
-  await loadDocumentDetail(row.id);
-  await loadDocumentPages(row.id, 1);
+  await Promise.all([loadDocumentDetail(row.id), loadDocumentPages(row.id, 1)]);
 }
 
 async function loadDocumentDetail(docId = detailState.document?.id) {
@@ -167,26 +186,39 @@ async function saveMetadata() {
   }
 }
 
-async function rebuildDocumentPages(row = detailState.document) {
+async function reparseDocument(row = detailState.document) {
   if (!row?.id) return;
-  detailState.rebuildLoading = true;
+  detailState.taskLoading = true;
   try {
     const params = buildDbParams(appState.dbPath);
-    await requestJson(withQuery(`/api/documents/${encodeURIComponent(row.id)}/parse`, params), {
+    const payload = await requestJson(withQuery(`/api/documents/${encodeURIComponent(row.id)}/parse`, params), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode: "full", force: true }),
     });
-    ElMessage.success("文档分页已重建");
-    await Promise.all([
-      refreshDocuments(documentList.page),
-      detailState.visible ? loadDocumentDetail(row.id) : Promise.resolve(),
-      detailState.visible ? loadDocumentPages(row.id, 1) : Promise.resolve(),
-    ]);
+    ElMessage.success(`已创建重解析任务 ${payload.task.id}`);
+    await Promise.all([refreshDocuments(documentList.page), loadDocumentDetail(row.id)]);
   } catch (error) {
     ElMessage.error(error.message);
   } finally {
-    detailState.rebuildLoading = false;
+    detailState.taskLoading = false;
+  }
+}
+
+async function buildEmbedding(row = detailState.document) {
+  if (!row?.id) return;
+  detailState.embedLoading = true;
+  try {
+    const params = buildDbParams(appState.dbPath);
+    const payload = await requestJson(withQuery(`/api/documents/${encodeURIComponent(row.id)}/embedding`, params), {
+      method: "POST",
+    });
+    ElMessage.success(`已创建 embedding 任务 ${payload.task.id}`);
+    await Promise.all([refreshDocuments(documentList.page), loadDocumentDetail(row.id)]);
+  } catch (error) {
+    ElMessage.error(error.message);
+  } finally {
+    detailState.embedLoading = false;
   }
 }
 
@@ -265,20 +297,7 @@ async function saveDocumentCollections() {
         <el-button :icon="Refresh" @click="refreshDocuments(documentList.page)">刷新</el-button>
       </div>
       <div class="toolbar-right">
-        <el-upload
-          :http-request="uploadDocument"
-          :on-progress="handleUploadProgress"
-          :show-file-list="false"
-          :disabled="uploadState.uploading"
-        >
-          <el-button type="primary" :loading="uploadState.uploading" :icon="Upload">上传并生成分页</el-button>
-        </el-upload>
-        <el-progress
-          v-if="uploadState.uploading || uploadState.progress === 100"
-          :percentage="uploadState.progress"
-          :stroke-width="8"
-          class="upload-progress"
-        />
+        <el-button type="primary" :icon="Upload" @click="openUploadDialog">上传文档</el-button>
       </div>
     </el-card>
 
@@ -293,31 +312,48 @@ async function saveDocumentCollections() {
         empty-text="暂无文档"
       >
         <el-table-column prop="original_filename" label="文件名" min-width="260" show-overflow-tooltip />
-        <el-table-column prop="content_type" label="类型" min-width="150" show-overflow-tooltip>
-          <template #default="{ row }">{{ row.content_type || "-" }}</template>
-        </el-table-column>
-        <el-table-column prop="status" label="状态" width="130">
+        <el-table-column prop="status" label="状态" width="120">
           <template #default="{ row }">
             <el-tag :type="documentStatusType(row.status)">{{ row.status }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="page_count" label="页数" width="90" align="right" />
+        <el-table-column label="Embedding" width="180">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.has_embeddings ? 'success' : (row.embedding_enabled ? 'warning' : 'info')">
+              {{ row.has_embeddings ? "ready" : (row.embedding_enabled ? "pending" : "disabled") }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="图片语义化" width="140">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.image_semantic_enabled ? 'success' : 'info'">
+              {{ row.image_semantic_enabled ? "enabled" : "disabled" }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column prop="file_size" label="大小" width="120" align="right">
           <template #default="{ row }">{{ formatFileSize(row.file_size) }}</template>
         </el-table-column>
         <el-table-column prop="file_mtime" label="更新时间" width="190">
           <template #default="{ row }">{{ formatTime(row.file_mtime) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="330" fixed="right">
+        <el-table-column label="操作" width="420" fixed="right">
           <template #default="{ row }">
             <el-button size="small" :icon="View" @click="openDocumentDetail(row)">查看</el-button>
             <el-button size="small" :icon="Edit" @click="openAssignDialog(row)">分配</el-button>
+            <el-button size="small" :loading="detailState.taskLoading && detailState.document?.id === row.id" @click="reparseDocument(row)">
+              重解析
+            </el-button>
             <el-button
+              v-if="row.status === 'completed' && !row.has_embeddings"
               size="small"
-              :loading="detailState.rebuildLoading && detailState.document?.id === row.id"
-              @click="rebuildDocumentPages(row)"
+              type="success"
+              :icon="Promotion"
+              :loading="detailState.embedLoading && detailState.document?.id === row.id"
+              @click="buildEmbedding(row)"
             >
-              重建
+              补做 Embedding
             </el-button>
             <el-button size="small" type="danger" :icon="Delete" @click="deleteDocument(row)">删除</el-button>
           </template>
@@ -338,6 +374,27 @@ async function saveDocumentCollections() {
     </div>
   </section>
 
+  <el-dialog v-model="uploadState.visible" title="上传文档" width="560px">
+    <el-upload drag :auto-upload="false" :show-file-list="true" :limit="1" :on-change="handlePendingFile">
+      <el-icon class="el-icon--upload"><Upload /></el-icon>
+      <div>点击或拖拽文件到这里</div>
+    </el-upload>
+    <div class="upload-options">
+      <el-switch v-model="uploadState.enableEmbedding" active-text="启用 embedding" />
+      <el-switch v-model="uploadState.enableImageSemantic" active-text="启用图片语义化" />
+    </div>
+    <el-progress
+      v-if="uploadState.submitting || uploadState.progress > 0"
+      :percentage="uploadState.progress"
+      :stroke-width="8"
+      class="upload-progress wide-progress"
+    />
+    <template #footer>
+      <el-button @click="uploadState.visible = false">取消</el-button>
+      <el-button type="primary" :loading="uploadState.submitting" @click="submitUpload">开始上传</el-button>
+    </template>
+  </el-dialog>
+
   <el-drawer v-model="detailState.visible" size="62%" title="文档详情" class="document-drawer">
     <div v-loading="detailState.loading" class="drawer-content">
       <template v-if="detailState.document">
@@ -350,12 +407,26 @@ async function saveDocumentCollections() {
             {{ detailState.pageSummary?.page_count || detailState.document.page_count || 0 }}
           </el-descriptions-item>
           <el-descriptions-item label="大小">{{ formatFileSize(detailState.document.file_size) }}</el-descriptions-item>
+          <el-descriptions-item label="Embedding" :span="2">
+            enabled={{ detailState.document.embedding_enabled }} / ready={{ detailState.document.has_embeddings }}
+          </el-descriptions-item>
+          <el-descriptions-item label="图片语义化" :span="2">
+            {{ detailState.document.image_semantic_enabled }}
+          </el-descriptions-item>
           <el-descriptions-item label="Storage URI" :span="2">{{ detailState.document.storage_uri }}</el-descriptions-item>
         </el-descriptions>
 
         <div class="drawer-actions">
-          <el-button type="primary" :loading="detailState.rebuildLoading" @click="rebuildDocumentPages(detailState.document)">
-            重建分页
+          <el-button type="primary" :loading="detailState.taskLoading" @click="reparseDocument(detailState.document)">
+            重解析
+          </el-button>
+          <el-button
+            v-if="detailState.document.status === 'completed' && !detailState.document.has_embeddings"
+            type="success"
+            :loading="detailState.embedLoading"
+            @click="buildEmbedding(detailState.document)"
+          >
+            补做 Embedding
           </el-button>
           <el-button @click="loadDocumentPages(detailState.document.id, detailState.pagesPage)">刷新页面预览</el-button>
           <el-button type="success" @click="saveMetadata">保存 Metadata</el-button>

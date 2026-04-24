@@ -8,6 +8,7 @@ Reference: legacy/python/src/fs_explorer/document_pages.py
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { Buffer } from "node:buffer";
 import { once } from "node:events";
 import { resolve } from "node:path";
 
@@ -34,6 +35,7 @@ import { encodeSseEvent } from "../runtime/explore-sessions.js";
 import { ExplorationWorkflowService } from "../runtime/exploration-workflow.js";
 import { IndexSearchService } from "../runtime/index-search.js";
 import { createDefaultActionModel } from "../runtime/openai-compatible-model.js";
+import { TraditionalRagService } from "../runtime/traditional-rag.js";
 import { resolveSqliteDbPath } from "../storage/resolve-db-path.js";
 import { SqliteStorage } from "../storage/sqlite.js";
 import type { BlobStore } from "../types/library.js";
@@ -166,6 +168,7 @@ function serializeDocumentPage(page: {
   source_locator: string | null;
   markdown: string;
   char_count: number;
+  chunk_count?: number;
   page_label: string;
   is_synthetic_page: boolean;
 }): Record<string, unknown> {
@@ -176,6 +179,7 @@ function serializeDocumentPage(page: {
     source_locator: page.source_locator,
     markdown: page.markdown,
     char_count: page.char_count,
+    chunk_count: page.chunk_count ?? 0,
     page_label: page.page_label,
     is_synthetic_page: page.is_synthetic_page,
   };
@@ -238,6 +242,8 @@ export async function createHttpServer(
   const { storage, owned: ownsStorage } = makeStorage(options);
   const blobStore = options.blobStore ?? new LocalBlobStore();
   const libraryService = new DocumentLibraryService(storage, blobStore, options.parser);
+  const traditionalRag = new TraditionalRagService(storage, blobStore);
+  await libraryService.cleanupInFlightTasks();
   const workflowService = new ExplorationWorkflowService({
     storage,
     blobStore,
@@ -347,6 +353,148 @@ export async function createHttpServer(
     }
   });
 
+  app.get("/api/document-chunks/:chunkId/content", async (request, reply) => {
+    const traceId = makeTraceId();
+    const { chunkId } = request.params as { chunkId: string };
+    const chunk = storage.getDocumentChunk(chunkId);
+    if (!chunk) {
+      return errorResponse(reply, {
+        statusCode: 404,
+        errorCode: "document_chunk_not_found",
+        message: "Document chunk not found.",
+        traceId,
+      });
+    }
+    return withTrace(
+      reply,
+      {
+        chunk: {
+          id: chunk.id,
+          document_id: chunk.document_id,
+          page_no: chunk.page_no,
+          document_index: chunk.document_index,
+          page_index: chunk.page_index,
+          block_type: chunk.block_type,
+          bbox: JSON.parse(chunk.bbox_json || "[]"),
+          content_md: chunk.content_md,
+          size_class: chunk.size_class,
+          summary_text: chunk.summary_text,
+          merged_page_nos: JSON.parse(chunk.merged_page_nos_json || "[]"),
+          merged_bboxes: JSON.parse(chunk.merged_bboxes_json || "[]"),
+        },
+      },
+      { traceId },
+    );
+  });
+
+  app.get("/api/assets/images/:imageHash", async (request, reply) => {
+    const traceId = makeTraceId();
+    const { imageHash } = request.params as { imageHash: string };
+    const image = storage.getImageSemantics([imageHash])[imageHash];
+    if (!image || !image.object_key || image.is_dropped) {
+      return errorResponse(reply, {
+        statusCode: 404,
+        errorCode: "image_not_found",
+        message: "Image asset not found.",
+        traceId,
+      });
+    }
+    const bytes = await blobStore.get({ objectKey: image.object_key });
+    reply.header("X-Trace-Id", traceId);
+    reply.type(image.mime_type || "application/octet-stream");
+    return reply.send(Buffer.from(bytes));
+  });
+
+  app.post("/api/rag/query", async (request, reply) => {
+    const traceId = makeTraceId();
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    try {
+      const result = await traditionalRag.query({
+        question: toStringValue(body.question),
+        mode: (toStringValue(body.mode, "hybrid") as "keyword" | "semantic" | "hybrid"),
+        documentIds: toStringArray(body.document_ids),
+        collectionIds: collectionIdsFromBody(body),
+        keywordWeight: Number(body.keyword_weight ?? 0.5),
+        semanticWeight: Number(body.semantic_weight ?? 0.5),
+      });
+      return withTrace(reply, result as unknown as Record<string, unknown>, { traceId });
+    } catch (error) {
+      return errorResponse(reply, {
+        statusCode: /selected|empty|embedding/i.test(String(error)) ? 400 : 500,
+        errorCode: "rag_query_failed",
+        message: error instanceof Error ? error.message : String(error),
+        traceId,
+      });
+    }
+  });
+
+  app.get("/api/document-parse-tasks", async (request, reply) => {
+    const traceId = makeTraceId();
+    const query = request.query as Record<string, unknown>;
+    const page = toIntValue(query.page, 1);
+    const pageSize = toIntValue(query.page_size, 20);
+    if (page < 1 || pageSize < 1) {
+      return errorResponse(reply, {
+        statusCode: 400,
+        errorCode: "invalid_pagination",
+        message: "`page` and `page_size` must be positive integers.",
+        traceId,
+      });
+    }
+    const result = libraryService.listDocumentParseTasks({
+      status: toStringValue(query.status, "") || null,
+      taskType: toStringValue(query.task_type, "") || null,
+      documentId: toStringValue(query.document_id, "") || null,
+      page,
+      pageSize,
+    });
+    return withTrace(reply, {
+      page,
+      page_size: pageSize,
+      total: result.total,
+      items: result.items,
+    }, { traceId });
+  });
+
+  app.get("/api/document-parse-tasks/:taskId", async (request, reply) => {
+    const traceId = makeTraceId();
+    const { taskId } = request.params as { taskId: string };
+    const task = libraryService.getDocumentParseTask(taskId);
+    if (!task) {
+      return errorResponse(reply, {
+        statusCode: 404,
+        errorCode: "document_parse_task_not_found",
+        message: "Document parse task not found.",
+        traceId,
+      });
+    }
+    return withTrace(reply, { task }, { traceId });
+  });
+
+  app.delete("/api/document-parse-tasks/:taskId", async (request, reply) => {
+    const traceId = makeTraceId();
+    const { taskId } = request.params as { taskId: string };
+    try {
+      const deleted = libraryService.deleteDocumentParseTask(taskId);
+      if (!deleted) {
+        return errorResponse(reply, {
+          statusCode: 404,
+          errorCode: "document_parse_task_not_found",
+          message: "Document parse task not found.",
+          traceId,
+        });
+      }
+      return withTrace(reply, { deleted: true }, { traceId });
+    } catch (error) {
+      return errorResponse(reply, {
+        statusCode: /completed|failed/i.test(String(error)) ? 409 : 500,
+        errorCode: "document_parse_task_delete_failed",
+        message: error instanceof Error ? error.message : String(error),
+        traceId,
+      });
+    }
+  });
+
   app.get("/api/documents", async (request, reply) => {
     const traceId = makeTraceId();
     const query = request.query as Record<string, unknown>;
@@ -415,18 +563,21 @@ export async function createHttpServer(
           traceId,
         });
       }
+      const fields = (part.fields ?? {}) as Record<string, { value?: unknown }>;
       const result = await libraryService.uploadDocument({
         filename: part.filename,
         data: await filePartToBuffer(part),
         contentType: part.mimetype,
+        enableEmbedding: toBoolValue(fields.enable_embedding?.value, true),
+        enableImageSemantic: toBoolValue(fields.enable_image_semantic?.value, true),
       });
       return withTrace(
         reply,
         {
           document: result.document,
-          upload_result: result.uploadResult,
+          task: result.task,
         },
-        { statusCode: 201, traceId },
+        { statusCode: 202, traceId },
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -539,17 +690,18 @@ export async function createHttpServer(
       const result = await libraryService.reparseDocument({
         docId,
         force: toBoolValue(body.force, false) || mode === "full",
+        enableEmbedding:
+          body.enable_embedding == null ? undefined : toBoolValue(body.enable_embedding, true),
+        enableImageSemantic:
+          body.enable_image_semantic == null ? undefined : toBoolValue(body.enable_image_semantic, true),
       });
       return withTrace(
         reply,
         {
-          document_id: result.documentId,
-          page_count: result.pageCount,
-          pages_updated: result.pagesUpdated,
-          from_cache: result.fromCache,
-          page_naming_scheme: result.pageNamingScheme,
+          document: result.document,
+          task: result.task,
         },
-        { traceId },
+        { statusCode: 202, traceId },
       );
     } catch (error) {
       return errorResponse(reply, {
@@ -557,6 +709,22 @@ export async function createHttpServer(
         errorCode: /not found/i.test(String(error))
           ? "document_not_found"
           : "document_parse_failed",
+        message: error instanceof Error ? error.message : String(error),
+        traceId,
+      });
+    }
+  });
+
+  app.post("/api/documents/:docId/embedding", async (request, reply) => {
+    const traceId = makeTraceId();
+    const { docId } = request.params as { docId: string };
+    try {
+      const task = await libraryService.createEmbeddingTask(docId);
+      return withTrace(reply, { task }, { statusCode: 202, traceId });
+    } catch (error) {
+      return errorResponse(reply, {
+        statusCode: /completed|not found/i.test(String(error)) ? 409 : 500,
+        errorCode: "document_embedding_task_failed",
         message: error instanceof Error ? error.message : String(error),
         traceId,
       });

@@ -46,6 +46,7 @@ function buildParsedDocument(): ParsedDocument {
         heading: "Overview",
         source_locator: "page-1",
         images: [],
+        blocks: [],
       },
       {
         unit_no: 2,
@@ -63,9 +64,22 @@ function buildParsedDocument(): ParsedDocument {
             height: 50,
           },
         ],
+        blocks: [],
       },
     ],
   };
+}
+
+async function waitForTask(service: DocumentLibraryService, taskId: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const task = service.getDocumentParseTask(taskId);
+    if (task && ["completed", "failed"].includes(task.status)) {
+      assert.notEqual(task.status, "failed");
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Task ${taskId} did not finish in time`);
 }
 
 describe("document library service", () => {
@@ -84,16 +98,16 @@ describe("document library service", () => {
       data: Buffer.from("fake-docx", "utf8"),
       contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     });
+    await waitForTask(service, result.task.id);
 
     assert.equal(result.document.original_filename, "alpha.docx");
-    assert.equal(result.uploadResult.pages_generated, 2);
-    assert.equal(result.document.upload_status, "pages_ready");
+    assert.equal(result.task.task_type, "upload_parse");
 
     const document = storage.getDocument(String(result.document.id));
     assert.ok(document);
     assert.equal(document?.page_count, 2);
+    assert.equal(document?.upload_status, "completed");
     assert.equal(storage.listDocumentPages(String(result.document.id)).length, 2);
-    assert.equal(storage.listImageSemanticsForDocument(String(result.document.id)).length, 1);
 
     const sourcePath = await blobStore.materialize({
       objectKey: buildDocumentObjectKey(String(result.document.id), "alpha.docx"),
@@ -128,11 +142,12 @@ describe("document library service", () => {
     storage.initialize();
     const service = new DocumentLibraryService(storage, blobStore, parser);
 
-    await service.uploadDocument({
+    const uploaded = await service.uploadDocument({
       filename: "Alpha.pdf",
       data: Buffer.from("pdf", "utf8"),
       contentType: "application/pdf",
     });
+    await waitForTask(service, uploaded.task.id);
 
     await assert.rejects(
       service.uploadDocument({
@@ -162,6 +177,7 @@ describe("document library service", () => {
       data: Buffer.from("%PDF fake", "utf8"),
       contentType: "application/pdf",
     });
+    await waitForTask(service, uploaded.task.id);
 
     assert.equal(uploaded.document.original_filename, filename);
     assert.equal(parser.calls, 1);
@@ -220,18 +236,14 @@ describe("document library service", () => {
       data: Buffer.from("docx", "utf8"),
       contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     });
+    await waitForTask(service, uploaded.task.id);
 
     assert.equal(parser.calls, 1);
-    const cached = await service.reparseDocument({ docId: String(uploaded.document.id) });
-    assert.equal(cached.fromCache, true);
-    assert.equal(parser.calls, 1);
-
-    const forced = await service.reparseDocument({
+    const reparsed = await service.reparseDocument({
       docId: String(uploaded.document.id),
       force: true,
     });
-    assert.equal(forced.fromCache, false);
-    assert.equal(forced.pagesUpdated, 2);
+    await waitForTask(service, reparsed.task.id);
     assert.equal(parser.calls, 2);
 
     storage.close();
@@ -252,6 +264,7 @@ describe("document library service", () => {
       data: Buffer.from("pdf", "utf8"),
       contentType: "application/pdf",
     });
+    await waitForTask(service, uploaded.task.id);
 
     const deleted = await service.deleteDocument({ docId: String(uploaded.document.id) });
 

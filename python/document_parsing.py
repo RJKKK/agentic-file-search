@@ -6,8 +6,11 @@ Document parsing adapters and cache-oriented parsing helpers.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import html
+import io
+import json
 import os
 import re
 import shutil
@@ -24,9 +27,48 @@ except ImportError:  # pragma: no cover - optional dependency
     fitz = None
 
 try:
+    import pymupdf.layout  # noqa: F401
+except ImportError:  # pragma: no cover - optional dependency
+    pass
+
+try:
     import pymupdf4llm
 except ImportError:  # pragma: no cover - optional dependency
     pymupdf4llm = None
+
+try:
+    from pymupdf4llm.helpers.document_layout import (
+        fallback_text_to_md as _layout_fallback_text_to_md,
+        footnote_to_md as _layout_footnote_to_md,
+        list_item_to_md as _layout_list_item_to_md,
+        picture_text_to_md as _layout_picture_text_to_md,
+        section_hdr_to_md as _layout_section_hdr_to_md,
+        text_to_md as _layout_text_to_md,
+        title_to_md as _layout_title_to_md,
+    )
+except ImportError:  # pragma: no cover - optional dependency
+    _layout_fallback_text_to_md = None
+    _layout_footnote_to_md = None
+    _layout_list_item_to_md = None
+    _layout_picture_text_to_md = None
+    _layout_section_hdr_to_md = None
+    _layout_text_to_md = None
+    _layout_title_to_md = None
+
+try:
+    import cv2
+except ImportError:  # pragma: no cover - optional dependency
+    cv2 = None
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - optional dependency
+    np = None
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover - optional dependency
+    Image = None
 
 try:
     from docling.document_converter import DocumentConverter
@@ -75,6 +117,21 @@ class ParsedImage:
     mime_type: str | None = None
     width: int | None = None
     height: int | None = None
+    bbox: tuple[float, float, float, float] | None = None
+    placeholder: str | None = None
+
+
+@dataclass(frozen=True)
+class ParsedBlock:
+    """Structured layout block reconstructed from pymupdf4llm JSON output."""
+
+    index: int
+    block_type: str
+    bbox: tuple[float, float, float, float]
+    markdown: str
+    char_count: int
+    image_hash: str | None = None
+    source_image_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +144,7 @@ class ParsedUnit:
     heading: str | None = None
     source_locator: str | None = None
     images: tuple[ParsedImage, ...] = ()
+    blocks: tuple[ParsedBlock, ...] = ()
 
     @property
     def image_hashes(self) -> tuple[str, ...]:
@@ -183,6 +241,7 @@ def _coerce_unit(item: ParsedUnit | ParsedPage) -> ParsedUnit:
         heading=item.heading,
         source_locator=item.source_locator,
         images=item.images,
+        blocks=(),
     )
 
 
@@ -351,8 +410,22 @@ def reconstruct_parsed_document(units: list[dict[str, object]]) -> ParseCacheHit
                     mime_type=_optional_str(image.get("mime_type")),
                     width=_optional_int(image.get("width")),
                     height=_optional_int(image.get("height")),
+                    bbox=_coerce_bbox(image.get("bbox")),
+                    placeholder=_optional_str(image.get("placeholder")),
                 )
                 for image in _coerce_image_list(unit.get("images"))
+            ),
+            blocks=tuple(
+                ParsedBlock(
+                    index=int(block.get("index", 0)),
+                    block_type=str(block.get("block_type") or block.get("class") or "text"),
+                    bbox=_coerce_bbox(block.get("bbox")) or (0.0, 0.0, 0.0, 0.0),
+                    markdown=str(block.get("markdown") or ""),
+                    char_count=int(block.get("char_count") or len(str(block.get("markdown") or ""))),
+                    image_hash=_optional_str(block.get("image_hash")),
+                    source_image_index=_optional_int(block.get("source_image_index")),
+                )
+                for block in _coerce_block_list(unit.get("blocks"))
             ),
         )
         for unit in ordered
@@ -420,6 +493,112 @@ def enhance_page_image_semantics(
         enhanced += 1
 
     return enhanced
+
+
+def extract_pdf_images_payload(
+    file_path: str,
+    *,
+    page_nos: list[int] | None = None,
+) -> list[dict[str, object]]:
+    """Extract raw PDF images as JSON-friendly payloads."""
+    if fitz is None:
+        return []
+    requested = set(page_nos or [])
+    results: list[dict[str, object]] = []
+    try:
+        with fitz.open(file_path) as document:
+            iterable = (
+                sorted(page_no for page_no in requested if 1 <= page_no <= int(document.page_count))
+                if requested
+                else list(range(1, int(document.page_count) + 1))
+            )
+            for page_no in iterable:
+                for image in _extract_pdf_images(file_path, page_no=page_no, include_bytes=True):
+                    image_bytes = image.get("image_bytes", b"")
+                    if not isinstance(image_bytes, (bytes, bytearray)) or not image_bytes:
+                        continue
+                    results.append(
+                        {
+                            "image_hash": str(image["image_hash"]),
+                            "page_no": page_no,
+                            "image_index": int(image["image_index"]),
+                            "mime_type": _optional_str(image.get("mime_type")),
+                            "width": _optional_int(image.get("width")),
+                            "height": _optional_int(image.get("height")),
+                            "bytes_base64": base64.b64encode(bytes(image_bytes)).decode("ascii"),
+                            "byte_size": len(image_bytes),
+                        }
+                    )
+    except Exception:
+        return []
+    return results
+
+
+def inspect_image_bytes(
+    *,
+    image_bytes: bytes,
+    mime_type: str | None,
+) -> dict[str, object]:
+    """Run OpenCV preprocessing and produce a compressed image candidate."""
+    supported = {
+        "image/png",
+        "image/jpg",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+        "image/bmp",
+    }
+    effective_mime = _optional_str(mime_type) or "image/png"
+    if effective_mime.lower() not in supported:
+        return {
+            "supported": False,
+            "has_text": False,
+            "interference_score": 0.0,
+            "compressed_bytes_base64": base64.b64encode(image_bytes).decode("ascii"),
+            "compressed_byte_size": len(image_bytes),
+            "output_mime_type": effective_mime,
+        }
+
+    has_text = False
+    interference_score = 0.0
+    if cv2 is not None and np is not None:
+        try:
+            array = np.frombuffer(image_bytes, dtype=np.uint8)
+            image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+            if image is not None:
+                has_text = _opencv_has_text(image)
+                interference_score = _opencv_interference_score(image)
+        except Exception:
+            has_text = False
+            interference_score = 0.0
+
+    compressed_bytes = image_bytes
+    output_mime_type = effective_mime
+    if Image is not None:
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as image:
+                image = image.convert("RGB")
+                width, height = image.size
+                max_side = max(width, height, 1)
+                if max_side > 1600:
+                    scale = 1600 / max_side
+                    image = image.resize((max(1, int(width * scale)), max(1, int(height * scale))))
+                buffer = io.BytesIO()
+                image.save(buffer, format="JPEG", quality=80, optimize=True)
+                compressed_bytes = buffer.getvalue()
+                output_mime_type = "image/jpeg"
+        except Exception:
+            compressed_bytes = image_bytes
+            output_mime_type = effective_mime
+
+    return {
+        "supported": True,
+        "has_text": has_text,
+        "interference_score": float(interference_score),
+        "compressed_bytes_base64": base64.b64encode(compressed_bytes).decode("ascii"),
+        "compressed_byte_size": len(compressed_bytes),
+        "output_mime_type": output_mime_type,
+    }
 
 
 def _coerce_selector(
@@ -577,6 +756,7 @@ def _parse_pdf(
     *,
     selector: ParseSelector | None = None,
 ) -> ParsedDocument:
+    page_payloads: list[dict[str, object]] = []
     chunks: list[tuple[int, str]] = []
     parser_name = "pymupdf4llm"
     requested_pages = _requested_pdf_pages(selector)
@@ -622,35 +802,34 @@ def _parse_pdf(
                     continue
                 seen_sources.add(source_key)
                 try:
-                    payload = _pymupdf4llm_to_markdown(
+                    payload = _pymupdf4llm_to_json(
                         source,
                         pages=requested_pages,
-                        page_chunks=True,
                     )
-                    chunks = _extract_pdf_markdown_chunks(payload)
-                    if chunks:
+                    page_payloads = _extract_pdf_json_pages(payload)
+                    if page_payloads:
                         break
                 except Exception as exc:
                     diagnostics.append(
-                        f"pymupdf4llm page_chunks failed for {type(source).__name__}: "
+                        f"pymupdf4llm to_json failed for {type(source).__name__}: "
                         f"{type(exc).__name__}: {exc}"
                     )
-            if not chunks:
+            if not page_payloads:
                 try:
                     payload = _pymupdf4llm_to_markdown(
                         file_path,
                         pages=requested_pages,
-                        page_chunks=False,
+                        page_chunks=True,
                     )
                     chunks = _extract_pdf_markdown_chunks(payload)
                 except Exception as exc:
                     diagnostics.append(
-                        f"pymupdf4llm full-document fallback failed: {type(exc).__name__}: {exc}"
+                        f"pymupdf4llm markdown fallback failed: {type(exc).__name__}: {exc}"
                     )
         else:
             diagnostics.append("pymupdf4llm import is unavailable.")
 
-        if not chunks and document is not None:
+        if not page_payloads and not chunks and document is not None:
             parser_name = "pymupdf"
             try:
                 page_indices = (
@@ -680,7 +859,7 @@ def _parse_pdf(
         if document is not None:
             document.close()
 
-    if not chunks:
+    if not page_payloads and not chunks:
         modules_missing = fitz is None or pymupdf4llm is None
         detail = " ".join(diagnostics).strip()
         if not detail:
@@ -693,6 +872,13 @@ def _parse_pdf(
                 if modules_missing
                 else f"PDF parser produced no pages. {detail}"
             ),
+        )
+
+    if page_payloads:
+        return _parsed_document_from_pdf_json(
+            file_path=file_path,
+            parser_name=parser_name,
+            page_payloads=page_payloads,
         )
 
     cleaned_chunks = _strip_pdf_headers_and_footers(chunks)
@@ -709,6 +895,8 @@ def _parse_pdf(
                 mime_type=_optional_str(image.get("mime_type")),
                 width=_optional_int(image.get("width")),
                 height=_optional_int(image.get("height")),
+                bbox=_coerce_bbox(image.get("bbox")),
+                placeholder=_optional_str(image.get("placeholder")),
             )
             for image in _extract_pdf_images(file_path, page_no=page_no)
         )
@@ -720,6 +908,7 @@ def _parse_pdf(
                 heading=_derive_heading(normalized),
                 source_locator=f"page-{page_no}",
                 images=images,
+                blocks=(),
             )
         )
 
@@ -728,6 +917,23 @@ def _parse_pdf(
         parser_version=PARSER_VERSION,
         units=tuple(units),
     )
+
+
+def _pymupdf4llm_to_json(
+    source: object,
+    *,
+    pages: list[int] | None,
+) -> object:
+    """Call pymupdf4llm.to_json across supported version-specific signatures."""
+    if pymupdf4llm is None:
+        raise RuntimeError("pymupdf4llm is unavailable")
+    try:
+        return pymupdf4llm.to_json(
+            source,
+            pages=pages,
+        )
+    except TypeError:
+        return pymupdf4llm.to_json(source)
 
 
 def _pymupdf4llm_to_markdown(
@@ -755,6 +961,128 @@ def _pymupdf4llm_to_markdown(
             page_chunks=page_chunks,
             margins=_pdf_content_margins(),
         )
+
+
+def _extract_pdf_json_pages(payload: object) -> list[dict[str, object]]:
+    raw = payload
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    if isinstance(raw, dict):
+        if isinstance(raw.get("pages"), list):
+            pages = raw.get("pages")
+        else:
+            pages = [raw]
+    elif isinstance(raw, list):
+        pages = raw
+    else:
+        return []
+    return [item for item in pages if isinstance(item, dict)]
+
+
+def _parsed_document_from_pdf_json(
+    *,
+    file_path: str,
+    parser_name: str,
+    page_payloads: list[dict[str, object]],
+) -> ParsedDocument:
+    page_builders: list[tuple[int, str, list[ParsedBlock], tuple[ParsedImage, ...]]] = []
+    for order_index, payload in enumerate(page_payloads, start=1):
+        page_no = (
+            _optional_int(payload.get("page"))
+            or _optional_int(payload.get("page_no"))
+            or _optional_int(payload.get("page_number"))
+            or order_index
+        )
+        page_bbox = _pdf_json_page_bbox(payload)
+        extracted_images = list(_extract_pdf_images(file_path, page_no=page_no))
+        image_cursor = 0
+        blocks = []
+        enriched_images: list[ParsedImage] = []
+        for sequence_index, raw_block in enumerate(_iter_pdf_json_blocks(payload)):
+            block_class = _pdf_json_block_type(raw_block)
+            bbox = _pdf_json_block_bbox(raw_block) or (0.0, 0.0, 0.0, 0.0)
+            markdown = _block_markdown_from_pdf_json(
+                raw_block,
+                block_type=block_class,
+            )
+            image_hash: str | None = None
+            source_image_index: int | None = None
+            if block_class == "picture":
+                matched = extracted_images[image_cursor] if image_cursor < len(extracted_images) else None
+                image_cursor += 1
+                if matched is not None:
+                    image_hash = str(matched["image_hash"])
+                    source_image_index = int(matched["image_index"])
+                    placeholder = f"[[IMAGE:{image_hash}]]"
+                    markdown = placeholder
+                    enriched_images.append(
+                        ParsedImage(
+                            image_hash=image_hash,
+                            page_no=page_no,
+                            image_index=source_image_index,
+                            mime_type=_optional_str(matched.get("mime_type")),
+                            width=_optional_int(matched.get("width")),
+                            height=_optional_int(matched.get("height")),
+                            bbox=bbox,
+                            placeholder=placeholder,
+                        )
+                    )
+            normalized_block = _normalize_block_markdown(
+                markdown=markdown,
+                block_type=block_class,
+            )
+            if not normalized_block:
+                continue
+            blocks.append(
+                ParsedBlock(
+                    index=_optional_int(raw_block.get("index")) or sequence_index,
+                    block_type=block_class,
+                    bbox=bbox,
+                    markdown=normalized_block,
+                    char_count=len(normalized_block),
+                    image_hash=image_hash,
+                    source_image_index=source_image_index,
+                )
+            )
+
+        filtered_blocks = _strip_pdf_header_footer_blocks(
+            page_no=page_no,
+            page_bbox=page_bbox,
+            blocks=blocks,
+        )
+        filtered_placeholders = {
+            block.image_hash
+            for block in filtered_blocks
+            if block.block_type == "picture" and block.image_hash
+        }
+        page_images = tuple(
+            image for image in enriched_images if image.image_hash in filtered_placeholders
+        )
+        page_markdown = _normalize_markdown(
+            "\n\n".join(block.markdown for block in filtered_blocks if block.markdown.strip())
+        )
+        page_builders.append((page_no, page_markdown, filtered_blocks, page_images))
+
+    units = [
+        ParsedUnit(
+            unit_no=page_no,
+            markdown=markdown,
+            content_hash=_text_sha256(markdown),
+            heading=_derive_heading(markdown),
+            source_locator=f"page-{page_no}",
+            images=images,
+            blocks=tuple(blocks),
+        )
+        for page_no, markdown, blocks, images in page_builders
+    ]
+    return ParsedDocument(
+        parser_name=parser_name,
+        parser_version=PARSER_VERSION,
+        units=tuple(units),
+    )
 
 
 def _requested_pdf_pages(selector: ParseSelector | None) -> list[int] | None:
@@ -889,6 +1217,184 @@ def _extract_pdf_markdown_chunks(payload: object) -> list[tuple[int, str]]:
         else:
             chunks.append((index, str(item)))
     return chunks
+
+
+def _iter_pdf_json_blocks(payload: dict[str, object]) -> list[dict[str, object]]:
+    page_boxes = payload.get("page_boxes")
+    if isinstance(page_boxes, list):
+        blocks = [item for item in page_boxes if isinstance(item, dict)]
+        blocks.sort(
+            key=lambda item: (
+                _optional_int(item.get("index"))
+                if _optional_int(item.get("index")) is not None
+                else 10**9,
+                (_pdf_json_block_bbox(item) or (0.0, 0.0, 0.0, 0.0))[1],
+                (_pdf_json_block_bbox(item) or (0.0, 0.0, 0.0, 0.0))[0],
+            )
+        )
+        return blocks
+
+    direct_blocks = payload.get("blocks")
+    if isinstance(direct_blocks, list):
+        blocks = [item for item in direct_blocks if isinstance(item, dict)]
+        blocks.sort(
+            key=lambda item: (
+                _optional_int(item.get("index"))
+                if _optional_int(item.get("index")) is not None
+                else 10**9,
+                (_pdf_json_block_bbox(item) or (0.0, 0.0, 0.0, 0.0))[1],
+                (_pdf_json_block_bbox(item) or (0.0, 0.0, 0.0, 0.0))[0],
+            )
+        )
+        return blocks
+
+    layout_boxes = payload.get("boxes")
+    if isinstance(layout_boxes, list):
+        return [item for item in layout_boxes if isinstance(item, dict)]
+
+    return []
+
+
+def _block_markdown_from_pdf_json(
+    block: dict[str, object],
+    *,
+    block_type: str | None = None,
+) -> str:
+    text = (
+        block.get("markdown")
+        or block.get("md")
+        or block.get("text")
+        or block.get("content")
+        or ""
+    )
+    if text:
+        return str(text)
+
+    effective_type = block_type or _pdf_json_block_type(block)
+    table = block.get("table")
+    if isinstance(table, dict):
+        markdown = table.get("markdown")
+        if markdown:
+            return str(markdown)
+        extracted = table.get("extract")
+        if isinstance(extracted, list):
+            rows = []
+            for row in extracted:
+                if isinstance(row, list):
+                    rows.append("| " + " | ".join(str(cell or "").strip() for cell in row) + " |")
+            if rows:
+                return "\n".join(rows)
+
+    textlines = block.get("textlines")
+    if not isinstance(textlines, list) or not textlines:
+        return ""
+
+    if effective_type == "title" and _layout_title_to_md is not None:
+        return str(_layout_title_to_md(textlines))
+    if effective_type == "section-header" and _layout_section_hdr_to_md is not None:
+        return str(_layout_section_hdr_to_md(textlines))
+    if effective_type == "list-item" and _layout_list_item_to_md is not None:
+        return str(_layout_list_item_to_md(textlines, 1))
+    if effective_type == "footnote" and _layout_footnote_to_md is not None:
+        return str(_layout_footnote_to_md(textlines))
+    if effective_type == "picture" and _layout_picture_text_to_md is not None:
+        return str(_layout_picture_text_to_md(textlines))
+    if effective_type == "table-fallback" and _layout_fallback_text_to_md is not None:
+        return str(_layout_fallback_text_to_md(textlines))
+    if _layout_text_to_md is not None:
+        return str(_layout_text_to_md(textlines))
+
+    lines: list[str] = []
+    for line in textlines:
+        if not isinstance(line, dict):
+            continue
+        spans = line.get("spans")
+        if not isinstance(spans, list):
+            continue
+        line_text = "".join(str(span.get("text") or "") for span in spans if isinstance(span, dict)).strip()
+        if line_text:
+            lines.append(line_text)
+    return "\n".join(lines)
+
+
+def _pdf_json_page_bbox(payload: dict[str, object]) -> tuple[float, float, float, float] | None:
+    bbox = _coerce_bbox(payload.get("bbox"))
+    if bbox is not None:
+        return bbox
+    width = _optional_float(payload.get("width"))
+    height = _optional_float(payload.get("height"))
+    if width is None or height is None:
+        return None
+    return (0.0, 0.0, float(width), float(height))
+
+
+def _pdf_json_block_type(block: dict[str, object]) -> str:
+    return (
+        _optional_str(block.get("block_type"))
+        or _optional_str(block.get("class"))
+        or _optional_str(block.get("boxclass"))
+        or "text"
+    )
+
+
+def _pdf_json_block_bbox(block: dict[str, object]) -> tuple[float, float, float, float] | None:
+    bbox = _coerce_bbox(block.get("bbox"))
+    if bbox is not None:
+        return bbox
+    values = (
+        _optional_float(block.get("x0")),
+        _optional_float(block.get("y0")),
+        _optional_float(block.get("x1")),
+        _optional_float(block.get("y1")),
+    )
+    if any(value is None for value in values):
+        return None
+    x0, y0, x1, y1 = values
+    return (float(x0), float(y0), float(x1), float(y1))
+
+
+def _normalize_block_markdown(*, markdown: str, block_type: str) -> str:
+    normalized = str(markdown or "")
+    if block_type == "table":
+        normalized = _normalize_pdf_table_markdown(normalized)
+    normalized = re.sub(r"Col\d+", "", normalized)
+    normalized = _normalize_markdown(normalized)
+    return normalized
+
+
+def _strip_pdf_header_footer_blocks(
+    *,
+    page_no: int,
+    page_bbox: tuple[float, float, float, float] | None,
+    blocks: list[ParsedBlock],
+) -> list[ParsedBlock]:
+    if not blocks:
+        return []
+    if page_bbox is None:
+        return [
+            block
+            for block in blocks
+            if not (block.block_type == "text" and _is_page_number_footer(block.markdown, page_no=page_no))
+        ]
+
+    page_height = max(page_bbox[3] - page_bbox[1], 1.0)
+    top_cutoff = page_bbox[1] + page_height * 0.08
+    bottom_cutoff = page_bbox[3] - page_height * 0.08
+    filtered: list[ParsedBlock] = []
+    for block in blocks:
+        if block.block_type == "text":
+            text = block.markdown.strip()
+            if not text:
+                continue
+            if _is_page_number_footer(text, page_no=page_no):
+                continue
+            center_y = (block.bbox[1] + block.bbox[3]) / 2
+            if center_y <= top_cutoff and len(text) <= 120:
+                continue
+            if center_y >= bottom_cutoff and len(text) <= 120:
+                continue
+        filtered.append(block)
+    return filtered
 
 
 def _pdf_content_margins() -> tuple[float, float, float, float]:
@@ -1035,6 +1541,63 @@ def _extract_pdf_images(
             return images
     except Exception:
         return []
+
+
+def _opencv_has_text(image) -> bool:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    thresholded = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        15,
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    morphed = cv2.morphologyEx(thresholded, cv2.MORPH_CLOSE, kernel, iterations=1)
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(morphed, connectivity=8)
+    area = float(image.shape[0] * image.shape[1])
+    candidates = 0
+    for index in range(1, count):
+        width = int(stats[index, cv2.CC_STAT_WIDTH])
+        height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        box_area = int(stats[index, cv2.CC_STAT_AREA])
+        if width < 3 or height < 3:
+            continue
+        if width > image.shape[1] * 0.8 or height > image.shape[0] * 0.3:
+            continue
+        if box_area <= 0 or box_area / area > 0.08:
+            continue
+        aspect_ratio = width / max(height, 1)
+        if 0.1 <= aspect_ratio <= 15:
+            candidates += 1
+    return candidates >= 12
+
+
+def _opencv_interference_score(image) -> float:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    area = float(image.shape[0] * image.shape[1])
+    edges = cv2.Canny(gray, 80, 180)
+    edge_density = float(np.count_nonzero(edges)) / max(area, 1.0)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80, minLineLength=20, maxLineGap=8)
+    line_density = 0.0 if lines is None else min(float(len(lines)) / 100.0, 1.0)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype("float32")
+    colorfulness = float(np.mean(np.sqrt(hsv[:, :, 1] ** 2 + hsv[:, :, 2] ** 2)) / 255.0)
+    histogram = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
+    histogram /= max(float(histogram.sum()), 1.0)
+    entropy = float(-np.sum([value * np.log2(value) for value in histogram if value > 0]) / 8.0)
+    fill_ratio = float(np.count_nonzero(gray < 245)) / max(area, 1.0)
+    return max(
+        0.0,
+        min(
+            1.0,
+            0.28 * edge_density * 8
+            + 0.22 * line_density
+            + 0.18 * colorfulness
+            + 0.16 * entropy
+            + 0.16 * fill_ratio,
+        ),
+    )
 
 
 def _convert_doc_to_docx(file_path: str) -> str:
@@ -1288,11 +1851,39 @@ def _coerce_image_list(value: object) -> list[dict[str, object]]:
     return items
 
 
+def _coerce_block_list(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    items: list[dict[str, object]] = []
+    for item in value:
+        if isinstance(item, dict):
+            items.append(item)
+    return items
+
+
+def _coerce_bbox(value: object) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        return tuple(float(item) for item in value)  # type: ignore[return-value]
+    except (TypeError, ValueError):
+        return None
+
+
 def _optional_int(value: object) -> int | None:
     if value is None:
         return None
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return None
 

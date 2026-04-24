@@ -30,6 +30,18 @@ export const ParsedImageSchema = z.object({
   mime_type: z.string().nullable().optional(),
   width: z.number().int().positive().nullable().optional(),
   height: z.number().int().positive().nullable().optional(),
+  bbox: z.array(z.number()).length(4).nullable().optional(),
+  placeholder: z.string().nullable().optional(),
+});
+
+export const ParsedBlockSchema = z.object({
+  index: z.number().int().min(0),
+  block_type: z.string().min(1),
+  bbox: z.array(z.number()).length(4),
+  markdown: z.string(),
+  char_count: z.number().int().min(0).optional().default(0),
+  image_hash: z.string().nullable().optional(),
+  source_image_index: z.number().int().min(0).nullable().optional(),
 });
 
 export const ParsedUnitSchema = z.object({
@@ -39,6 +51,7 @@ export const ParsedUnitSchema = z.object({
   heading: z.string().nullable().optional(),
   source_locator: z.string().nullable().optional(),
   images: z.array(ParsedImageSchema).default([]),
+  blocks: z.array(ParsedBlockSchema).default([]),
 });
 
 export const ParsedDocumentSchema = z.object({
@@ -72,6 +85,7 @@ export type SupportedExtension = (typeof SUPPORTED_EXTENSIONS)[number];
 export type ParseSelectorInput = z.input<typeof ParseSelectorSchema>;
 export type ParseSelector = z.infer<typeof ParseSelectorSchema>;
 export type ParsedImage = z.infer<typeof ParsedImageSchema>;
+export type ParsedBlock = z.infer<typeof ParsedBlockSchema>;
 export type ParsedUnit = z.infer<typeof ParsedUnitSchema>;
 export type ParsedDocument = z.infer<typeof ParsedDocumentSchema>;
 export type PythonBridgeResponse = z.infer<typeof PythonBridgeResponseSchema>;

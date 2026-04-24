@@ -15,19 +15,20 @@ Phase 1 focuses on:
 - dynamic skill loading from folders
 - real OpenAI-compatible LLM provider wiring
 - page-first retrieval strategy
+- traditional RAG with structured chunks and retrieval chunks
 - SQLite-backed document storage for Node
 - document library upload/storage services
 - exploration session workflow with SSE
 - page-manifest index search
+- SQLite FTS5 keyword search
+- optional Qdrant semantic search
 - Fastify HTTP API
 - migrated legacy Vue frontend served by the Node API
 
-Phase 1 does not include:
+The repository now supports both:
 
-- semantic search
-- lazy indexing
-- metadata extraction
-- chunk/schema/embedding storage
+- agent retrieval for the original page-first workflow
+- traditional retrieval for keyword / semantic / hybrid document QA
 
 ## Quick Start
 
@@ -62,7 +63,7 @@ The active Node service still calls a local Python parser bridge for document pa
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install "docling>=2.55.0" "pymupdf>=1.24.0" pymupdf4llm
+python -m pip install "docling>=2.55.0" "pymupdf>=1.24.0" pymupdf4llm pillow opencv-python numpy
 ```
 
 On macOS/Linux, activate the venv with:
@@ -100,6 +101,130 @@ Notes:
 - The Node-owned parser files live in `python/`.
 - You do not need to install the full `legacy/python` project to run the Node mainline.
 - If you intentionally want the full legacy Python toolchain for comparison, use `legacy/python/pyproject.toml`; that is separate from the Node parser bridge.
+
+### Python Third-Party Libraries
+
+The current parser/runtime directly depends on these Python libraries:
+
+- `docling`: office document parsing fallback (`.docx`, `.pptx`, `.xlsx`, and converted office flows)
+- `pymupdf` (`fitz`): PDF open/read, image extraction, page geometry
+- `pymupdf4llm`: PDF `to_json()` structured block parsing
+- `pillow`: image compression and format normalization
+- `opencv-python` or `opencv-python-headless`: image text detection and interference scoring
+- `numpy`: OpenCV preprocessing and image scoring math
+
+Recommended install commands:
+
+Windows / local desktop:
+
+```powershell
+python -m pip install --upgrade pip
+python -m pip install "docling>=2.55.0" "pymupdf>=1.24.0" pymupdf4llm pillow opencv-python numpy
+```
+
+Linux / server / Docker-friendly:
+
+```bash
+python3 -m pip install --upgrade pip
+python3 -m pip install "docling>=2.55.0" "pymupdf>=1.24.0" pymupdf4llm pillow opencv-python-headless numpy
+```
+
+Linux system packages that are typically required in addition to Python packages:
+
+- `libreoffice` or `libreoffice-core + libreoffice-writer + libreoffice-calc + libreoffice-impress`
+- `python3`, `python3-venv`, `python3-pip`
+- `libgl1`, `libglib2.0-0` for OpenCV runtime compatibility
+
+Example on Debian/Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv python3-pip libreoffice libgl1 libglib2.0-0
+```
+
+## Linux Docker Deployment
+
+This repository now includes Docker templates for a Linux deployment with:
+
+- one application container for Node.js + frontend + Python parser bridge
+- one optional Qdrant container for semantic retrieval
+- persistent storage for SQLite data and Qdrant vectors
+
+Template files:
+
+- `Dockerfile`
+- `docker-compose.yml`
+- `.dockerignore`
+- `docker/app.env.example`
+
+### 1. Prepare Environment
+
+Copy the example env file and fill in your model credentials:
+
+```bash
+cp .env.example .env
+```
+
+If you want Docker Compose to use the bundled Qdrant service, set:
+
+```env
+QDRANT_URL=http://qdrant:6333
+```
+
+You can also start from the Docker-oriented template:
+
+```bash
+cp docker/app.env.example .env
+```
+
+Important runtime values for Docker:
+
+- `FS_EXPLORER_HOST=0.0.0.0`
+- `FS_EXPLORER_PORT=8000`
+- `FS_EXPLORER_PYTHON_BIN=/opt/venv/bin/python`
+- `QDRANT_URL=http://qdrant:6333` when semantic retrieval is enabled
+
+### 2. Start Services
+
+Build and start the stack:
+
+```bash
+docker compose up -d --build
+```
+
+After startup:
+
+- app/API/UI: `http://127.0.0.1:8000`
+- health check: `http://127.0.0.1:8000/api/health`
+- qdrant: `http://127.0.0.1:6333`
+
+### 3. Persistent Data
+
+The provided `docker-compose.yml` keeps data in:
+
+- `./data` mounted to `/app/data` for SQLite blobs/pages/uploads
+- `qdrant_storage` Docker volume for Qdrant collections
+
+### 4. Stop / Upgrade
+
+Stop the stack:
+
+```bash
+docker compose down
+```
+
+Rebuild after code changes:
+
+```bash
+docker compose up -d --build
+```
+
+### 5. Notes
+
+- The Docker image installs LibreOffice because `.docx -> .pdf` conversion still depends on `soffice`.
+- The Docker image uses `opencv-python-headless` instead of desktop OpenCV packages.
+- If you only want keyword retrieval and agent retrieval, you can leave `QDRANT_URL` unset and remove the `qdrant` service from `docker-compose.yml`.
+- The service still runs the TypeScript server directly with `tsx`, so the image keeps the Node dependency tree rather than producing a precompiled JS artifact.
 
 ## Configuration
 
@@ -140,9 +265,10 @@ The Node rewrite now includes a decoupled document parsing runtime that calls Py
 Behavior:
 
 - `.pdf`: follows the legacy PDF parsing path
+- `.pdf`: prefers `pymupdf4llm.to_json(...)`, then reconstructs compatible page markdown from structured blocks
 - `.docx`: converts to PDF first, then follows the PDF parsing path
 - `.doc`, `.pptx`, `.xlsx`, `.html`, `.md`: stay aligned with the legacy parsing path
-- database writes and indexing-side storage sync are intentionally kept out of this runtime layer
+- parsed PDF blocks are exposed to the Node layer for structured chunk persistence
 
 ## Database
 
@@ -152,7 +278,8 @@ The Node rewrite now has its own SQLite storage backend.
 - Path resolution: `src/storage/resolve-db-path.ts`
 - Driver: `better-sqlite3`
 - Default database file: `data/agentic-file-search.sqlite`
-- Physical tables: `collections`, `collection_documents`, `documents`, `document_pages`, `image_semantics`
+- Physical tables: `collections`, `collection_documents`, `documents`, `document_pages`, `document_chunks`, `retrieval_chunks`, `image_semantics`, `image_semantic_cache`
+- Virtual tables: `retrieval_chunks_fts`
 
 The legacy `corpora` concept is still present logically, but it is no longer a physical table. Node stores the `root_path <-> corpus_id` mapping as hidden `corpus_scope` rows inside `collections`, while user-visible collections continue to behave like normal reusable document sets.
 
@@ -171,6 +298,9 @@ Implemented route groups:
 - `/api/documents`: upload, list, detail, metadata patch, delete, reparse, page listing
 - `/api/collections`: collection CRUD plus document attach/detach
 - `/api/search`: scoped page-manifest search
+- `/api/rag/query`: traditional RAG query endpoint
+- `/api/document-chunks/:chunkId/content`: chunk content endpoint T
+- `/api/assets/images/:imageHash`: image asset endpoint K
 - `/api/explore/sessions`: create/get/reply plus `/events` SSE stream
 
 Legacy folder indexing endpoints are present but return explicit `501` responses in phase 1.
@@ -198,6 +328,14 @@ The Node rewrite now includes the document library storage chain.
 
 Uploads preserve the legacy sequence: validate filename, store source blob, parse through the Python bridge, write page blobs, sync SQLite manifests, write image semantic placeholders, and update parse state.
 
+Uploads and reparses now also:
+
+- build `document_chunks`
+- build `retrieval_chunks`
+- update per-page `chunk_count`
+- populate SQLite FTS5
+- optionally write embeddings into per-document Qdrant collections
+
 ## Exploration Sessions
 
 The Node rewrite now includes an exploration session workflow exposed through HTTP/SSE.
@@ -217,7 +355,14 @@ The Node rewrite now includes the non-embedding page search path from the legacy
 
 This search path reads SQLite document/page manifests, loads page markdown from the blob store, applies the legacy query-term scoring/snippet rules, and returns ranked page hits. It also powers index-aware `glob`, `grep`, `read`, `list_indexed_documents`, and `get_document` behavior inside exploration sessions.
 
-Still intentionally out of scope: `semantic_search`, embeddings, lazy indexing, metadata extraction, and metadata filter parsing.
+Traditional RAG adds:
+
+- structured `document_chunks`
+- `retrieval_chunks` as the only embedding / BM25 source
+- SQLite FTS5 keyword retrieval
+- optional Qdrant semantic retrieval
+- hybrid retrieval with score weighting
+- chunk citations, page numbers, and bbox metadata in the response
 
 ## Node Phase 1 Skills
 
@@ -249,6 +394,7 @@ Use `list_indexed_documents` and `get_document` only when a `doc_id` or full doc
 - Parser bridge: [python](./python)
 - Frontend: [frontend](./frontend)
 - Env example: [.env.example](./.env.example)
+- Traditional RAG design: [docs/traditional-rag-design.md](./docs/traditional-rag-design.md)
 - Node checklist: [docs/revamp/NODE_PHASE1_CHECKLIST.md](./docs/revamp/NODE_PHASE1_CHECKLIST.md)
 - Legacy Python archive: [legacy/python](./legacy/python)
 - Legacy Python architecture: [legacy/python/ARCHITECTURE.md](./legacy/python/ARCHITECTURE.md)

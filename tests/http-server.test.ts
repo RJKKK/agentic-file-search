@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { once } from "node:events";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -22,6 +23,7 @@ class StaticParser implements PythonDocumentParserExecutor {
           heading: "Purchase Price",
           source_locator: "page-1",
           images: [],
+          blocks: [],
         },
       ],
     };
@@ -90,14 +92,15 @@ async function createAppFixture() {
   const root = await mkdtemp(join(tmpdir(), "afs-http-"));
   const storage = new SqliteStorage({ dbPath: join(root, "storage.sqlite") });
   storage.initialize();
+  const blobStore = new LocalBlobStore(join(root, "object-store"));
   const app = await createHttpServer({
     storage,
-    blobStore: new LocalBlobStore(join(root, "object-store")),
+    blobStore,
     parser: new StaticParser(),
     model: new StopModel(),
     skillsRoot: join(process.cwd(), "skills"),
   });
-  return { app, storage };
+  return { app, storage, blobStore };
 }
 
 describe("http server", () => {
@@ -286,6 +289,65 @@ describe("http server", () => {
       payload: { name: "Deals" },
     });
     assert.equal(recreated.statusCode, 201);
+    await app.close();
+    storage.close();
+  });
+
+  it("supports traditional rag answers plus chunk and image asset routes", async () => {
+    const { app, storage, blobStore } = await createAppFixture();
+    const upload = multipartBody({ filename: "alpha.pdf", content: "%PDF fake" });
+    const uploaded = await app.inject({
+      method: "POST",
+      url: "/api/documents",
+      headers: { "content-type": upload.contentType },
+      payload: upload.body,
+    });
+    const docId = uploaded.json().document.id as string;
+    const chunks = storage.listDocumentChunks(docId);
+    assert.equal(chunks.length, 1);
+
+    const rag = await app.inject({
+      method: "POST",
+      url: "/api/rag/query",
+      payload: {
+        question: "What is the purchase price?",
+        mode: "keyword",
+        document_ids: [docId],
+      },
+    });
+    assert.equal(rag.statusCode, 200);
+    assert.equal(rag.json().used_chunks[0].document_chunk_id, chunks[0]?.id);
+
+    const chunkContent = await app.inject({
+      method: "GET",
+      url: `/api/document-chunks/${chunks[0]?.id}/content`,
+    });
+    assert.equal(chunkContent.statusCode, 200);
+    assert.match(chunkContent.json().chunk.content_md, /purchase price/i);
+
+    await blobStore.put({
+      objectKey: "documents/alpha.pdf/images/img-1.png",
+      data: Buffer.from("png-bytes", "utf8"),
+    });
+    storage.upsertImageSemantics([
+      {
+        imageHash: "img-1",
+        sourceDocumentId: docId,
+        sourcePageNo: 1,
+        sourceImageIndex: 0,
+        mimeType: "image/png",
+        objectKey: "documents/alpha.pdf/images/img-1.png",
+        accessibleUrl: "/api/assets/images/img-1",
+      },
+    ]);
+    const image = await app.inject({
+      method: "GET",
+      url: "/api/assets/images/img-1",
+    });
+    assert.equal(image.statusCode, 200);
+    assert.equal(image.headers["content-type"], "image/png");
+    assert.equal(image.body, "png-bytes");
+
     await app.close();
     storage.close();
   });

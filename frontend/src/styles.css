@@ -118,6 +118,26 @@ body {
   gap: 8px;
 }
 
+.qa-mode-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.rag-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.rag-mode-select {
+  width: 180px;
+}
+
 .qa-workspace {
   min-height: 0;
 }
@@ -295,6 +315,18 @@ body {
   width: 160px;
 }
 
+.wide-progress {
+  width: 100%;
+  margin-top: 14px;
+}
+
+.upload-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-top: 16px;
+}
+
 .table-card {
   min-height: 0;
   border-radius: 8px;
@@ -355,6 +387,48 @@ body {
   margin-top: 0;
   color: #303133;
   line-height: 1.7;
+}
+
+.rag-citations {
+  display: grid;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.citation-card {
+  border: 1px solid #dcdfe6;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fafafa;
+}
+
+.citation-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 10px;
+  color: #606266;
+  font-size: 12px;
+}
+
+.citation-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.rag-warning {
+  margin-bottom: 12px;
+}
+
+.task-detail {
+  display: grid;
+  gap: 16px;
+}
+
+.task-error {
+  margin-top: 16px;
 }
 
 .wide-control {

@@ -5,6 +5,7 @@ Reference: legacy/python/src/fs_explorer/fs.py
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import io
 import json
@@ -25,12 +26,15 @@ _IMPORT_STDOUT = io.StringIO()
 with contextlib.redirect_stdout(_IMPORT_STDOUT):
     from document_parsing import (  # noqa: E402
         DocumentParseError,
+        ParsedBlock,
         ParsedDocument,
         ParsedImage,
         ParsedUnit,
         _coerce_selector,
         _convert_doc_to_docx,
+        extract_pdf_images_payload,
         _html_to_markdown,
+        inspect_image_bytes,
         _parse_pdf,
         _parse_with_docling,
         _read_text_file,
@@ -50,6 +54,20 @@ def _serialize_image(image: ParsedImage) -> dict[str, Any]:
         "mime_type": image.mime_type,
         "width": image.width,
         "height": image.height,
+        "bbox": list(image.bbox) if image.bbox is not None else None,
+        "placeholder": image.placeholder,
+    }
+
+
+def _serialize_block(block: ParsedBlock) -> dict[str, Any]:
+    return {
+        "index": int(block.index),
+        "block_type": str(block.block_type),
+        "bbox": list(block.bbox),
+        "markdown": str(block.markdown),
+        "char_count": int(block.char_count),
+        "image_hash": block.image_hash,
+        "source_image_index": block.source_image_index,
     }
 
 
@@ -61,6 +79,7 @@ def _serialize_unit(unit: ParsedUnit) -> dict[str, Any]:
         "heading": unit.heading,
         "source_locator": unit.source_locator,
         "images": [_serialize_image(image) for image in unit.images],
+        "blocks": [_serialize_block(block) for block in unit.blocks],
     }
 
 
@@ -168,20 +187,45 @@ def main() -> int:
     try:
         payload = json.loads(raw or "{}")
         operation = str(payload.get("operation") or "").strip()
-        if operation != "parse_document":
-            raise ValueError(f"Unsupported operation: {operation or '<empty>'}")
-        file_path = str(payload.get("file_path") or "").strip()
-        selector = payload.get("selector")
-        if not file_path:
-            raise ValueError("file_path is required")
-        parser_stdout = io.StringIO()
-        with contextlib.redirect_stdout(parser_stdout):
-            document = _parse_document_for_bridge(file_path, selector if isinstance(selector, dict) else None)
-        parser_logs = parser_stdout.getvalue()
-        if parser_logs:
-            sys.stderr.write(parser_logs)
-        sys.stdout.write(json.dumps({"ok": True, "document": _serialize_document(document)}))
-        return 0
+        if operation == "parse_document":
+            file_path = str(payload.get("file_path") or "").strip()
+            selector = payload.get("selector")
+            if not file_path:
+                raise ValueError("file_path is required")
+            parser_stdout = io.StringIO()
+            with contextlib.redirect_stdout(parser_stdout):
+                document = _parse_document_for_bridge(file_path, selector if isinstance(selector, dict) else None)
+            parser_logs = parser_stdout.getvalue()
+            if parser_logs:
+                sys.stderr.write(parser_logs)
+            sys.stdout.write(json.dumps({"ok": True, "document": _serialize_document(document)}))
+            return 0
+        if operation == "extract_pdf_images":
+            file_path = str(payload.get("file_path") or "").strip()
+            raw_page_nos = payload.get("page_nos")
+            page_nos = [int(value) for value in raw_page_nos] if isinstance(raw_page_nos, list) else None
+            if not file_path:
+                raise ValueError("file_path is required")
+            parser_stdout = io.StringIO()
+            with contextlib.redirect_stdout(parser_stdout):
+                images = extract_pdf_images_payload(file_path, page_nos=page_nos)
+            parser_logs = parser_stdout.getvalue()
+            if parser_logs:
+                sys.stderr.write(parser_logs)
+            sys.stdout.write(json.dumps({"ok": True, "images": images}))
+            return 0
+        if operation == "inspect_image":
+            encoded = str(payload.get("bytes_base64") or "").strip()
+            if not encoded:
+                raise ValueError("bytes_base64 is required")
+            mime_type = str(payload.get("mime_type") or "").strip() or None
+            result = inspect_image_bytes(
+                image_bytes=base64.b64decode(encoded),
+                mime_type=mime_type,
+            )
+            sys.stdout.write(json.dumps({"ok": True, "result": result}))
+            return 0
+        raise ValueError(f"Unsupported operation: {operation or '<empty>'}")
     except DocumentParseError as exc:
         sys.stdout.write(
             json.dumps(

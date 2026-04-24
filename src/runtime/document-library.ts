@@ -4,8 +4,19 @@ Reference: legacy/python/src/fs_explorer/server.py
 */
 
 import type { DocumentCatalog, DocumentRecord, DocumentSummary } from "../types/skills.js";
-import type { BlobStore, DocumentScope, DocumentSummaryPayload } from "../types/library.js";
-import type { PublicCollectionRecord, SqliteStorageBackend, StoredDocument } from "../types/storage.js";
+import type {
+  BlobStore,
+  DocumentParseTaskPayload,
+  DocumentScope,
+  DocumentSummaryPayload,
+} from "../types/library.js";
+import type {
+  DocumentParseStageTiming,
+  PublicCollectionRecord,
+  SqliteStorageBackend,
+  StoredDocument,
+  StoredDocumentParseTask,
+} from "../types/storage.js";
 import { loadDocumentPages, resolvePagesDirectory } from "./document-pages.js";
 import { buildDocumentPagesPrefix, buildDocumentSourceKey, validateStorageFilename } from "./page-store.js";
 
@@ -157,10 +168,45 @@ export function serializeDocumentSummary(
     content_sha256: document.content_sha256 || "",
     parsed_content_sha256: document.parsed_content_sha256,
     parsed_is_complete: document.parsed_is_complete,
+    embedding_enabled: document.embedding_enabled,
+    has_embeddings: document.has_embeddings,
+    image_semantic_enabled: document.image_semantic_enabled,
     is_deleted: document.is_deleted,
     status,
     metadata,
     last_indexed_at: document.last_indexed_at,
+  };
+}
+
+export function serializeDocumentParseTask(task: StoredDocumentParseTask): DocumentParseTaskPayload {
+  let options: Record<string, unknown> = {};
+  let stageTimings: DocumentParseStageTiming[] = [];
+  try {
+    options = JSON.parse(task.options_json || "{}") as Record<string, unknown>;
+  } catch {
+    options = {};
+  }
+  try {
+    stageTimings = JSON.parse(task.stage_timings_json || "[]") as DocumentParseStageTiming[];
+  } catch {
+    stageTimings = [];
+  }
+  return {
+    id: task.id,
+    document_id: task.document_id,
+    document_filename: task.document_filename,
+    task_type: task.task_type,
+    status: task.status,
+    progress_percent: task.progress_percent,
+    current_stage: task.current_stage,
+    options,
+    stage_timings: stageTimings,
+    error_message: task.error_message,
+    created_at: task.created_at,
+    started_at: task.started_at,
+    finished_at: task.finished_at,
+    updated_at: task.updated_at,
+    total_duration_ms: task.total_duration_ms,
   };
 }
 

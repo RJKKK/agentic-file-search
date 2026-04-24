@@ -9,6 +9,7 @@ import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join } from "node:path";
 
+import { LocalBlobStore } from "./blob-store.js";
 import type { PythonDocumentParserExecutor } from "./document-parsing.js";
 import { PythonDocumentParserBridge } from "./document-parsing.js";
 import {
@@ -16,34 +17,168 @@ import {
   buildDocumentPagesKeyPrefix,
   createLibraryDocumentCatalog,
   ensureLibraryCorpus,
-  getLibraryCorpusId,
   materializeDocument,
+  serializeDocumentParseTask,
   serializeDocumentSummary,
 } from "./document-library.js";
-import { loadDocumentPages, pageRecordFromManifest } from "./document-pages.js";
-import { LocalBlobStore } from "./blob-store.js";
+import { pageRecordFromManifest } from "./document-pages.js";
 import { persistDocumentPages, validateStorageFilename } from "./page-store.js";
+import { type ImageChunkRendering, TraditionalRagService } from "./traditional-rag.js";
 import type {
   BlobStore,
   DeleteDocumentResult,
+  DocumentParseTaskPayload,
   ReparseDocumentResult,
   UploadDocumentInput,
   UploadDocumentResult,
 } from "../types/library.js";
 import type { ParsedDocument } from "../types/parsing.js";
 import type {
+  DocumentParseStageTiming,
+  DocumentParseTaskType,
   SqliteStorageBackend,
+  StorageDocumentChunkRecord,
   StorageDocumentRecord,
-  StorageImageSemanticRecord,
+  StorageRetrievalChunkRecord,
   StoredDocument,
+  StoredDocumentParseTask,
 } from "../types/storage.js";
+
+type UploadParseOptions = {
+  enable_embedding: boolean;
+  enable_image_semantic: boolean;
+};
+
+type ReparseOptions = UploadParseOptions & {
+  force: boolean;
+};
+
+type EmbedOnlyOptions = {
+  enable_embedding: true;
+};
+
+type TaskOptions = UploadParseOptions | ReparseOptions | EmbedOnlyOptions;
+
+type QueuedTask =
+  | {
+      taskId: string;
+      taskType: "upload_parse";
+      documentId: string;
+      filename: string;
+      sourceHash: string;
+      filePath: string;
+      options: UploadParseOptions;
+    }
+  | {
+      taskId: string;
+      taskType: "reparse";
+      documentId: string;
+      options: ReparseOptions;
+    }
+  | {
+      taskId: string;
+      taskType: "embed_only";
+      documentId: string;
+      options: EmbedOnlyOptions;
+    };
+
+const TASK_STAGE_SEQUENCES: Record<DocumentParseTaskType, string[]> = {
+  upload_parse: [
+    "store_source",
+    "parse_document",
+    "persist_pages",
+    "build_document_chunks",
+    "process_images",
+    "build_retrieval_chunks",
+    "build_embeddings",
+    "finalize",
+  ],
+  reparse: [
+    "parse_document",
+    "persist_pages",
+    "build_document_chunks",
+    "process_images",
+    "build_retrieval_chunks",
+    "build_embeddings",
+    "finalize",
+  ],
+  embed_only: ["load_retrieval_chunks", "build_embeddings", "finalize"],
+};
+
+const TASK_STAGE_LABELS: Record<string, string> = {
+  store_source: "Store source",
+  parse_document: "Parse document",
+  persist_pages: "Persist pages",
+  build_document_chunks: "Build document chunks",
+  process_images: "Process images",
+  build_retrieval_chunks: "Build retrieval chunks",
+  build_embeddings: "Build embeddings",
+  load_retrieval_chunks: "Load retrieval chunks",
+  finalize: "Finalize",
+};
 
 function randomDocumentId(): string {
   return randomBytes(16).toString("hex");
 }
 
+function randomTaskId(): string {
+  return `task_${randomBytes(16).toString("hex")}`;
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
 function computeBufferSha256(data: Uint8Array): string {
   return createHash("sha256").update(data).digest("hex");
+}
+
+function parseTaskOptions(task: StoredDocumentParseTask): TaskOptions {
+  try {
+    return JSON.parse(task.options_json || "{}") as TaskOptions;
+  } catch {
+    return {} as TaskOptions;
+  }
+}
+
+function parseStageTimings(task: StoredDocumentParseTask): DocumentParseStageTiming[] {
+  try {
+    const parsed = JSON.parse(task.stage_timings_json || "[]") as DocumentParseStageTiming[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function buildStageTimings(taskType: DocumentParseTaskType): DocumentParseStageTiming[] {
+  return TASK_STAGE_SEQUENCES[taskType].map((stage) => ({
+    stage,
+    label: TASK_STAGE_LABELS[stage] ?? stage,
+    status: "pending",
+    started_at: null,
+    finished_at: null,
+    duration_ms: null,
+  }));
+}
+
+function computeProgress(stageTimings: DocumentParseStageTiming[]): number {
+  if (stageTimings.length === 0) {
+    return 0;
+  }
+  const done = stageTimings.filter((item) => ["completed", "skipped", "failed"].includes(item.status)).length;
+  return Math.max(0, Math.min(100, Math.round((done / stageTimings.length) * 100)));
+}
+
+function diffMs(startedAt: string | null, finishedAt: string | null): number | null {
+  if (!startedAt || !finishedAt) {
+    return null;
+  }
+  const start = Date.parse(startedAt);
+  const end = Date.parse(finishedAt);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) {
+    return null;
+  }
+  return Math.max(0, end - start);
 }
 
 async function parseDocumentFromBytes(input: {
@@ -63,29 +198,28 @@ async function parseDocumentFromBytes(input: {
   }
 }
 
-function imageRecordsFromParsedDocument(
-  documentId: string,
-  parsedDocument: ParsedDocument,
-): StorageImageSemanticRecord[] {
-  return parsedDocument.units.flatMap((unit) =>
-    unit.images.map((image) => ({
-      imageHash: image.image_hash,
-      sourceDocumentId: documentId,
-      sourcePageNo: unit.unit_no,
-      sourceImageIndex: image.image_index,
-      mimeType: image.mime_type ?? null,
-      width: image.width ?? null,
-      height: image.height ?? null,
-    })),
-  );
+function pageChunkCounts(documentChunks: StorageDocumentChunkRecord[]): Map<number, number> {
+  const counts = new Map<number, number>();
+  for (const chunk of documentChunks) {
+    counts.set(chunk.pageNo, (counts.get(chunk.pageNo) ?? 0) + 1);
+  }
+  return counts;
 }
 
 export class DocumentLibraryService {
+  private readonly traditionalRag: TraditionalRagService;
+
+  private readonly pendingTasks: QueuedTask[] = [];
+
+  private drainingQueue = false;
+
   constructor(
     readonly storage: SqliteStorageBackend,
     readonly blobStore: BlobStore = new LocalBlobStore(),
     private readonly parser: PythonDocumentParserExecutor = new PythonDocumentParserBridge(),
-  ) {}
+  ) {
+    this.traditionalRag = new TraditionalRagService(storage, blobStore);
+  }
 
   createDocumentCatalog() {
     return createLibraryDocumentCatalog({
@@ -94,96 +228,139 @@ export class DocumentLibraryService {
     });
   }
 
+  async cleanupInFlightTasks(): Promise<number> {
+    const queued = this.storage.listDocumentParseTasks({ status: "queued", limit: 10_000, offset: 0 }).items;
+    const running = this.storage.listDocumentParseTasks({ status: "running", limit: 10_000, offset: 0 }).items;
+    const tasks = [...queued, ...running];
+    for (const task of tasks) {
+      if (task.document_id) {
+        await this.cleanupDocumentArtifacts(task.document_id, { preserveSource: true });
+        this.storage.updateDocumentUploadStatus(task.document_id, "failed");
+        this.storage.updateDocumentFeatureFlags(task.document_id, { hasEmbeddings: false });
+      }
+    }
+    return this.storage.deleteActiveDocumentParseTasks();
+  }
+
+  listDocumentParseTasks(input: {
+    status?: string | null;
+    taskType?: string | null;
+    documentId?: string | null;
+    page?: number;
+    pageSize?: number;
+  }): { items: DocumentParseTaskPayload[]; total: number } {
+    const page = Math.max(Number(input.page ?? 1), 1);
+    const pageSize = Math.max(Number(input.pageSize ?? 20), 1);
+    const result = this.storage.listDocumentParseTasks({
+      status: (input.status as "queued" | "running" | "completed" | "failed" | null) ?? null,
+      taskType: (input.taskType as DocumentParseTaskType | null) ?? null,
+      documentId: input.documentId ?? null,
+      limit: pageSize,
+      offset: (page - 1) * pageSize,
+    });
+    return {
+      items: result.items.map((task) => serializeDocumentParseTask(task)),
+      total: result.total,
+    };
+  }
+
+  getDocumentParseTask(taskId: string): DocumentParseTaskPayload | null {
+    const task = this.storage.getDocumentParseTask(taskId);
+    return task ? serializeDocumentParseTask(task) : null;
+  }
+
+  deleteDocumentParseTask(taskId: string): boolean {
+    const task = this.requireTask(taskId);
+    if (!["completed", "failed"].includes(task.status)) {
+      throw new Error("Only completed or failed tasks can be deleted.");
+    }
+    return this.storage.deleteDocumentParseTask(taskId);
+  }
+
   async uploadDocument(input: UploadDocumentInput): Promise<UploadDocumentResult> {
     const filename = validateStorageFilename(input.filename || "");
     const corpusId = ensureLibraryCorpus(this.storage);
     const existing = this.storage.listDocuments(corpusId, false);
     const normalizedFilename = filename.toLowerCase();
-    if (
-      existing.some(
-        (item) => String(item.original_filename || "").toLowerCase() === normalizedFilename,
-      )
-    ) {
+    if (existing.some((item) => String(item.original_filename || "").toLowerCase() === normalizedFilename)) {
       throw new Error("A document with the same filename already exists.");
     }
 
     const docId = randomDocumentId();
+    const taskId = randomTaskId();
     const sourceObjectKey = buildDocumentObjectKey(docId, filename);
     const pagesPrefix = buildDocumentPagesKeyPrefix(filename);
-    let storedSource = false;
-    let storedPages = false;
+    const taskOptions: UploadParseOptions = {
+      enable_embedding: input.enableEmbedding !== false,
+      enable_image_semantic: input.enableImageSemantic !== false,
+    };
+    const stageTimings = buildStageTimings("upload_parse");
+    this.storage.createDocumentParseTask({
+      id: taskId,
+      documentId: null,
+      documentFilename: filename,
+      taskType: "upload_parse",
+      status: "queued",
+      progressPercent: 0,
+      currentStage: null,
+      optionsJson: JSON.stringify(taskOptions),
+      stageTimingsJson: JSON.stringify(stageTimings),
+    });
+
     try {
-      const blobHead = await this.blobStore.put({
-        objectKey: sourceObjectKey,
-        data: input.data,
-      });
-      storedSource = true;
+      const persistedBlobHead = await this.runTaskStage(taskId, stageTimings, "store_source", async () =>
+        this.blobStore.put({
+          objectKey: sourceObjectKey,
+          data: input.data,
+        }),
+      );
+      const fileInfo = await stat(persistedBlobHead.absolutePath);
       const sourceHash = computeBufferSha256(input.data);
-      // Parse from an ASCII temp path so Windows/Python can handle mojibake or surrogate filenames.
-      const parsedDocument = await parseDocumentFromBytes({
-        parser: this.parser,
-        documentId: docId,
-        filename,
-        data: input.data,
-      });
-      const pages = await persistDocumentPages({
-        blobStore: this.blobStore,
-        documentId: docId,
-        originalFilename: filename,
-        contentType: input.contentType ?? null,
-        parsedDocument,
-        syntheticPages: extname(filename).toLowerCase() !== ".pdf",
-      });
-      storedPages = true;
-      const fileInfo = await stat(blobHead.absolutePath);
       const documentRecord: StorageDocumentRecord = {
         id: docId,
         corpusId,
         relativePath: filename,
-        absolutePath: blobHead.absolutePath,
+        absolutePath: persistedBlobHead.absolutePath,
         content: "",
         metadataJson: "{}",
         fileMtime: Number(fileInfo.mtimeMs / 1000),
-        fileSize: Number(blobHead.size),
+        fileSize: Number(persistedBlobHead.size),
         contentSha256: sourceHash,
         originalFilename: filename,
         objectKey: sourceObjectKey,
         sourceObjectKey,
         pagesPrefix,
-        storageUri: blobHead.storageUri,
+        storageUri: persistedBlobHead.storageUri,
         contentType: input.contentType ?? null,
-        uploadStatus: "pages_ready",
-        pageCount: pages.length,
+        uploadStatus: "processing",
+        pageCount: 0,
+        parsedContentSha256: null,
+        parsedIsComplete: false,
+        embeddingEnabled: taskOptions.enable_embedding,
+        hasEmbeddings: false,
+        imageSemanticEnabled: taskOptions.enable_image_semantic,
       };
       this.storage.upsertDocumentStub(documentRecord);
-      this.storage.syncDocumentPages(
-        docId,
-        pages.map((page) => pageRecordFromManifest(page, { documentId: docId })),
-      );
-      this.storage.upsertImageSemantics(imageRecordsFromParsedDocument(docId, parsedDocument));
-      this.storage.updateDocumentParseState(docId, sourceHash, true);
-      const document = this.requireDocument(docId);
+      this.storage.updateDocumentParseTask(taskId, { documentId: docId });
+      this.enqueueTask({
+        taskId,
+        taskType: "upload_parse",
+        documentId: docId,
+        filename,
+        sourceHash,
+        filePath: persistedBlobHead.absolutePath,
+        options: taskOptions,
+      });
       return {
-        document: serializeDocumentSummary(document),
-        uploadResult: {
-          corpus_id: document.corpus_id,
-          storage_uri: String(document.storage_uri || ""),
-          pages_generated: pages.length,
-          page_count: pages.length,
-          page_naming_scheme: "page-0001.md",
-        },
+        document: serializeDocumentSummary(this.requireDocument(docId)),
+        task: serializeDocumentParseTask(this.requireTask(taskId)),
       };
     } catch (error) {
-      try {
-        if (storedPages) {
-          await this.blobStore.deletePrefix({ prefix: pagesPrefix });
-        }
-        if (storedSource) {
-          await this.blobStore.delete({ objectKey: sourceObjectKey });
-        }
-      } catch {
-        // Best-effort cleanup to mirror the legacy upload rollback path.
+      await this.blobStore.delete({ objectKey: sourceObjectKey }).catch(() => undefined);
+      if (this.storage.getDocument(docId)) {
+        this.storage.deleteDocument(docId);
       }
+      await this.failTask(taskId, stageTimings, null, error);
       throw error;
     }
   }
@@ -191,67 +368,69 @@ export class DocumentLibraryService {
   async reparseDocument(input: {
     docId: string;
     force?: boolean;
+    enableEmbedding?: boolean;
+    enableImageSemantic?: boolean;
   }): Promise<ReparseDocumentResult> {
     const document = this.requireDocument(input.docId);
-    const sourceObjectKey = String(document.source_object_key || document.object_key || "");
-    if (!sourceObjectKey) {
-      throw new Error("Document source object key is missing.");
-    }
-    const sourceData = await this.blobStore.get({ objectKey: sourceObjectKey });
-    const sourceHash = computeBufferSha256(sourceData);
-    if (
-      !input.force &&
-      String(document.parsed_content_sha256 || "") === sourceHash &&
-      Number(document.page_count || 0) > 0
-    ) {
-      const pages = await loadDocumentPages({
-        storage: this.storage,
-        blobStore: this.blobStore,
-        documentId: document.id,
-      });
-      return {
-        documentId: document.id,
-        pageCount: pages.length,
-        pagesUpdated: 0,
-        fromCache: true,
-        pages,
-        pageNamingScheme: "page-0001.md",
-      };
-    }
-
-    const parsedDocument = await parseDocumentFromBytes({
-      parser: this.parser,
+    const taskId = randomTaskId();
+    const options: ReparseOptions = {
+      force: input.force === true,
+      enable_embedding: input.enableEmbedding ?? document.embedding_enabled,
+      enable_image_semantic: input.enableImageSemantic ?? document.image_semantic_enabled,
+    };
+    this.storage.updateDocumentUploadStatus(document.id, "processing");
+    this.storage.createDocumentParseTask({
+      id: taskId,
       documentId: document.id,
-      filename: document.original_filename || document.relative_path || sourceObjectKey,
-      data: sourceData,
+      documentFilename: document.original_filename || document.relative_path,
+      taskType: "reparse",
+      status: "queued",
+      progressPercent: 0,
+      currentStage: null,
+      optionsJson: JSON.stringify(options),
+      stageTimingsJson: JSON.stringify(buildStageTimings("reparse")),
     });
-    const storedPages = await persistDocumentPages({
-      blobStore: this.blobStore,
+    this.enqueueTask({
+      taskId,
+      taskType: "reparse",
       documentId: document.id,
-      originalFilename: document.original_filename || document.relative_path,
-      contentType: document.content_type,
-      parsedDocument,
-      syntheticPages: extname(document.original_filename || document.relative_path).toLowerCase() !== ".pdf",
-    });
-    this.storage.syncDocumentPages(
-      document.id,
-      storedPages.map((page) => pageRecordFromManifest(page, { documentId: document.id })),
-    );
-    this.storage.upsertImageSemantics(imageRecordsFromParsedDocument(document.id, parsedDocument));
-    this.storage.updateDocumentParseState(document.id, sourceHash, true);
-    const pages = await loadDocumentPages({
-      storage: this.storage,
-      blobStore: this.blobStore,
-      documentId: document.id,
+      options,
     });
     return {
-      documentId: document.id,
-      pageCount: pages.length,
-      pagesUpdated: storedPages.length,
-      fromCache: false,
-      pages,
-      pageNamingScheme: "page-0001.md",
+      document: serializeDocumentSummary(this.requireDocument(document.id)),
+      task: serializeDocumentParseTask(this.requireTask(taskId)),
     };
+  }
+
+  async createEmbeddingTask(docId: string): Promise<DocumentParseTaskPayload> {
+    const document = this.requireDocument(docId);
+    if (document.upload_status !== "completed") {
+      throw new Error("Embedding can only be created for completed documents.");
+    }
+    this.storage.updateDocumentUploadStatus(docId, "processing");
+    this.storage.updateDocumentFeatureFlags(docId, {
+      embeddingEnabled: true,
+      hasEmbeddings: false,
+    });
+    const taskId = randomTaskId();
+    this.storage.createDocumentParseTask({
+      id: taskId,
+      documentId: docId,
+      documentFilename: document.original_filename || document.relative_path,
+      taskType: "embed_only",
+      status: "queued",
+      progressPercent: 0,
+      currentStage: null,
+      optionsJson: JSON.stringify({ enable_embedding: true } satisfies EmbedOnlyOptions),
+      stageTimingsJson: JSON.stringify(buildStageTimings("embed_only")),
+    });
+    this.enqueueTask({
+      taskId,
+      taskType: "embed_only",
+      documentId: docId,
+      options: { enable_embedding: true },
+    });
+    return serializeDocumentParseTask(this.requireTask(taskId));
   }
 
   async deleteDocument(input: { docId: string }): Promise<DeleteDocumentResult> {
@@ -260,9 +439,24 @@ export class DocumentLibraryService {
     if (pagesPrefix) {
       await this.blobStore.deletePrefix({ prefix: pagesPrefix }).catch(() => undefined);
     }
+    const imageRows = this.storage.listImageSemanticsForDocument(document.id);
+    for (const image of imageRows) {
+      if (image.object_key) {
+        await this.blobStore.delete({ objectKey: image.object_key }).catch(() => undefined);
+      }
+    }
     const sourceObjectKey = String(document.source_object_key || document.object_key || "");
     if (sourceObjectKey) {
       await this.blobStore.delete({ objectKey: sourceObjectKey }).catch(() => undefined);
+    }
+    await this.traditionalRag.deleteDocumentIndex(document.id);
+    const taskResult = this.storage.listDocumentParseTasks({
+      documentId: document.id,
+      limit: 10_000,
+      offset: 0,
+    });
+    for (const task of taskResult.items) {
+      this.storage.deleteDocumentParseTask(task.id);
     }
     const deletedDocument = this.storage.deleteDocument(document.id);
     if (!deletedDocument) {
@@ -284,6 +478,413 @@ export class DocumentLibraryService {
       blobStore: this.blobStore,
       document: this.requireDocument(docId),
     });
+  }
+
+  private enqueueTask(task: QueuedTask): void {
+    this.pendingTasks.push(task);
+    void this.drainTaskQueue();
+  }
+
+  private async drainTaskQueue(): Promise<void> {
+    if (this.drainingQueue) {
+      return;
+    }
+    this.drainingQueue = true;
+    try {
+      while (this.pendingTasks.length > 0) {
+        const task = this.pendingTasks.shift();
+        if (!task) {
+          continue;
+        }
+        await this.executeQueuedTask(task);
+      }
+    } finally {
+      this.drainingQueue = false;
+    }
+  }
+
+  private async executeQueuedTask(task: QueuedTask): Promise<void> {
+    const storedTask = this.requireTask(task.taskId);
+    const stageTimings = parseStageTimings(storedTask);
+    try {
+      if (task.taskType === "upload_parse") {
+        await this.executeUploadParseTask(task, stageTimings);
+      } else if (task.taskType === "reparse") {
+        await this.executeReparseTask(task, stageTimings);
+      } else {
+        await this.executeEmbedOnlyTask(task, stageTimings);
+      }
+      await this.completeTask(task.taskId, stageTimings);
+    } catch (error) {
+      if (task.documentId) {
+        this.storage.updateDocumentUploadStatus(task.documentId, "failed");
+        this.storage.updateDocumentFeatureFlags(task.documentId, { hasEmbeddings: false });
+      }
+      await this.failTask(task.taskId, stageTimings, null, error);
+      if (task.taskType === "upload_parse") {
+        await this.cleanupDocumentArtifacts(task.documentId, { preserveSource: true });
+      }
+    }
+  }
+
+  private async executeUploadParseTask(
+    task: Extract<QueuedTask, { taskType: "upload_parse" }>,
+    stageTimings: DocumentParseStageTiming[],
+  ): Promise<void> {
+    const document = this.requireDocument(task.documentId);
+    const parsedDocument = await this.runTaskStage(task.taskId, stageTimings, "parse_document", async () => {
+      const sourceBytes = await this.blobStore.get({ objectKey: document.source_object_key });
+      return parseDocumentFromBytes({
+        parser: this.parser,
+        documentId: document.id,
+        filename: task.filename,
+        data: sourceBytes,
+      });
+    });
+    const storedPages = await this.runTaskStage(task.taskId, stageTimings, "persist_pages", async () =>
+      persistDocumentPages({
+        blobStore: this.blobStore,
+        documentId: document.id,
+        originalFilename: task.filename,
+        contentType: document.content_type,
+        parsedDocument,
+        syntheticPages: extname(task.filename).toLowerCase() !== ".pdf",
+      }),
+    );
+    await this.finishIndexingPhases({
+      taskId: task.taskId,
+      stageTimings,
+      document,
+      parsedDocument,
+      storedPages,
+      sourceHash: task.sourceHash,
+      enableEmbedding: task.options.enable_embedding,
+      enableImageSemantic: task.options.enable_image_semantic,
+    });
+  }
+
+  private async executeReparseTask(
+    task: Extract<QueuedTask, { taskType: "reparse" }>,
+    stageTimings: DocumentParseStageTiming[],
+  ): Promise<void> {
+    const document = await this.materializeDocument(task.documentId);
+    const sourceObjectKey = String(document.source_object_key || document.object_key || "");
+    if (!sourceObjectKey) {
+      throw new Error("Document source object key is missing.");
+    }
+    const sourceBytes = await this.blobStore.get({ objectKey: sourceObjectKey });
+    const sourceHash = computeBufferSha256(sourceBytes);
+    const parsedDocument = await this.runTaskStage(task.taskId, stageTimings, "parse_document", async () =>
+      parseDocumentFromBytes({
+        parser: this.parser,
+        documentId: document.id,
+        filename: document.original_filename || document.relative_path || sourceObjectKey,
+        data: sourceBytes,
+      }),
+    );
+    const storedPages = await this.runTaskStage(task.taskId, stageTimings, "persist_pages", async () =>
+      persistDocumentPages({
+        blobStore: this.blobStore,
+        documentId: document.id,
+        originalFilename: document.original_filename || document.relative_path,
+        contentType: document.content_type,
+        parsedDocument,
+        syntheticPages: extname(document.original_filename || document.relative_path).toLowerCase() !== ".pdf",
+      }),
+    );
+    await this.finishIndexingPhases({
+      taskId: task.taskId,
+      stageTimings,
+      document,
+      parsedDocument,
+      storedPages,
+      sourceHash,
+      enableEmbedding: task.options.enable_embedding,
+      enableImageSemantic: task.options.enable_image_semantic,
+    });
+  }
+
+  private async executeEmbedOnlyTask(
+    task: Extract<QueuedTask, { taskType: "embed_only" }>,
+    stageTimings: DocumentParseStageTiming[],
+  ): Promise<void> {
+    const document = this.requireDocument(task.documentId);
+    const retrievalChunks = await this.runTaskStage(task.taskId, stageTimings, "load_retrieval_chunks", async () =>
+      this.storage.listRetrievalChunks(document.id).map((chunk) => ({
+        id: chunk.id,
+        chunkText: chunk.chunk_text,
+      })),
+    );
+    const embeddingsWritten = await this.runTaskStage(task.taskId, stageTimings, "build_embeddings", async () =>
+      this.traditionalRag.buildEmbeddingsForChunks(document.id, retrievalChunks),
+    );
+    await this.runTaskStage(task.taskId, stageTimings, "finalize", async () => {
+      this.storage.updateDocumentFeatureFlags(document.id, {
+        embeddingEnabled: true,
+        hasEmbeddings: embeddingsWritten > 0,
+      });
+      this.storage.updateDocumentUploadStatus(document.id, "completed");
+    });
+  }
+
+  private async finishIndexingPhases(input: {
+    taskId: string;
+    stageTimings: DocumentParseStageTiming[];
+    document: StoredDocument;
+    parsedDocument: ParsedDocument;
+    storedPages: Awaited<ReturnType<typeof persistDocumentPages>>;
+    sourceHash: string;
+    enableEmbedding: boolean;
+    enableImageSemantic: boolean;
+  }): Promise<void> {
+    let imageRenderMap: Map<string, ImageChunkRendering> | null = null;
+    if (input.enableImageSemantic) {
+      imageRenderMap = await this.runTaskStage(input.taskId, input.stageTimings, "process_images", async () =>
+        this.traditionalRag.renderImages({
+          documentId: input.document.id,
+          filePath: input.document.absolute_path,
+          originalFilename: input.document.original_filename || input.document.relative_path,
+          parsedDocument: input.parsedDocument,
+          enableImageSemantic: true,
+        }),
+      );
+    } else {
+      await this.skipTaskStage(input.taskId, input.stageTimings, "process_images");
+    }
+
+    const documentChunks = await this.runTaskStage(
+      input.taskId,
+      input.stageTimings,
+      "build_document_chunks",
+      async () =>
+        this.traditionalRag.createDocumentChunks({
+          documentId: input.document.id,
+          parsedDocument: input.parsedDocument,
+          imageRenderMap:
+            imageRenderMap ??
+            (await this.traditionalRag.renderImages({
+              documentId: input.document.id,
+              filePath: input.document.absolute_path,
+              originalFilename: input.document.original_filename || input.document.relative_path,
+              parsedDocument: input.parsedDocument,
+              enableImageSemantic: false,
+            })),
+        }),
+    );
+
+    const retrievalChunks = await this.runTaskStage(
+      input.taskId,
+      input.stageTimings,
+      "build_retrieval_chunks",
+      async () => {
+        const chunks = this.traditionalRag.createRetrievalChunks(input.document.id, documentChunks);
+        this.storage.replaceDocumentChunks(input.document.id, documentChunks);
+        this.storage.replaceRetrievalChunks(input.document.id, chunks);
+        const chunkCounts = pageChunkCounts(documentChunks);
+        this.storage.syncDocumentPages(
+          input.document.id,
+          input.storedPages.map((page) => ({
+            ...pageRecordFromManifest(page, { documentId: input.document.id }),
+            chunkCount: chunkCounts.get(page.pageNo) ?? 0,
+          })),
+        );
+        return chunks;
+      },
+    );
+
+    let embeddingsWritten = 0;
+    if (input.enableEmbedding) {
+      embeddingsWritten = await this.runTaskStage(
+        input.taskId,
+        input.stageTimings,
+        "build_embeddings",
+        async () => this.traditionalRag.buildEmbeddingsForChunks(input.document.id, retrievalChunks),
+      );
+    } else {
+      await this.traditionalRag.deleteDocumentIndex(input.document.id);
+      await this.skipTaskStage(input.taskId, input.stageTimings, "build_embeddings");
+    }
+
+    await this.runTaskStage(input.taskId, input.stageTimings, "finalize", async () => {
+      this.storage.updateDocumentParseState(input.document.id, input.sourceHash, true);
+      this.storage.updateDocumentFeatureFlags(input.document.id, {
+        embeddingEnabled: input.enableEmbedding,
+        hasEmbeddings: input.enableEmbedding && embeddingsWritten > 0,
+        imageSemanticEnabled: input.enableImageSemantic,
+      });
+      this.storage.updateDocumentUploadStatus(input.document.id, "completed");
+    });
+  }
+
+  private async runTaskStage<T>(
+    taskId: string,
+    stageTimings: DocumentParseStageTiming[],
+    stageName: string,
+    action: () => Promise<T>,
+  ): Promise<T> {
+    const stage = stageTimings.find((item) => item.stage === stageName);
+    if (!stage) {
+      throw new Error(`Unknown task stage: ${stageName}`);
+    }
+    const startedAt = nowIso();
+    stage.status = "running";
+    stage.started_at = startedAt;
+    stage.finished_at = null;
+    stage.duration_ms = null;
+    this.persistTaskProgress(taskId, stageTimings, {
+      status: "running",
+      currentStage: stageName,
+      startedAt,
+      errorMessage: null,
+    });
+    try {
+      const result = await action();
+      const finishedAt = nowIso();
+      stage.status = "completed";
+      stage.finished_at = finishedAt;
+      stage.duration_ms = diffMs(stage.started_at, finishedAt);
+      this.persistTaskProgress(taskId, stageTimings, {
+        status: "running",
+        currentStage: stageName,
+      });
+      return result;
+    } catch (error) {
+      const finishedAt = nowIso();
+      stage.status = "failed";
+      stage.finished_at = finishedAt;
+      stage.duration_ms = diffMs(stage.started_at, finishedAt);
+      this.persistTaskProgress(taskId, stageTimings, {
+        status: "failed",
+        currentStage: stageName,
+        finishedAt,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
+
+  private async skipTaskStage(
+    taskId: string,
+    stageTimings: DocumentParseStageTiming[],
+    stageName: string,
+  ): Promise<void> {
+    const stage = stageTimings.find((item) => item.stage === stageName);
+    if (!stage) {
+      return;
+    }
+    stage.status = "skipped";
+    stage.started_at = null;
+    stage.finished_at = nowIso();
+    stage.duration_ms = 0;
+    this.persistTaskProgress(taskId, stageTimings, {
+      status: "running",
+      currentStage: stageName,
+    });
+  }
+
+  private async completeTask(taskId: string, stageTimings: DocumentParseStageTiming[]): Promise<void> {
+    const task = this.requireTask(taskId);
+    const finishedAt = nowIso();
+    this.storage.updateDocumentParseTask(taskId, {
+      status: "completed",
+      progressPercent: 100,
+      currentStage: null,
+      stageTimingsJson: JSON.stringify(stageTimings),
+      errorMessage: null,
+      finishedAt,
+      totalDurationMs: diffMs(task.started_at, finishedAt),
+    });
+  }
+
+  private async failTask(
+    taskId: string,
+    stageTimings: DocumentParseStageTiming[],
+    stageName: string | null,
+    error: unknown,
+  ): Promise<void> {
+    if (stageName) {
+      const stage = stageTimings.find((item) => item.stage === stageName);
+      if (stage) {
+        stage.status = "failed";
+        stage.finished_at = nowIso();
+        stage.duration_ms = diffMs(stage.started_at, stage.finished_at);
+      }
+    }
+    const task = this.storage.getDocumentParseTask(taskId);
+    const finishedAt = nowIso();
+    this.storage.updateDocumentParseTask(taskId, {
+      status: "failed",
+      currentStage: stageName,
+      stageTimingsJson: JSON.stringify(stageTimings),
+      errorMessage: error instanceof Error ? error.message : String(error),
+      finishedAt,
+      startedAt: task?.started_at ?? nowIso(),
+      totalDurationMs: diffMs(task?.started_at ?? nowIso(), finishedAt),
+    });
+  }
+
+  private persistTaskProgress(
+    taskId: string,
+    stageTimings: DocumentParseStageTiming[],
+    input: {
+      status: "running" | "failed";
+      currentStage: string | null;
+      startedAt?: string | null;
+      finishedAt?: string | null;
+      errorMessage?: string | null;
+    },
+  ): void {
+    const existing = this.requireTask(taskId);
+    this.storage.updateDocumentParseTask(taskId, {
+      status: input.status,
+      progressPercent: input.status === "failed" ? computeProgress(stageTimings) : computeProgress(stageTimings),
+      currentStage: input.currentStage,
+      stageTimingsJson: JSON.stringify(stageTimings),
+      errorMessage: input.errorMessage ?? null,
+      startedAt: existing.started_at ?? input.startedAt ?? nowIso(),
+      finishedAt: input.finishedAt ?? null,
+      totalDurationMs:
+        input.finishedAt && (existing.started_at ?? input.startedAt)
+          ? diffMs(existing.started_at ?? input.startedAt ?? null, input.finishedAt)
+          : existing.total_duration_ms,
+    });
+  }
+
+  private async cleanupDocumentArtifacts(
+    docId: string,
+    input: { preserveSource: boolean },
+  ): Promise<void> {
+    const document = this.storage.getDocument(docId);
+    if (!document) {
+      return;
+    }
+    const images = this.storage.listImageSemanticsForDocument(docId);
+    for (const image of images) {
+      if (image.object_key) {
+        await this.blobStore.delete({ objectKey: image.object_key }).catch(() => undefined);
+      }
+    }
+    if (document.pages_prefix) {
+      await this.blobStore.deletePrefix({ prefix: document.pages_prefix }).catch(() => undefined);
+    }
+    if (!input.preserveSource && document.source_object_key) {
+      await this.blobStore.delete({ objectKey: document.source_object_key }).catch(() => undefined);
+    }
+    await this.traditionalRag.deleteDocumentIndex(docId);
+    this.storage.deleteImageSemanticsForDocument(docId);
+    this.storage.syncDocumentPages(docId, []);
+    this.storage.replaceRetrievalChunks(docId, []);
+    this.storage.replaceDocumentChunks(docId, []);
+    this.storage.updateDocumentParseState(docId, null, false);
+    this.storage.updateDocumentFeatureFlags(docId, { hasEmbeddings: false });
+  }
+
+  private requireTask(taskId: string): StoredDocumentParseTask {
+    const task = this.storage.getDocumentParseTask(taskId);
+    if (!task) {
+      throw new Error("Document parse task not found.");
+    }
+    return task;
   }
 
   private requireDocument(docId: string): StoredDocument {

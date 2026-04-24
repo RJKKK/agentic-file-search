@@ -8,6 +8,9 @@ Reference: legacy/python/src/fs_explorer/server.py
 
 import type { DocumentCatalog } from "./skills.js";
 import type {
+  DocumentParseTaskStatus,
+  DocumentParseTaskType,
+  DocumentParseStageTiming,
   PublicCollectionRecord,
   SqliteStorageBackend,
   StoredDocument,
@@ -50,6 +53,7 @@ export interface LoadedDocumentPage {
   source_locator: string | null;
   content_hash: string;
   char_count: number;
+  chunk_count?: number;
   is_synthetic_page: boolean;
   page_label: string;
   markdown: string;
@@ -69,6 +73,8 @@ export interface UploadDocumentInput {
   filename: string;
   data: Uint8Array;
   contentType?: string | null;
+  enableEmbedding?: boolean;
+  enableImageSemantic?: boolean;
 }
 
 export interface DocumentSummaryPayload {
@@ -89,30 +95,41 @@ export interface DocumentSummaryPayload {
   content_sha256: string;
   parsed_content_sha256: string | null;
   parsed_is_complete: boolean;
+  embedding_enabled: boolean;
+  has_embeddings: boolean;
+  image_semantic_enabled: boolean;
   is_deleted: boolean;
   status: string;
   metadata: Record<string, unknown>;
   last_indexed_at?: string;
 }
 
+export interface DocumentParseTaskPayload {
+  id: string;
+  document_id: string | null;
+  document_filename: string;
+  task_type: DocumentParseTaskType;
+  status: DocumentParseTaskStatus;
+  progress_percent: number;
+  current_stage: string | null;
+  options: Record<string, unknown>;
+  stage_timings: DocumentParseStageTiming[];
+  error_message: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  updated_at: string;
+  total_duration_ms: number | null;
+}
+
 export interface UploadDocumentResult {
   document: DocumentSummaryPayload;
-  uploadResult: {
-    corpus_id: string;
-    storage_uri: string;
-    pages_generated: number;
-    page_count: number;
-    page_naming_scheme: string;
-  };
+  task: DocumentParseTaskPayload;
 }
 
 export interface ReparseDocumentResult {
-  documentId: string;
-  pageCount: number;
-  pagesUpdated: number;
-  fromCache: boolean;
-  pages: LoadedDocumentPage[];
-  pageNamingScheme: string;
+  document: DocumentSummaryPayload;
+  task: DocumentParseTaskPayload;
 }
 
 export interface DeleteDocumentResult {

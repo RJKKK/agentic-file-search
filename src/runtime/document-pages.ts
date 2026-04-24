@@ -31,6 +31,12 @@ export function pageRecordFromManifest(
     sourceLocator: "sourceLocator" in item ? item.sourceLocator ?? null : item.source_locator ?? null,
     contentHash: "contentHash" in item ? item.contentHash : item.content_hash,
     charCount: "charCount" in item ? item.charCount : item.char_count,
+    chunkCount:
+      "chunkCount" in item
+        ? Number(item.chunkCount ?? 0)
+        : "chunk_count" in item
+          ? Number(item.chunk_count ?? 0)
+          : 0,
     isSyntheticPage:
       "isSyntheticPage" in item ? item.isSyntheticPage : item.is_synthetic_page,
   };
@@ -64,6 +70,7 @@ export async function readPageContent(input: {
     source_locator: input.page.source_locator ?? header.source_locator ?? null,
     content_hash: input.page.content_hash,
     char_count: input.page.char_count || body.length,
+    chunk_count: input.page.chunk_count || 0,
     is_synthetic_page: input.page.is_synthetic_page,
     page_label: header.page_label ?? String(input.page.page_no),
     markdown: body,

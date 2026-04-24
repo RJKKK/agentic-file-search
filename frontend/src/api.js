@@ -53,6 +53,9 @@ export function uploadWithProgress(url, formData, onProgress) {
 
 export function documentStatusType(status) {
   if (status === "deleted") return "danger";
+  if (status === "failed") return "danger";
+  if (status === "processing") return "warning";
+  if (status === "queued") return "info";
   if (["pages_ready", "indexed", "completed"].includes(status)) return "success";
   if (status === "uploaded") return "warning";
   return "info";
@@ -69,6 +72,16 @@ export function formatTime(value) {
   const timestamp = Number(value || 0);
   if (!timestamp) return "-";
   return new Date(timestamp * 1000).toLocaleString();
+}
+
+export function formatDuration(value) {
+  const duration = Number(value ?? 0);
+  if (!Number.isFinite(duration) || duration < 0) return "-";
+  if (duration < 1000) return `${duration} ms`;
+  if (duration < 60_000) return `${(duration / 1000).toFixed(1)} s`;
+  const minutes = Math.floor(duration / 60_000);
+  const seconds = Math.round((duration % 60_000) / 1000);
+  return `${minutes}m ${seconds}s`;
 }
 
 export function shortText(value, maxLength = 48) {

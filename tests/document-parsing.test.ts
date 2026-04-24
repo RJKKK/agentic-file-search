@@ -36,6 +36,7 @@ function buildDocument(): ParsedDocument {
         heading: "Overview",
         source_locator: "unit-1",
         images: [],
+        blocks: [],
       },
       {
         unit_no: 2,
@@ -44,6 +45,7 @@ function buildDocument(): ParsedDocument {
         heading: "Purchase Price",
         source_locator: "unit-2",
         images: [],
+        blocks: [],
       },
       {
         unit_no: 3,
@@ -52,6 +54,7 @@ function buildDocument(): ParsedDocument {
         heading: "Adjustments",
         source_locator: "unit-3",
         images: [],
+        blocks: [],
       },
     ],
   };
@@ -101,6 +104,69 @@ function runPythonTableNormalization(markdown: string): string | null {
   }
   assert.equal(completed.status, 0, completed.stderr || completed.stdout || "python normalization failed");
   return (JSON.parse(completed.stdout) as { text: string }).text;
+}
+
+function runPythonPdfLayoutProbe(pdfPath: string): {
+  unit_count: number;
+  block_count: number;
+  non_zero_bbox_count: number;
+  first_block_types: string[];
+} | null {
+  const pythonExecutable = configuredPythonExecutable();
+  const pythonEnv = {
+    ...process.env,
+    PYTHONUTF8: "1",
+    PYTHONIOENCODING: "utf-8",
+  };
+  const probe = spawnSync(pythonExecutable, ["-c", "print('ok')"], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: pythonEnv,
+  });
+  if (probe.error || probe.status !== 0) {
+    return null;
+  }
+  const script = [
+    "import json",
+    "import sys",
+    "from pathlib import Path",
+    "import pymupdf.layout",
+    "sys.path.insert(0, str(Path.cwd()))",
+    "from python.document_parsing import _parse_pdf",
+    "parsed = _parse_pdf(sys.argv[1])",
+    "first = parsed.units[0]",
+    "payload = {",
+    "  'unit_count': len(parsed.units),",
+    "  'block_count': len(first.blocks),",
+    "  'non_zero_bbox_count': sum(1 for block in first.blocks if tuple(block.bbox) != (0.0, 0.0, 0.0, 0.0)),",
+    "  'first_block_types': [block.block_type for block in first.blocks[:8]],",
+    "}",
+    "print(json.dumps(payload, ensure_ascii=False))",
+  ].join("\n");
+  const completed = spawnSync(pythonExecutable, ["-c", script, pdfPath], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: pythonEnv,
+  });
+  if (completed.error) {
+    throw completed.error;
+  }
+  if (completed.status !== 0) {
+    return null;
+  }
+  const lines = completed.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const jsonLine = lines[lines.length - 1];
+  return jsonLine
+    ? (JSON.parse(jsonLine) as {
+        unit_count: number;
+        block_count: number;
+        non_zero_bbox_count: number;
+        first_block_types: string[];
+      })
+    : null;
 }
 
 describe("document parsing runtime", () => {
@@ -221,5 +287,20 @@ describe("document parsing runtime", () => {
 
     const plainText = runPythonTableNormalization("普通段落\n\n不是表格");
     assert.equal(plainText, "普通段落\n\n不是表格");
+  });
+
+  it("reconstructs structured PDF blocks with non-zero bbox values from pymupdf4llm JSON", (t) => {
+    const result = runPythonPdfLayoutProbe(
+      resolve(process.cwd(), "data", "large_acquisition", "01_master_agreement.pdf"),
+    );
+    if (result == null) {
+      t.skip("Python layout parser is not available for structured PDF block checks.");
+      return;
+    }
+
+    assert.equal(result.unit_count > 0, true);
+    assert.equal(result.block_count > 1, true);
+    assert.equal(result.non_zero_bbox_count, result.block_count);
+    assert.deepEqual(result.first_block_types.slice(0, 4), ["section-header", "text", "section-header", "text"]);
   });
 });

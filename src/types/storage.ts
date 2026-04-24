@@ -27,6 +27,9 @@ export interface StorageDocumentRecord {
   pageCount?: number;
   parsedContentSha256?: string | null;
   parsedIsComplete?: boolean;
+  embeddingEnabled?: boolean;
+  hasEmbeddings?: boolean;
+  imageSemanticEnabled?: boolean;
 }
 
 export interface StoredDocument {
@@ -49,6 +52,9 @@ export interface StoredDocument {
   content_sha256: string;
   parsed_content_sha256: string | null;
   parsed_is_complete: boolean;
+  embedding_enabled: boolean;
+  has_embeddings: boolean;
+  image_semantic_enabled: boolean;
   last_indexed_at: string;
   is_deleted: boolean;
 }
@@ -78,6 +84,7 @@ export interface StoredDocumentPage {
   object_key: string;
   content_hash: string;
   char_count: number;
+  chunk_count: number;
   is_synthetic_page: boolean;
   heading: string | null;
   source_locator: string | null;
@@ -89,6 +96,7 @@ export interface StorageDocumentPageRecord {
   objectKey: string;
   contentHash: string;
   charCount: number;
+  chunkCount?: number;
   isSyntheticPage: boolean;
   heading?: string | null;
   sourceLocator?: string | null;
@@ -102,6 +110,14 @@ export interface StoredImageSemantic {
   mime_type: string | null;
   width: number | null;
   height: number | null;
+  bbox_json: string | null;
+  object_key: string | null;
+  storage_uri: string | null;
+  has_text: boolean | null;
+  interference_score: number | null;
+  is_dropped: boolean;
+  recognizable: boolean | null;
+  accessible_url: string | null;
   semantic_text: string | null;
   semantic_model: string | null;
 }
@@ -114,7 +130,157 @@ export interface StorageImageSemanticRecord {
   mimeType?: string | null;
   width?: number | null;
   height?: number | null;
+  bboxJson?: string | null;
+  objectKey?: string | null;
+  storageUri?: string | null;
+  hasText?: boolean | null;
+  interferenceScore?: number | null;
+  isDropped?: boolean;
+  recognizable?: boolean | null;
+  accessibleUrl?: string | null;
   semanticText?: string | null;
+  semanticModel?: string | null;
+}
+
+export type DocumentChunkSizeClass = "small" | "normal" | "oversized";
+
+export interface StoredDocumentChunk {
+  id: string;
+  document_id: string;
+  page_no: number;
+  document_index: number;
+  page_index: number;
+  block_type: string;
+  bbox_json: string;
+  content_md: string;
+  size_class: DocumentChunkSizeClass;
+  summary_text: string | null;
+  merged_page_nos_json: string;
+  merged_bboxes_json: string;
+}
+
+export interface StorageDocumentChunkRecord {
+  id: string;
+  documentId: string;
+  pageNo: number;
+  documentIndex: number;
+  pageIndex: number;
+  blockType: string;
+  bboxJson: string;
+  contentMd: string;
+  sizeClass: DocumentChunkSizeClass;
+  summaryText?: string | null;
+  mergedPageNosJson?: string;
+  mergedBboxesJson?: string;
+}
+
+export interface StoredRetrievalChunk {
+  id: string;
+  document_id: string;
+  source_document_chunk_id: string;
+  ordinal: number;
+  chunk_text: string;
+  size_class: DocumentChunkSizeClass;
+  is_split_from_oversized: boolean;
+}
+
+export interface StorageRetrievalChunkRecord {
+  id: string;
+  documentId: string;
+  sourceDocumentChunkId: string;
+  ordinal: number;
+  chunkText: string;
+  sizeClass: DocumentChunkSizeClass;
+  isSplitFromOversized?: boolean;
+}
+
+export interface StoredImageSemanticCache {
+  image_hash: string;
+  prompt_version: string;
+  recognizable: boolean;
+  image_kind: string | null;
+  contains_text: boolean | null;
+  visible_text: string | null;
+  summary: string | null;
+  entities_json: string;
+  keywords_json: string;
+  qa_hints_json: string;
+  drop_reason: string | null;
+  semantic_model: string | null;
+}
+
+export type DocumentParseTaskType = "upload_parse" | "reparse" | "embed_only";
+export type DocumentParseTaskStatus = "queued" | "running" | "completed" | "failed";
+export type DocumentParseStageStatus = "pending" | "running" | "completed" | "skipped" | "failed";
+
+export interface DocumentParseStageTiming {
+  stage: string;
+  label: string;
+  status: DocumentParseStageStatus;
+  started_at: string | null;
+  finished_at: string | null;
+  duration_ms: number | null;
+}
+
+export interface StoredDocumentParseTask {
+  id: string;
+  document_id: string | null;
+  document_filename: string;
+  task_type: DocumentParseTaskType;
+  status: DocumentParseTaskStatus;
+  progress_percent: number;
+  current_stage: string | null;
+  options_json: string;
+  stage_timings_json: string;
+  error_message: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  updated_at: string;
+  total_duration_ms: number | null;
+}
+
+export interface StorageDocumentParseTaskRecord {
+  id: string;
+  documentId?: string | null;
+  documentFilename: string;
+  taskType: DocumentParseTaskType;
+  status: DocumentParseTaskStatus;
+  progressPercent?: number;
+  currentStage?: string | null;
+  optionsJson?: string;
+  stageTimingsJson?: string;
+  errorMessage?: string | null;
+  createdAt?: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  updatedAt?: string;
+  totalDurationMs?: number | null;
+}
+
+export interface RetrievalChunkKeywordHit {
+  retrieval_chunk_id: string;
+  document_id: string;
+  source_document_chunk_id: string;
+  ordinal: number;
+  chunk_text: string;
+  size_class: DocumentChunkSizeClass;
+  is_split_from_oversized: boolean;
+  score: number;
+}
+
+export interface StorageImageSemanticCacheRecord {
+  imageHash: string;
+  promptVersion: string;
+  recognizable: boolean;
+  imageKind?: string | null;
+  containsText?: boolean | null;
+  visibleText?: string | null;
+  summary?: string | null;
+  entitiesJson?: string;
+  keywordsJson?: string;
+  qaHintsJson?: string;
+  dropReason?: string | null;
   semanticModel?: string | null;
 }
 
@@ -142,18 +308,75 @@ export interface SqliteStorageBackend {
     parsedContentSha256: string | null,
     parsedIsComplete: boolean,
   ): StoredDocument | null;
+  updateDocumentUploadStatus(docId: string, uploadStatus: string): StoredDocument | null;
+  updateDocumentFeatureFlags(
+    docId: string,
+    input: {
+      embeddingEnabled?: boolean;
+      hasEmbeddings?: boolean;
+      imageSemanticEnabled?: boolean;
+    },
+  ): StoredDocument | null;
   syncDocumentPages(
     documentId: string,
     pages: StorageDocumentPageRecord[],
   ): { upserted: number; untouched: number; deleted: number };
   listDocumentPages(documentId: string, pageNos?: number[] | null): StoredDocumentPage[];
+  replaceDocumentChunks(
+    documentId: string,
+    chunks: StorageDocumentChunkRecord[],
+  ): { inserted: number; deleted: number };
+  listDocumentChunks(documentId: string): StoredDocumentChunk[];
+  getDocumentChunk(chunkId: string): StoredDocumentChunk | null;
+  replaceRetrievalChunks(
+    documentId: string,
+    chunks: StorageRetrievalChunkRecord[],
+  ): { inserted: number; deleted: number };
+  listRetrievalChunks(documentId: string): StoredRetrievalChunk[];
+  keywordSearchRetrievalChunks(input: {
+    query: string;
+    documentIds: string[];
+    limit: number;
+  }): RetrievalChunkKeywordHit[];
   upsertImageSemantics(images: StorageImageSemanticRecord[]): number;
   getImageSemantics(imageHashes: string[]): Record<string, StoredImageSemantic>;
   listImageSemanticsForDocument(
     documentId: string,
     pageNos?: number[] | null,
   ): StoredImageSemantic[];
+  deleteImageSemanticsForDocument(documentId: string): number;
   updateImageSemantic(imageHash: string, semanticText: string, semanticModel?: string | null): void;
+  getImageSemanticCache(
+    imageHash: string,
+    promptVersion: string,
+  ): StoredImageSemanticCache | null;
+  upsertImageSemanticCache(record: StorageImageSemanticCacheRecord): void;
+  createDocumentParseTask(task: StorageDocumentParseTaskRecord): StoredDocumentParseTask;
+  getDocumentParseTask(taskId: string): StoredDocumentParseTask | null;
+  listDocumentParseTasks(input?: {
+    status?: DocumentParseTaskStatus | null;
+    taskType?: DocumentParseTaskType | null;
+    documentId?: string | null;
+    limit?: number;
+    offset?: number;
+  }): { items: StoredDocumentParseTask[]; total: number };
+  updateDocumentParseTask(
+    taskId: string,
+    patch: {
+      documentId?: string | null;
+      status?: DocumentParseTaskStatus;
+      progressPercent?: number;
+      currentStage?: string | null;
+      optionsJson?: string;
+      stageTimingsJson?: string;
+      errorMessage?: string | null;
+      startedAt?: string | null;
+      finishedAt?: string | null;
+      totalDurationMs?: number | null;
+    },
+  ): StoredDocumentParseTask | null;
+  deleteDocumentParseTask(taskId: string): boolean;
+  deleteActiveDocumentParseTasks(): number;
   createCollection(name: string): PublicCollectionRecord;
   listCollections(includeDeleted?: boolean): PublicCollectionRecord[];
   getCollection(collectionId: string): PublicCollectionRecord | null;
