@@ -30,6 +30,71 @@ export async function requestJson(url, options = {}) {
   return payload;
 }
 
+export async function streamJsonEvents(url, options = {}, handlers = {}) {
+  const response = await fetch(url, options);
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    const message =
+      payload.message || payload.error || payload.detail || `Request failed (${response.status})`;
+    const error = new Error(message);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
+  if (!response.body) {
+    throw new Error("Streaming response is not available.");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const dispatch = (type, payload) => {
+    const handler = handlers[type];
+    if (typeof handler === "function") {
+      handler(payload);
+    }
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+      let separatorIndex = buffer.indexOf("\n\n");
+      while (separatorIndex >= 0) {
+        const block = buffer.slice(0, separatorIndex);
+        buffer = buffer.slice(separatorIndex + 2);
+        const lines = block.split("\n");
+        let type = "message";
+        const dataLines = [];
+        for (const line of lines) {
+          if (line.startsWith("event:")) {
+            type = line.slice(6).trim() || "message";
+            continue;
+          }
+          if (line.startsWith("data:")) {
+            dataLines.push(line.slice(5).trimStart());
+          }
+        }
+        if (!dataLines.length) {
+          separatorIndex = buffer.indexOf("\n\n");
+          continue;
+        }
+        let payload = {};
+        try {
+          payload = JSON.parse(dataLines.join("\n"));
+        } catch {
+          payload = { raw: dataLines.join("\n") };
+        }
+        dispatch(type, payload);
+        separatorIndex = buffer.indexOf("\n\n");
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 export function uploadWithProgress(url, formData, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();

@@ -169,6 +169,74 @@ function runPythonPdfLayoutProbe(pdfPath: string): {
     : null;
 }
 
+function runPythonPdfHeaderFooterProbe(): {
+  markdown: string;
+  block_types: string[];
+} | null {
+  const pythonExecutable = configuredPythonExecutable();
+  const pythonEnv = {
+    ...process.env,
+    PYTHONUTF8: "1",
+    PYTHONIOENCODING: "utf-8",
+  };
+  const probe = spawnSync(pythonExecutable, ["-c", "print('ok')"], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: pythonEnv,
+  });
+  if (probe.error || probe.status !== 0) {
+    return null;
+  }
+  const script = [
+    "import json",
+    "import sys",
+    "from pathlib import Path",
+    "sys.path.insert(0, str(Path.cwd()))",
+    "from python.document_parsing import _parsed_document_from_pdf_json",
+    "parsed = _parsed_document_from_pdf_json(",
+    "  file_path='missing.pdf',",
+    "  parser_name='pymupdf4llm',",
+    "  page_payloads=[{",
+    "    'page': 1,",
+    "    'width': 600,",
+    "    'height': 800,",
+    "    'page_boxes': [",
+    "      {'index': 0, 'block_type': 'page-header', 'bbox': [0, 0, 600, 40], 'text': 'Company Confidential'},",
+    "      {'index': 1, 'block_type': 'text', 'bbox': [50, 100, 550, 180], 'text': 'Main body paragraph.'},",
+    "      {'index': 2, 'block_type': 'page-footer', 'bbox': [0, 760, 600, 800], 'text': 'Page 1'},",
+    "    ],",
+    "  }],",
+    ")",
+    "unit = parsed.units[0]",
+    "print(json.dumps({",
+    "  'markdown': unit.markdown,",
+    "  'block_types': [block.block_type for block in unit.blocks],",
+    "}, ensure_ascii=False))",
+  ].join("\n");
+  const completed = spawnSync(pythonExecutable, ["-c", script], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: pythonEnv,
+  });
+  if (completed.error) {
+    throw completed.error;
+  }
+  if (completed.status !== 0) {
+    return null;
+  }
+  const lines = completed.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const jsonLine = lines[lines.length - 1];
+  return jsonLine
+    ? (JSON.parse(jsonLine) as {
+        markdown: string;
+        block_types: string[];
+      })
+    : null;
+}
+
 describe("document parsing runtime", () => {
   it("reuses cached full parses for preview_file on non-pdf inputs", async () => {
     const root = await mkdtemp(join(tmpdir(), "afs-preview-"));
@@ -302,5 +370,18 @@ describe("document parsing runtime", () => {
     assert.equal(result.block_count > 1, true);
     assert.equal(result.non_zero_bbox_count, result.block_count);
     assert.deepEqual(result.first_block_types.slice(0, 4), ["section-header", "text", "section-header", "text"]);
+  });
+
+  it("drops explicit page-header and page-footer blocks from pymupdf4llm JSON pages", (t) => {
+    const result = runPythonPdfHeaderFooterProbe();
+    if (result == null) {
+      t.skip("Python layout parser is not available for header/footer filtering checks.");
+      return;
+    }
+
+    assert.equal(result.markdown.includes("Main body paragraph."), true);
+    assert.equal(result.markdown.includes("Company Confidential"), false);
+    assert.equal(result.markdown.includes("Page 1"), false);
+    assert.deepEqual(result.block_types, ["text"]);
   });
 });

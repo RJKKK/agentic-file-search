@@ -70,6 +70,43 @@ function buildParsedDocument(): ParsedDocument {
   };
 }
 
+function buildParsedDocumentWithoutImages(): ParsedDocument {
+  const document = buildParsedDocument();
+  return {
+    ...document,
+    units: document.units.map((unit) => ({
+      ...unit,
+      images: [],
+    })),
+  };
+}
+
+function buildEmbeddingBatchParsedDocument(unitCount: number): ParsedDocument {
+  return {
+    parser_name: "fake",
+    parser_version: "v1",
+    units: Array.from({ length: unitCount }, (_, index) => ({
+      unit_no: index + 1,
+      markdown: `chunk-${index + 1}`,
+      content_hash: `batch-u${index + 1}`,
+      heading: `Section ${index + 1}`,
+      source_locator: `page-${index + 1}`,
+      images: [],
+      blocks: [
+        {
+          index: 0,
+          block_type: "paragraph",
+          bbox: [0, 0, 0, 0] as [number, number, number, number],
+          markdown: `chunk-${index + 1}`,
+          char_count: `chunk-${index + 1}`.length,
+          image_hash: null,
+          source_image_index: null,
+        },
+      ],
+    })),
+  };
+}
+
 async function waitForTask(service: DocumentLibraryService, taskId: string): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const task = service.getDocumentParseTask(taskId);
@@ -89,7 +126,7 @@ describe("document library service", () => {
     const objectRoot = join(root, "object-store");
     const storage = new SqliteStorage({ dbPath });
     const blobStore = new LocalBlobStore(objectRoot);
-    const parser = new FakeParser(buildParsedDocument());
+    const parser = new FakeParser(buildParsedDocumentWithoutImages());
     storage.initialize();
     const service = new DocumentLibraryService(storage, blobStore, parser);
 
@@ -97,6 +134,7 @@ describe("document library service", () => {
       filename: "alpha.docx",
       data: Buffer.from("fake-docx", "utf8"),
       contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      enableEmbedding: false,
     });
     await waitForTask(service, result.task.id);
 
@@ -138,7 +176,7 @@ describe("document library service", () => {
     const objectRoot = join(root, "object-store");
     const storage = new SqliteStorage({ dbPath });
     const blobStore = new LocalBlobStore(objectRoot);
-    const parser = new FakeParser(buildParsedDocument());
+    const parser = new FakeParser(buildParsedDocumentWithoutImages());
     storage.initialize();
     const service = new DocumentLibraryService(storage, blobStore, parser);
 
@@ -146,6 +184,7 @@ describe("document library service", () => {
       filename: "Alpha.pdf",
       data: Buffer.from("pdf", "utf8"),
       contentType: "application/pdf",
+      enableEmbedding: false,
     });
     await waitForTask(service, uploaded.task.id);
 
@@ -154,6 +193,7 @@ describe("document library service", () => {
         filename: "alpha.pdf",
         data: Buffer.from("pdf-two", "utf8"),
         contentType: "application/pdf",
+        enableEmbedding: false,
       }),
       /same filename/i,
     );
@@ -167,7 +207,7 @@ describe("document library service", () => {
     const objectRoot = join(root, "object-store");
     const storage = new SqliteStorage({ dbPath });
     const blobStore = new LocalBlobStore(objectRoot);
-    const parser = new FakeParser(buildParsedDocument());
+    const parser = new FakeParser(buildParsedDocumentWithoutImages());
     storage.initialize();
     const service = new DocumentLibraryService(storage, blobStore, parser);
 
@@ -176,6 +216,7 @@ describe("document library service", () => {
       filename,
       data: Buffer.from("%PDF fake", "utf8"),
       contentType: "application/pdf",
+      enableEmbedding: false,
     });
     await waitForTask(service, uploaded.task.id);
 
@@ -199,7 +240,7 @@ describe("document library service", () => {
     const objectRoot = join(root, "object-store");
     const storage = new FailingStorage({ dbPath });
     const blobStore = new LocalBlobStore(objectRoot);
-    const parser = new FakeParser(buildParsedDocument());
+    const parser = new FakeParser(buildParsedDocumentWithoutImages());
     storage.initialize();
     const service = new DocumentLibraryService(storage, blobStore, parser);
 
@@ -208,6 +249,7 @@ describe("document library service", () => {
         filename: "alpha.docx",
         data: Buffer.from("docx", "utf8"),
         contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        enableEmbedding: false,
       }),
       /boom/,
     );
@@ -227,7 +269,7 @@ describe("document library service", () => {
     const objectRoot = join(root, "object-store");
     const storage = new SqliteStorage({ dbPath });
     const blobStore = new LocalBlobStore(objectRoot);
-    const parser = new FakeParser(buildParsedDocument());
+    const parser = new FakeParser(buildParsedDocumentWithoutImages());
     storage.initialize();
     const service = new DocumentLibraryService(storage, blobStore, parser);
 
@@ -235,6 +277,7 @@ describe("document library service", () => {
       filename: "alpha.docx",
       data: Buffer.from("docx", "utf8"),
       contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      enableEmbedding: false,
     });
     await waitForTask(service, uploaded.task.id);
 
@@ -249,13 +292,101 @@ describe("document library service", () => {
     storage.close();
   });
 
+  it("batches embedding requests using EMBEDDING_BATCH_SIZE", async () => {
+    const root = await mkdtemp(join(tmpdir(), "afs-library-service-embed-batch-"));
+    const dbPath = join(root, "library.sqlite");
+    const objectRoot = join(root, "object-store");
+    const storage = new SqliteStorage({ dbPath });
+    const blobStore = new LocalBlobStore(objectRoot);
+    const parser = new FakeParser(buildEmbeddingBatchParsedDocument(5));
+    storage.initialize();
+    const service = new DocumentLibraryService(storage, blobStore, parser);
+
+    const originalFetch = globalThis.fetch;
+    const previousEnv = {
+      EMBEDDING_API_KEY: process.env.EMBEDDING_API_KEY,
+      EMBEDDING_BASE_URL: process.env.EMBEDDING_BASE_URL,
+      EMBEDDING_MODEL_NAME: process.env.EMBEDDING_MODEL_NAME,
+      EMBEDDING_BATCH_SIZE: process.env.EMBEDDING_BATCH_SIZE,
+      TRADITIONAL_RAG_SMALL_CHUNK_MAX_CHARS: process.env.TRADITIONAL_RAG_SMALL_CHUNK_MAX_CHARS,
+      TRADITIONAL_RAG_NORMAL_CHUNK_MAX_CHARS: process.env.TRADITIONAL_RAG_NORMAL_CHUNK_MAX_CHARS,
+      QDRANT_URL: process.env.QDRANT_URL,
+      FS_EXPLORER_QDRANT_URL: process.env.FS_EXPLORER_QDRANT_URL,
+    };
+    const requests: Array<{ model: string; input: string[] }> = [];
+
+    process.env.EMBEDDING_API_KEY = "test-key";
+    process.env.EMBEDDING_BASE_URL = "https://example.test/v1";
+    process.env.EMBEDDING_MODEL_NAME = "test-embedding";
+    process.env.EMBEDDING_BATCH_SIZE = "2";
+    process.env.TRADITIONAL_RAG_SMALL_CHUNK_MAX_CHARS = "3";
+    process.env.TRADITIONAL_RAG_NORMAL_CHUNK_MAX_CHARS = "10";
+    delete process.env.QDRANT_URL;
+    delete process.env.FS_EXPLORER_QDRANT_URL;
+
+    globalThis.fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url === "https://example.test/v1/embeddings") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string; input?: string[] | string };
+        const batch = Array.isArray(body.input) ? body.input : [String(body.input ?? "")];
+        requests.push({
+          model: String(body.model ?? ""),
+          input: batch,
+        });
+        return new Response(
+          JSON.stringify({
+            data: batch.map((_, index) => ({
+              embedding: [index + 1, index + 2, index + 3],
+            })),
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      }
+      throw new Error(`Unexpected fetch in test: ${url}`);
+    };
+
+    try {
+      const uploaded = await service.uploadDocument({
+        filename: "batched.pdf",
+        data: Buffer.from("%PDF batched", "utf8"),
+        contentType: "application/pdf",
+        enableImageSemantic: false,
+      });
+      await waitForTask(service, uploaded.task.id);
+
+      assert.deepEqual(
+        requests.map((item) => item.input.length),
+        [2, 2, 1],
+      );
+      assert.deepEqual(
+        requests.flatMap((item) => item.input),
+        ["chunk-1", "chunk-2", "chunk-3", "chunk-4", "chunk-5"],
+      );
+      assert.deepEqual([...new Set(requests.map((item) => item.model))], ["test-embedding"]);
+      assert.equal(storage.listRetrievalChunks(String(uploaded.document.id)).length, 5);
+    } finally {
+      globalThis.fetch = originalFetch;
+      for (const [key, value] of Object.entries(previousEnv)) {
+        if (value == null) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+      storage.close();
+    }
+  });
+
   it("deletes source/pages blobs and database rows together", async () => {
     const root = await mkdtemp(join(tmpdir(), "afs-library-service-delete-"));
     const dbPath = join(root, "library.sqlite");
     const objectRoot = join(root, "object-store");
     const storage = new SqliteStorage({ dbPath });
     const blobStore = new LocalBlobStore(objectRoot);
-    const parser = new FakeParser(buildParsedDocument());
+    const parser = new FakeParser(buildParsedDocumentWithoutImages());
     storage.initialize();
     const service = new DocumentLibraryService(storage, blobStore, parser);
 
@@ -263,6 +394,7 @@ describe("document library service", () => {
       filename: "alpha.pdf",
       data: Buffer.from("pdf", "utf8"),
       contentType: "application/pdf",
+      enableEmbedding: false,
     });
     await waitForTask(service, uploaded.task.id);
 

@@ -2,41 +2,33 @@
 import { ChatDotRound, Collection, Document, Refresh } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 import MarkdownIt from "markdown-it";
-import { computed, inject, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+
 import {
-  buildDbParams,
   documentStatusType,
   formatValue,
   requestJson,
   shortText,
+  streamJsonEvents,
 } from "../api.js";
+import { useRetrievalScope } from "../composables/useRetrievalScope.js";
 
 const markdown = new MarkdownIt({ html: false, linkify: true, breaks: true });
-const appState = inject("appState");
+const {
+  appState,
+  askOptions,
+  askForm,
+  selectedDocuments,
+  selectedCollections,
+  refreshAskDocuments,
+  refreshCollections,
+} = useRetrievalScope();
 
 const queryMode = ref("agent");
 const activeTraceNames = ref([]);
 const activeSessionId = ref("");
 let eventSource = null;
-
-const askOptions = reactive({
-  documents: [],
-  collections: [],
-  documentQuery: "",
-  loadingDocuments: false,
-  loadingCollections: false,
-});
-
-const askForm = reactive({
-  task: "",
-  documentIds: [],
-  collectionIds: [],
-  enableSemantic: false,
-  enableMetadata: false,
-  retrievalMode: "hybrid",
-  keywordWeight: 0.5,
-  semanticWeight: 0.5,
-});
+let traditionalAbortController = null;
 
 const sessionState = reactive({
   status: "idle",
@@ -56,22 +48,24 @@ const ragState = reactive({
   usedChunks: [],
   warnings: [],
   error: "",
+  detailContentByChunkId: {},
+  detailLoadingByChunkId: {},
+  detailOpenByChunkId: {},
+  detailErrorByChunkId: {},
 });
 
 const isAsking = computed(() =>
   ["creating", "running", "indexing", "awaiting_human", "answering"].includes(sessionState.status),
 );
-const selectedDocuments = computed(() => {
-  const selected = new Set(askForm.documentIds);
-  return askOptions.documents.filter((item) => selected.has(item.id));
-});
-const selectedCollections = computed(() => {
-  const selected = new Set(askForm.collectionIds);
-  return askOptions.collections.filter((item) => selected.has(item.id));
-});
+
+const expandableDetailChunks = computed(() =>
+  (ragState.usedChunks || []).filter((chunk) => chunk.show_full_chunk_detail),
+);
+
 const renderedAnswer = computed(() => {
   const source = queryMode.value === "agent" ? sessionState.displayedAnswer : ragState.answer;
-  return markdown.render(source || "");
+  const html = markdown.render(source || "");
+  return decorateTraditionalAnswerHtml(html);
 });
 
 onMounted(async () => {
@@ -83,43 +77,30 @@ watch(
   () => Promise.all([refreshAskDocuments(), refreshCollections()]),
 );
 
-onBeforeUnmount(() => {
+watch(queryMode, (mode) => {
+  if (mode === "agent") {
+    closeTraditionalStream();
+    return;
+  }
   closeEventStream();
 });
 
-async function refreshAskDocuments(query = askOptions.documentQuery) {
-  askOptions.loadingDocuments = true;
-  askOptions.documentQuery = query || "";
-  try {
-    const params = buildDbParams(appState.dbPath, { page: 1, page_size: 100 });
-    if (askOptions.documentQuery.trim()) {
-      params.set("q", askOptions.documentQuery.trim());
-    }
-    const payload = await requestJson(`/api/documents?${params.toString()}`);
-    askOptions.documents = payload.items || [];
-  } catch (error) {
-    ElMessage.error(error.message);
-  } finally {
-    askOptions.loadingDocuments = false;
-  }
-}
-
-async function refreshCollections() {
-  askOptions.loadingCollections = true;
-  try {
-    const payload = await requestJson("/api/collections");
-    askOptions.collections = payload.items || [];
-  } catch (error) {
-    ElMessage.error(error.message);
-  } finally {
-    askOptions.loadingCollections = false;
-  }
-}
+onBeforeUnmount(() => {
+  closeEventStream();
+  closeTraditionalStream();
+});
 
 function closeEventStream() {
   if (eventSource) {
     eventSource.close();
     eventSource = null;
+  }
+}
+
+function closeTraditionalStream() {
+  if (traditionalAbortController) {
+    traditionalAbortController.abort();
+    traditionalAbortController = null;
   }
 }
 
@@ -160,31 +141,59 @@ async function submitQuestion() {
 }
 
 async function startTraditionalQuery() {
+  closeTraditionalStream();
   ragState.loading = true;
   ragState.answer = "";
   ragState.usedChunks = [];
   ragState.warnings = [];
   ragState.error = "";
+  ragState.detailContentByChunkId = {};
+  ragState.detailLoadingByChunkId = {};
+  ragState.detailOpenByChunkId = {};
+  ragState.detailErrorByChunkId = {};
+  traditionalAbortController = new AbortController();
   try {
-    const payload = await requestJson("/api/rag/query", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        question: askForm.task.trim(),
-        mode: askForm.retrievalMode,
-        document_ids: askForm.documentIds,
-        collection_ids: askForm.collectionIds,
-        keyword_weight: Number(askForm.keywordWeight || 0.5),
-        semantic_weight: Number(askForm.semanticWeight || 0.5),
-      }),
-    });
-    ragState.answer = payload.answer || "";
-    ragState.usedChunks = payload.used_chunks || [];
-    ragState.warnings = payload.warnings || [];
+    await streamJsonEvents(
+      "/api/rag/query/stream",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: traditionalAbortController.signal,
+        body: JSON.stringify({
+          question: askForm.task.trim(),
+          mode: askForm.retrievalMode,
+          document_ids: askForm.documentIds,
+          collection_ids: askForm.collectionIds,
+          keyword_weight: Number(askForm.keywordWeight || 0.5),
+          semantic_weight: Number(askForm.semanticWeight || 0.5),
+        }),
+      },
+      {
+        start(payload) {
+          ragState.warnings = payload.warnings || [];
+        },
+        answer_delta(payload) {
+          ragState.answer += payload.delta_text || "";
+          nextTick(scrollAnswerToBottom);
+        },
+        complete(payload) {
+          ragState.answer = payload.answer || ragState.answer;
+          ragState.usedChunks = payload.used_chunks || [];
+          ragState.warnings = payload.warnings || [];
+        },
+        error(payload) {
+          throw new Error(payload.message || "Traditional RAG stream failed.");
+        },
+      },
+    );
   } catch (error) {
+    if (error?.name === "AbortError") {
+      return;
+    }
     ragState.error = error.message;
     ElMessage.error(error.message);
   } finally {
+    traditionalAbortController = null;
     ragState.loading = false;
     nextTick(scrollAnswerToBottom);
   }
@@ -192,6 +201,7 @@ async function startTraditionalQuery() {
 
 async function startAgentSession() {
   closeEventStream();
+  closeTraditionalStream();
   sessionState.status = "creating";
   sessionState.events = [];
   sessionState.finalAnswer = "";
@@ -358,6 +368,118 @@ function readableFallback(data) {
     .join("\n");
 }
 
+function renderMarkdown(text) {
+  return markdown.render(String(text || ""));
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildInlineDetailMarkup(chunk) {
+  const chunkId = chunk.document_chunk_id;
+  const open = Boolean(ragState.detailOpenByChunkId[chunkId]);
+  const loading = Boolean(ragState.detailLoadingByChunkId[chunkId]);
+  const error = String(ragState.detailErrorByChunkId[chunkId] || "");
+  const content = String(ragState.detailContentByChunkId[chunkId] || "");
+  let detailHtml = "";
+  if (open) {
+    if (loading) {
+      detailHtml = '<div class="inline-answer-detail-body"><div class="inline-answer-detail-state">加载中...</div></div>';
+    } else if (error) {
+      detailHtml = `<div class="inline-answer-detail-body"><div class="inline-answer-detail-state inline-answer-detail-error">${error}</div></div>`;
+    } else if (content) {
+      detailHtml =
+        `<div class="inline-answer-detail-body markdown-body answer-markdown detail-markdown">` +
+        `${renderMarkdown(content)}` +
+        "</div>";
+    }
+  }
+  return (
+    `<span class="inline-answer-detail">` +
+    `<button type="button" class="inline-answer-detail-toggle" data-answer-detail-button="true" data-chunk-id="${chunkId}">` +
+    `${open ? "收起" : "展开"}引用 ${chunk.citation_no} 对应完整块` +
+    `</button>` +
+    detailHtml +
+    `</span>`
+  );
+}
+
+function decorateTraditionalAnswerHtml(html) {
+  if (queryMode.value !== "traditional" || ragState.loading || !expandableDetailChunks.value.length) {
+    return html;
+  }
+  let decorated = html;
+  for (const chunk of expandableDetailChunks.value) {
+    const anchorPattern = new RegExp(
+      `<a\\s+href="${escapeRegExp(chunk.source_link)}"[^>]*>.*?<\\/a>`,
+      "g",
+    );
+    decorated = decorated.replace(anchorPattern, buildInlineDetailMarkup(chunk));
+  }
+  return decorated;
+}
+
+async function toggleFullChunkDetail(chunk) {
+  const chunkId = chunk.document_chunk_id;
+  const isOpen = Boolean(ragState.detailOpenByChunkId[chunkId]);
+  if (isOpen) {
+    ragState.detailOpenByChunkId = {
+      ...ragState.detailOpenByChunkId,
+      [chunkId]: false,
+    };
+    return;
+  }
+
+  ragState.detailOpenByChunkId = {
+    ...ragState.detailOpenByChunkId,
+    [chunkId]: true,
+  };
+  if (ragState.detailContentByChunkId[chunkId] || ragState.detailLoadingByChunkId[chunkId]) {
+    return;
+  }
+
+  ragState.detailLoadingByChunkId = {
+    ...ragState.detailLoadingByChunkId,
+    [chunkId]: true,
+  };
+  ragState.detailErrorByChunkId = {
+    ...ragState.detailErrorByChunkId,
+    [chunkId]: "",
+  };
+  try {
+    const payload = await requestJson(chunk.source_link);
+    ragState.detailContentByChunkId = {
+      ...ragState.detailContentByChunkId,
+      [chunkId]: payload?.chunk?.content_md || "",
+    };
+  } catch (error) {
+    ragState.detailErrorByChunkId = {
+      ...ragState.detailErrorByChunkId,
+      [chunkId]: error.message || "Failed to load chunk content.",
+    };
+  } finally {
+    ragState.detailLoadingByChunkId = {
+      ...ragState.detailLoadingByChunkId,
+      [chunkId]: false,
+    };
+  }
+}
+
+function handleAnswerInteraction(event) {
+  const button = event.target instanceof Element ? event.target.closest("[data-answer-detail-button]") : null;
+  if (!button) {
+    return;
+  }
+  event.preventDefault();
+  const chunkId = button.getAttribute("data-chunk-id") || "";
+  const chunk = (ragState.usedChunks || []).find((item) => item.document_chunk_id === chunkId);
+  if (!chunk) {
+    return;
+  }
+  void toggleFullChunkDetail(chunk);
+}
+
 function scrollTraceToBottom() {
   const el = document.querySelector(".trace-list");
   if (el) el.scrollTop = el.scrollHeight;
@@ -456,9 +578,9 @@ function scrollAnswerToBottom() {
 
           <div v-if="queryMode === 'traditional'" class="rag-controls">
             <el-select v-model="askForm.retrievalMode" class="rag-mode-select">
-              <el-option label="混合检索" value="hybrid" />
-              <el-option label="关键字检索" value="keyword" />
-              <el-option label="语义检索" value="semantic" />
+              <el-option label="Hybrid" value="hybrid" />
+              <el-option label="Keyword" value="keyword" />
+              <el-option label="Semantic" value="semantic" />
             </el-select>
             <el-input-number
               v-if="askForm.retrievalMode === 'hybrid'"
@@ -526,7 +648,13 @@ function scrollAnswerToBottom() {
           <div class="section-title">
             <div>
               <h2>Answer</h2>
-              <span>{{ queryMode === "agent" ? sessionState.error || "Markdown answer stream" : ragState.error || "Traditional RAG answer" }}</span>
+              <span>
+                {{
+                  queryMode === "agent"
+                    ? sessionState.error || "Markdown answer stream"
+                    : ragState.error || "Traditional RAG answer stream"
+                }}
+              </span>
             </div>
           </div>
           <div class="answer-scroll">
@@ -545,19 +673,24 @@ function scrollAnswerToBottom() {
               description="Answer will appear here"
               :image-size="82"
             />
-            <article v-else class="markdown-body answer-markdown" v-html="renderedAnswer" />
+            <article
+              v-else
+              class="markdown-body answer-markdown"
+              v-html="renderedAnswer"
+              @click="handleAnswerInteraction"
+            />
 
             <div v-if="queryMode === 'traditional' && ragState.usedChunks.length" class="rag-citations">
-              <h3>Used Chunks</h3>
+              <h3>详情内容如下</h3>
               <div v-for="chunk in ragState.usedChunks" :key="chunk.document_chunk_id" class="citation-card">
                 <div class="citation-meta">
-                  <span>chunk {{ chunk.document_chunk_id }}</span>
+                  <span>[{{ chunk.citation_no }}]</span>
+                  <span>{{ chunk.document_name }}</span>
                   <span>score {{ Number(chunk.score || 0).toFixed(4) }}</span>
                   <span>pages {{ (chunk.page_nos || []).join(", ") }}</span>
+                  <span>locator {{ chunk.source_locator || "-" }}</span>
                   <span>compression {{ chunk.compression_applied ? "yes" : "no" }}</span>
                 </div>
-                <pre class="page-markdown">{{ chunk.content }}</pre>
-                <pre v-if="chunk.summary_text" class="page-markdown">{{ chunk.summary_text }}</pre>
                 <div class="citation-links">
                   <span>retrieval ids: {{ (chunk.retrieval_chunk_ids || []).join(", ") || "-" }}</span>
                   <a :href="chunk.source_link" target="_blank" rel="noreferrer">Open Chunk</a>

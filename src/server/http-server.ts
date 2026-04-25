@@ -236,6 +236,10 @@ function delay(ms: number): Promise<void> {
   });
 }
 
+function encodeJsonSseEvent(type: string, data: Record<string, unknown>): string {
+  return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
 export async function createHttpServer(
   options: HttpServerOptions = {},
 ): Promise<FastifyInstance> {
@@ -426,6 +430,93 @@ export async function createHttpServer(
         traceId,
       });
     }
+  });
+
+  app.post("/api/rag/retrieve", async (request, reply) => {
+    const traceId = makeTraceId();
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    try {
+      const result = await traditionalRag.retrieve({
+        question: toStringValue(body.question),
+        mode: (toStringValue(body.mode, "hybrid") as "keyword" | "semantic" | "hybrid"),
+        documentIds: toStringArray(body.document_ids),
+        collectionIds: collectionIdsFromBody(body),
+        keywordWeight: Number(body.keyword_weight ?? 0.5),
+        semanticWeight: Number(body.semantic_weight ?? 0.5),
+      });
+      return withTrace(reply, result as unknown as Record<string, unknown>, { traceId });
+    } catch (error) {
+      return errorResponse(reply, {
+        statusCode: /selected|empty|embedding/i.test(String(error)) ? 400 : 500,
+        errorCode: "rag_retrieve_failed",
+        message: error instanceof Error ? error.message : String(error),
+        traceId,
+      });
+    }
+  });
+
+  app.post("/api/rag/query/stream", async (request, reply) => {
+    const traceId = makeTraceId();
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+      "X-Trace-Id": traceId,
+    });
+    reply.raw.socket?.setNoDelay(true);
+    reply.raw.flushHeaders?.();
+    let closed = false;
+    const keepalive = setInterval(() => {
+      if (!closed && !reply.raw.destroyed) {
+        reply.raw.write(": keepalive\n\n");
+      }
+    }, 15_000);
+    const handleClose = () => {
+      closed = true;
+    };
+    reply.raw.socket?.on("close", handleClose);
+    request.raw.on("close", () => {
+      if (request.raw.aborted) {
+        handleClose();
+      }
+    });
+    void (async () => {
+      try {
+        reply.raw.write(": connected\n\n");
+        for await (const event of traditionalRag.streamQuery({
+          question: toStringValue(body.question),
+          mode: (toStringValue(body.mode, "hybrid") as "keyword" | "semantic" | "hybrid"),
+          documentIds: toStringArray(body.document_ids),
+          collectionIds: collectionIdsFromBody(body),
+          keywordWeight: Number(body.keyword_weight ?? 0.5),
+          semanticWeight: Number(body.semantic_weight ?? 0.5),
+        })) {
+          if (closed) {
+            break;
+          }
+          reply.raw.write(encodeJsonSseEvent(event.type, event));
+        }
+      } catch (error) {
+        if (!closed) {
+          reply.raw.write(
+            encodeJsonSseEvent("error", {
+              type: "error",
+              message: error instanceof Error ? error.message : String(error),
+            }),
+          );
+        }
+      } finally {
+        clearInterval(keepalive);
+        reply.raw.socket?.off("close", handleClose);
+        if (!reply.raw.destroyed) {
+          reply.raw.end();
+        }
+      }
+    })();
+    return reply;
   });
 
   app.get("/api/document-parse-tasks", async (request, reply) => {

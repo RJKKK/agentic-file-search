@@ -198,6 +198,9 @@ body {
   min-height: 0;
   /* overflow: auto; */
   padding: 12px 16px;
+  table {
+    width: 100%;
+  }
 }
 
 .trace-title {
@@ -393,6 +396,44 @@ body {
   display: grid;
   gap: 12px;
   margin-top: 18px;
+}
+
+.detail-markdown {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.inline-answer-detail {
+  display: block;
+  margin: 8px 0;
+}
+
+.inline-answer-detail-toggle {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #2563eb;
+  cursor: pointer;
+  font: inherit;
+  text-decoration: underline;
+}
+
+.inline-answer-detail-body {
+  margin-top: 10px;
+}
+
+.inline-answer-detail-state {
+  padding: 12px;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #475569;
+}
+
+.inline-answer-detail-error {
+  color: #b91c1c;
+  background: #fef2f2;
 }
 
 .citation-card {

@@ -9,6 +9,7 @@ import { describe, it } from "node:test";
 import type { ActionModel } from "../src/agent/agent.js";
 import { createHttpServer, LocalBlobStore, SqliteStorage } from "../src/index.js";
 import type { PythonDocumentParserExecutor } from "../src/runtime/document-parsing.js";
+import { TraditionalRagService } from "../src/runtime/traditional-rag.js";
 
 class StaticParser implements PythonDocumentParserExecutor {
   async parseDocument() {
@@ -295,14 +296,59 @@ describe("http server", () => {
 
   it("supports traditional rag answers plus chunk and image asset routes", async () => {
     const { app, storage, blobStore } = await createAppFixture();
-    const upload = multipartBody({ filename: "alpha.pdf", content: "%PDF fake" });
-    const uploaded = await app.inject({
-      method: "POST",
-      url: "/api/documents",
-      headers: { "content-type": upload.contentType },
-      payload: upload.body,
+    const corpusId = storage.getOrCreateCorpus("test-root");
+    const docId = "manual-doc";
+    storage.upsertDocumentStub({
+      id: docId,
+      corpusId,
+      relativePath: "alpha.pdf",
+      absolutePath: join(tmpdir(), "alpha.pdf"),
+      content: "",
+      metadataJson: "{}",
+      fileMtime: 1,
+      fileSize: 1,
+      contentSha256: "hash-alpha",
+      originalFilename: "alpha.pdf",
+      objectKey: "documents/alpha.pdf",
+      sourceObjectKey: "documents/alpha.pdf",
+      pagesPrefix: "documents/alpha/pages",
+      storageUri: "storage://alpha.pdf",
+      contentType: "application/pdf",
+      uploadStatus: "completed",
+      pageCount: 1,
+      parsedContentSha256: "parsed-alpha",
+      parsedIsComplete: true,
+      embeddingEnabled: false,
+      hasEmbeddings: false,
+      imageSemanticEnabled: false,
     });
-    const docId = uploaded.json().document.id as string;
+    storage.replaceDocumentChunks(docId, [
+      {
+        id: "manual-dchunk-1",
+        documentId: docId,
+        pageNo: 1,
+        documentIndex: 1,
+        pageIndex: 1,
+        blockType: "paragraph",
+        bboxJson: "[0,0,1,1]",
+        contentMd: "The purchase price is $45,000,000.",
+        sizeClass: "normal",
+        summaryText: null,
+        mergedPageNosJson: "[1]",
+        mergedBboxesJson: "[[0,0,1,1]]",
+      },
+    ]);
+    storage.replaceRetrievalChunks(docId, [
+      {
+        id: "manual-rchunk-1",
+        documentId: docId,
+        sourceDocumentChunkId: "manual-dchunk-1",
+        ordinal: 1,
+        chunkText: "The purchase price is $45,000,000.",
+        sizeClass: "normal",
+        isSplitFromOversized: false,
+      },
+    ]);
     const chunks = storage.listDocumentChunks(docId);
     assert.equal(chunks.length, 1);
 
@@ -317,6 +363,22 @@ describe("http server", () => {
     });
     assert.equal(rag.statusCode, 200);
     assert.equal(rag.json().used_chunks[0].document_chunk_id, chunks[0]?.id);
+    assert.equal("content" in rag.json().used_chunks[0], false);
+    assert.equal(rag.json().used_chunks[0].citation_no, 1);
+    assert.equal(rag.json().used_chunks[0].document_name, "alpha.pdf");
+
+    const retrieve = await app.inject({
+      method: "POST",
+      url: "/api/rag/retrieve",
+      payload: {
+        question: "What is the purchase price?",
+        mode: "keyword",
+        document_ids: [docId],
+      },
+    });
+    assert.equal(retrieve.statusCode, 200);
+    assert.equal(retrieve.json().retrieved_chunks[0].document_chunk_id, chunks[0]?.id);
+    assert.equal("content" in retrieve.json().retrieved_chunks[0], false);
 
     const chunkContent = await app.inject({
       method: "GET",
@@ -350,6 +412,236 @@ describe("http server", () => {
 
     await app.close();
     storage.close();
+  });
+
+  it("maps model citation numbers back to lightweight retrieved chunks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "afs-rag-"));
+    const storage = new SqliteStorage({ dbPath: join(root, "storage.sqlite") });
+    storage.initialize();
+    const blobStore = new LocalBlobStore(join(root, "object-store"));
+    const rag = new TraditionalRagService(storage, blobStore);
+    const corpusId = storage.getOrCreateCorpus(root);
+    const docId = "doc-semantic";
+
+    storage.upsertDocumentStub({
+      id: docId,
+      corpusId,
+      relativePath: "semantic.pdf",
+      absolutePath: join(root, "semantic.pdf"),
+      content: "",
+      metadataJson: "{}",
+      fileMtime: 1,
+      fileSize: 1,
+      contentSha256: "hash-semantic",
+      originalFilename: "semantic.pdf",
+      objectKey: "documents/semantic.pdf",
+      sourceObjectKey: "documents/semantic.pdf",
+      pagesPrefix: "documents/semantic/pages",
+      storageUri: "storage://semantic.pdf",
+      contentType: "application/pdf",
+      uploadStatus: "completed",
+      pageCount: 5,
+      parsedContentSha256: "parsed-semantic",
+      parsedIsComplete: true,
+      embeddingEnabled: true,
+      hasEmbeddings: true,
+      imageSemanticEnabled: false,
+    });
+
+    storage.replaceDocumentChunks(
+      docId,
+      Array.from({ length: 5 }, (_, index) => ({
+        id: `dchunk-${index + 1}`,
+        documentId: docId,
+        pageNo: index + 1,
+        documentIndex: index + 1,
+        pageIndex: 1,
+        blockType: "paragraph",
+        bboxJson: "[0,0,1,1]",
+        contentMd: `purchase price evidence ${index + 1}`,
+        sizeClass: "normal",
+        summaryText: null,
+        mergedPageNosJson: JSON.stringify([index + 1]),
+        mergedBboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+      })),
+    );
+    storage.replaceRetrievalChunks(
+      docId,
+      Array.from({ length: 5 }, (_, index) => ({
+        id: `rchunk-${index + 1}`,
+        documentId: docId,
+        sourceDocumentChunkId: `dchunk-${index + 1}`,
+        ordinal: index + 1,
+        chunkText: `purchase price evidence ${index + 1}`,
+        sizeClass: "normal",
+        isSplitFromOversized: index === 4,
+      })),
+    );
+
+    const originalFetch = globalThis.fetch;
+    const previousEmbeddingUrl = process.env.EMBEDDING_BASE_URL;
+    const previousEmbeddingKey = process.env.EMBEDDING_API_KEY;
+    const previousTextUrl = process.env.TEXT_BASE_URL;
+    const previousTextKey = process.env.TEXT_API_KEY;
+    const previousQdrantUrl = process.env.QDRANT_URL;
+
+    process.env.EMBEDDING_BASE_URL = "https://example.test/v1";
+    process.env.EMBEDDING_API_KEY = "embed-test-key";
+    process.env.TEXT_BASE_URL = "https://example.test/v1";
+    process.env.TEXT_API_KEY = "text-test-key";
+    process.env.QDRANT_URL = "https://qdrant.test";
+
+    globalThis.fetch = (async (input, init) => {
+      const url = String(input);
+      if (url === "https://example.test/v1/embeddings") {
+        return new Response(
+          JSON.stringify({
+            data: [{ embedding: [0.1, 0.2, 0.3], index: 0 }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url === "https://qdrant.test/collections/doc_doc-semantic/points/search") {
+        return new Response(
+          JSON.stringify({
+            result: Array.from({ length: 5 }, (_, index) => ({
+              id: `qdrant-${index + 1}`,
+              score: 10 - index,
+              payload: { retrieval_chunk_id: `rchunk-${index + 1}` },
+            })),
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url === "https://example.test/v1/chat/completions") {
+        const body = String(init?.body ?? "");
+        if (body.includes('"stream":true')) {
+          return new Response("stream unsupported", { status: 400 });
+        }
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    answer: "The strongest evidence is [2] and [5].",
+                    citations: [2, 5],
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof globalThis.fetch;
+
+    try {
+      const result = await rag.query({
+        question: "purchase price",
+        mode: "semantic",
+        documentIds: [docId],
+      });
+
+      assert.deepEqual(
+        result.used_chunks.map((chunk) => chunk.citation_no),
+        [2, 5],
+      );
+      assert.deepEqual(
+        result.used_chunks.map((chunk) => chunk.document_chunk_id),
+        ["dchunk-2", "dchunk-5"],
+      );
+      assert.equal(result.used_chunks[0]?.document_name, "semantic.pdf");
+      assert.equal("content" in result.used_chunks[0], false);
+      assert.match(result.answer, /详情内容如下/);
+      assert.match(result.answer, /\/api\/document-chunks\/dchunk-5\/content/);
+
+      const streamEvents = [];
+      for await (const event of rag.streamQuery({
+        question: "purchase price",
+        mode: "semantic",
+        documentIds: [docId],
+      })) {
+        streamEvents.push(event);
+      }
+      assert.equal(streamEvents[0]?.type, "start");
+      assert.equal(streamEvents.some((event) => event.type === "answer_delta"), true);
+      const completeEvent = streamEvents.find((event) => event.type === "complete");
+      assert.deepEqual(
+        completeEvent?.used_chunks.map((chunk) => chunk.citation_no),
+        [2, 5],
+      );
+      assert.match(String(completeEvent?.answer || ""), /详情内容如下/);
+      assert.match(String(completeEvent?.answer || ""), /\/api\/document-chunks\/dchunk-5\/content/);
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.EMBEDDING_BASE_URL = previousEmbeddingUrl;
+      process.env.EMBEDDING_API_KEY = previousEmbeddingKey;
+      process.env.TEXT_BASE_URL = previousTextUrl;
+      process.env.TEXT_API_KEY = previousTextKey;
+      process.env.QDRANT_URL = previousQdrantUrl;
+      storage.close();
+    }
+  });
+
+  it("removes blank seam lines when merging a table continued across pages", () => {
+    const rag = new TraditionalRagService({} as never, {} as never);
+    const documentChunks = rag.createDocumentChunks({
+      documentId: "doc-table",
+      imageRenderMap: new Map(),
+      parsedDocument: {
+        parser_name: "test",
+        parser_version: "1",
+        units: [
+          {
+            unit_no: 1,
+            markdown: "| Col A | Col B |\n| --- | --- |\n| A1 | B1 |",
+            content_hash: "hash-page-1",
+            heading: null,
+            source_locator: "page-1",
+            images: [],
+            blocks: [
+              {
+                index: 0,
+                block_type: "table",
+                bbox: [0, 0, 100, 100],
+                markdown: "| Col A | Col B |\n| --- | --- |\n| A1 | B1 |\n",
+                char_count: 44,
+                image_hash: null,
+                source_image_index: null,
+              },
+            ],
+          },
+          {
+            unit_no: 2,
+            markdown: "| A2 | B2 |\n| A3 | B3 |",
+            content_hash: "hash-page-2",
+            heading: null,
+            source_locator: "page-2",
+            images: [],
+            blocks: [
+              {
+                index: 0,
+                block_type: "table",
+                bbox: [0, 0, 100, 100],
+                markdown: "\n| A2 | B2 |\n| A3 | B3 |",
+                char_count: 24,
+                image_hash: null,
+                source_image_index: null,
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    assert.equal(documentChunks.length, 1);
+    assert.equal(
+      documentChunks[0]?.contentMd,
+      "| Col A | Col B |\n| --- | --- |\n| A1 | B1 |\n| A2 | B2 |\n| A3 | B3 |",
+    );
+    assert.doesNotMatch(String(documentChunks[0]?.contentMd || ""), /\|\s*A1\s*\|\s*B1\s*\|\n\n\|/);
   });
 
   it("supports exploration session create/get/reply and keeps unsupported index routes explicit", async () => {

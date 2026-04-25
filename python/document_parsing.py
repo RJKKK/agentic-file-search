@@ -1374,7 +1374,8 @@ def _strip_pdf_header_footer_blocks(
         return [
             block
             for block in blocks
-            if not (block.block_type == "text" and _is_page_number_footer(block.markdown, page_no=page_no))
+            if block.block_type not in {"page-header", "page-footer"}
+            and not (block.block_type == "text" and _is_page_number_footer(block.markdown, page_no=page_no))
         ]
 
     page_height = max(page_bbox[3] - page_bbox[1], 1.0)
@@ -1382,6 +1383,8 @@ def _strip_pdf_header_footer_blocks(
     bottom_cutoff = page_bbox[3] - page_height * 0.08
     filtered: list[ParsedBlock] = []
     for block in blocks:
+        if block.block_type in {"page-header", "page-footer"}:
+            continue
         if block.block_type == "text":
             text = block.markdown.strip()
             if not text:

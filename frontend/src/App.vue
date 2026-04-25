@@ -1,5 +1,5 @@
 <script setup>
-import { ChatDotRound, Collection, Document, List, Refresh, Setting } from "@element-plus/icons-vue";
+import { ChatDotRound, Collection, Document, List, Refresh, Search, Setting } from "@element-plus/icons-vue";
 import { provide, reactive } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
@@ -33,6 +33,10 @@ function refreshData() {
         <el-menu-item index="/qa">
           <el-icon><ChatDotRound /></el-icon>
           <span>问答</span>
+        </el-menu-item>
+        <el-menu-item index="/retrieval-test">
+          <el-icon><Search /></el-icon>
+          <span>召回测试</span>
         </el-menu-item>
         <el-menu-item index="/documents">
           <el-icon><Document /></el-icon>

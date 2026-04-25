@@ -12,7 +12,12 @@ import { resolveEmbeddingConfig, resolveTextConfig, resolveVisionConfig } from "
 import { PythonDocumentAssetBridge } from "./python-document-assets.js";
 import type { BlobStore } from "../types/library.js";
 import type { ParsedBlock, ParsedDocument, ParsedImage, ParsedUnit } from "../types/parsing.js";
-import type { TraditionalRagQueryResult, TraditionalRetrievalMode } from "../types/rag.js";
+import type {
+  TraditionalRagChunkReference,
+  TraditionalRagQueryResult,
+  TraditionalRagRetrieveResult,
+  TraditionalRetrievalMode,
+} from "../types/rag.js";
 import type {
   SqliteStorageBackend,
   StorageDocumentChunkRecord,
@@ -63,7 +68,12 @@ interface RankedChunkHit {
 }
 
 interface GroupedEvidence {
+  citationNo: number;
   documentChunkId: string;
+  documentId: string;
+  documentName: string;
+  sourceLocator: string | null;
+  hasOversizedSplitChild: boolean;
   retrievalChunkIds: string[];
   pageNos: number[];
   bboxes: Array<[number, number, number, number]>;
@@ -73,6 +83,13 @@ interface GroupedEvidence {
   mergedExcerpt: string;
   content: string;
   compressionApplied: boolean;
+}
+
+interface PreparedEvidenceSet {
+  mode: TraditionalRetrievalMode;
+  question: string;
+  warnings: string[];
+  chunks: GroupedEvidence[];
 }
 
 function stableId(prefix: string, value: string): string {
@@ -147,6 +164,23 @@ function normalizeWhitespace(value: string): string {
   return String(value || "").replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+function mergeContinuedBlockMarkdown(left: string, right: string, blockType: string): string {
+  if (blockType !== "table") {
+    return normalizeWhitespace(`${left}\n\n${right}`);
+  }
+  const normalizedLeft = String(left || "").replace(/\r\n/g, "\n");
+  const normalizedRight = String(right || "").replace(/\r\n/g, "\n");
+  const leftTrimmed = normalizedLeft.replace(/(?:\n[ \t]*)+$/g, "");
+  const rightTrimmed = normalizedRight.replace(/^(?:[ \t]*\n)+/g, "");
+  if (!leftTrimmed.trim()) {
+    return rightTrimmed.trim();
+  }
+  if (!rightTrimmed.trim()) {
+    return leftTrimmed.trim();
+  }
+  return `${leftTrimmed}\n${rightTrimmed}`.trim();
+}
+
 function toFtsQuery(value: string): string {
   const tokens = extractQueryTokens(value);
   if (!tokens?.length) {
@@ -170,6 +204,99 @@ function bboxKey(bbox: [number, number, number, number]): string {
 
 function extractQueryTokens(value: string): string[] {
   return [...new Set(String(value || "").toLowerCase().match(/[\u4e00-\u9fff]{1,}|[a-z0-9_]{2,}/g) ?? [])];
+}
+
+function normalizeBaseUrl(baseUrl: string | null): string {
+  return (baseUrl?.trim() || "https://api.openai.com/v1").replace(/\/+$/, "");
+}
+
+function resolveTextRequestTimeoutMs(): number {
+  const raw = Number.parseInt(process.env.FS_EXPLORER_TEXT_TIMEOUT_MS || "", 10);
+  if (Number.isFinite(raw) && raw > 0) {
+    return raw;
+  }
+  return 60_000;
+}
+
+async function fetchWithTimeout(
+  input: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`Text model request timed out after ${timeoutMs}ms.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function extractContentText(
+  content: string | Array<{ type?: string; text?: string }> | undefined,
+  trim: boolean,
+): string {
+  if (typeof content === "string") {
+    return trim ? content.trim() : content;
+  }
+  if (Array.isArray(content)) {
+    const text = content
+      .map((item) => (item.type === "text" || item.text ? String(item.text ?? "") : ""))
+      .filter(Boolean)
+      .join("\n");
+    return trim ? text.trim() : text;
+  }
+  return "";
+}
+
+function extractChoiceText(response: {
+  choices?: Array<{ message?: { content?: string | Array<{ type?: string; text?: string }> } }>;
+}): string {
+  return extractContentText(response.choices?.[0]?.message?.content, true);
+}
+
+function extractDeltaText(response: {
+  choices?: Array<{
+    delta?: { content?: string | Array<{ type?: string; text?: string }> };
+    message?: { content?: string | Array<{ type?: string; text?: string }> };
+  }>;
+}): string {
+  return extractContentText(response.choices?.[0]?.delta?.content ?? response.choices?.[0]?.message?.content, false);
+}
+
+async function* iterSseDataLines(stream: ReadableStream<Uint8Array>): AsyncIterable<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+      let separatorIndex = buffer.indexOf("\n\n");
+      while (separatorIndex >= 0) {
+        const block = buffer.slice(0, separatorIndex);
+        buffer = buffer.slice(separatorIndex + 2);
+        const dataLines = block
+          .split(/\r?\n/)
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trimStart());
+        if (dataLines.length > 0) {
+          yield dataLines.join("\n");
+        }
+        separatorIndex = buffer.indexOf("\n\n");
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 async function fetchJsonWithTimeout(
@@ -199,27 +326,11 @@ function qdrantConfig(): { url: string | null; apiKey: string | null } {
 }
 
 async function createEmbedding(text: string): Promise<number[] | null> {
-  const config = resolveEmbeddingConfig();
-  if (!config.apiKey) {
-    return null;
-  }
-  const baseUrl = (config.baseUrl?.trim() || "https://api.openai.com/v1").replace(/\/+$/, "");
-  const payload = await fetchJsonWithTimeout(
-    `${baseUrl}/embeddings`,
-    {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        authorization: `Bearer ${config.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: config.modelName,
-        input: text,
-      }),
-    },
-    60_000,
-  );
-  const vector = (payload as { data?: Array<{ embedding?: number[] }> }).data?.[0]?.embedding;
+  const [vector] = await createEmbeddings([text]);
+  return vector ?? null;
+}
+
+function normalizeEmbeddingVector(vector: unknown): number[] | null {
   if (!Array.isArray(vector) || vector.length === 0) {
     return null;
   }
@@ -233,6 +344,52 @@ async function createEmbedding(text: string): Promise<number[] | null> {
     return null;
   }
   return normalized;
+}
+
+function embeddingBatchSize(): number {
+  return parsePositiveIntegerEnv("EMBEDDING_BATCH_SIZE", 50);
+}
+
+async function createEmbeddings(texts: string[]): Promise<Array<number[] | null>> {
+  if (texts.length === 0) {
+    return [];
+  }
+  const config = resolveEmbeddingConfig();
+  if (!config.apiKey) {
+    return texts.map(() => null);
+  }
+  const baseUrl = (config.baseUrl?.trim() || "https://api.openai.com/v1").replace(/\/+$/, "");
+  const payload = await fetchJsonWithTimeout(
+    `${baseUrl}/embeddings`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: config.modelName,
+        input: texts,
+      }),
+    },
+    60_000,
+  );
+  const rows = (payload as { data?: Array<{ embedding?: number[]; index?: number }> }).data ?? [];
+  if (rows.length !== texts.length) {
+    console.warn(
+      `[traditional-rag] Embedding provider returned ${rows.length} vectors for ${texts.length} inputs; unmatched entries will be discarded.`,
+    );
+  }
+  const indexedRows = Array.from({ length: texts.length }, () => null as { embedding?: number[] } | null);
+  for (let rawIndex = 0; rawIndex < rows.length; rawIndex += 1) {
+    const row = rows[rawIndex];
+    const targetIndex =
+      Number.isInteger(row?.index) && Number(row.index) >= 0 && Number(row.index) < texts.length
+        ? Number(row.index)
+        : rawIndex;
+    indexedRows[targetIndex] = row ?? null;
+  }
+  return texts.map((_, index) => normalizeEmbeddingVector(indexedRows[index]?.embedding));
 }
 
 async function describeImageWithVision(input: {
@@ -292,21 +449,36 @@ async function describeImageWithVision(input: {
   }
 }
 
-async function summarizeAnswer(input: {
+function buildAnswerEvidenceText(input: {
   question: string;
-  hits: Array<{ documentChunkId: string; score: number; content: string }>;
-}): Promise<{ answer: string; used_chunks: Array<{ document_chunk_id: string; score: number }> } | null> {
+  hits: GroupedEvidence[];
+}): string {
+  const evidence = input.hits
+    .map(
+      (hit) =>
+        `[${hit.citationNo}] document=${hit.documentName} locator=${hit.sourceLocator ?? "-"} ` +
+        `pages=${hit.pageNos.join(", ") || "-"} score=${hit.score.toFixed(4)}\n${hit.content}`,
+    )
+    .join("\n\n");
+  return `Question:\n${input.question}\n\nEvidence:\n${evidence}`;
+}
+
+function buildFallbackAnswer(hits: GroupedEvidence[]): string {
+  if (hits.length === 0) {
+    return "未召回到可用证据。";
+  }
+  return `已召回 ${hits.length} 个相关片段，请查看下方“详情内容如下”。`;
+}
+
+async function answerWithCitations(input: {
+  question: string;
+  hits: GroupedEvidence[];
+}): Promise<{ answer: string; citations: number[] } | null> {
   const config = resolveTextConfig();
   if (!config.apiKey) {
     return null;
   }
-  const baseUrl = (config.baseUrl?.trim() || "https://api.openai.com/v1").replace(/\/+$/, "");
-  const evidence = input.hits
-    .map(
-      (hit, index) =>
-        `[${index + 1}] chunk=${hit.documentChunkId} score=${hit.score.toFixed(4)}\n${hit.content}`,
-    )
-    .join("\n\n");
+  const baseUrl = normalizeBaseUrl(config.baseUrl);
   const payload = await fetchJsonWithTimeout(
     `${baseUrl}/chat/completions`,
     {
@@ -323,11 +495,13 @@ async function summarizeAnswer(input: {
           {
             role: "system",
             content:
-              "Answer only from evidence. Return JSON with answer and used_chunks. used_chunks must be an array of objects with document_chunk_id and score.",
+              "Answer only from the numbered evidence. Do not reproduce long evidence excerpts. " +
+              "Return strict JSON with keys answer and citations. citations must be an array of evidence numbers such as [1, 3]. " +
+              "Use inline references like [1] in the answer when helpful.",
           },
           {
             role: "user",
-            content: `Question:\n${input.question}\n\nEvidence:\n${evidence}`,
+            content: buildAnswerEvidenceText(input),
           },
         ],
       }),
@@ -341,19 +515,113 @@ async function summarizeAnswer(input: {
   try {
     const parsed = JSON.parse(raw) as {
       answer?: string;
-      used_chunks?: Array<{ document_chunk_id?: string; score?: number }>;
+      citations?: unknown;
     };
     return {
       answer: String(parsed.answer || ""),
-      used_chunks: (parsed.used_chunks ?? [])
-        .filter((item) => item.document_chunk_id)
-        .map((item) => ({
-          document_chunk_id: String(item.document_chunk_id),
-          score: Number(item.score ?? 0),
-        })),
+      citations: Array.isArray(parsed.citations)
+        ? uniqueOrdered(
+            parsed.citations
+              .map((item) => Number.parseInt(String(item ?? ""), 10))
+              .filter((item) => Number.isFinite(item) && item > 0),
+          )
+        : [],
     };
   } catch {
     return null;
+  }
+}
+
+async function* streamAnswerFromModel(input: {
+  question: string;
+  hits: GroupedEvidence[];
+}): AsyncIterable<string> {
+  const config = resolveTextConfig();
+  if (!config.apiKey) {
+    const fallback = buildFallbackAnswer(input.hits);
+    if (fallback) {
+      yield fallback;
+    }
+    return;
+  }
+  const endpoint = `${normalizeBaseUrl(config.baseUrl)}/chat/completions`;
+  const timeoutMs = resolveTextRequestTimeoutMs();
+  const messages = [
+    {
+      role: "system",
+      content:
+        "Answer only from the numbered evidence. Cite supporting evidence using [n]. " +
+        "Do not quote or restate long evidence excerpts. If the evidence is insufficient, say so briefly.",
+    },
+    {
+      role: "user",
+      content: buildAnswerEvidenceText(input),
+    },
+  ];
+  let response = await fetchWithTimeout(
+    endpoint,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: config.modelName,
+        messages,
+        temperature: 0,
+        stream: true,
+      }),
+    },
+    timeoutMs,
+  );
+
+  if (!response.ok || !response.body) {
+    response = await fetchWithTimeout(
+      endpoint,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${config.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.modelName,
+          messages,
+          temperature: 0,
+        }),
+      },
+      timeoutMs,
+    );
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      throw new Error(`Text model request failed: HTTP ${response.status} ${body}`.trim());
+    }
+    const fullText = extractChoiceText((await response.json()) as { choices?: Array<{ message?: { content?: string } }> });
+    if (fullText) {
+      yield fullText;
+    }
+    return;
+  }
+
+  for await (const dataLine of iterSseDataLines(response.body)) {
+    if (!dataLine || dataLine === "[DONE]") {
+      if (dataLine === "[DONE]") {
+        break;
+      }
+      continue;
+    }
+    const text = extractDeltaText(
+      JSON.parse(dataLine) as {
+        choices?: Array<{
+          delta?: { content?: string | Array<{ type?: string; text?: string }> };
+          message?: { content?: string | Array<{ type?: string; text?: string }> };
+        }>;
+      },
+    );
+    if (text) {
+      yield text;
+    }
   }
 }
 
@@ -429,12 +697,17 @@ async function rebuildQdrantCollection(
   chunks: Array<{ id: string; text: string }>,
 ): Promise<number> {
   const points: Array<{ retrievalChunkId: string; vector: number[] }> = [];
-  for (const chunk of chunks) {
-    const vector = await createEmbedding(chunk.text);
-    if (!vector) {
-      continue;
+  const batchSize = embeddingBatchSize();
+  for (let index = 0; index < chunks.length; index += batchSize) {
+    const batch = chunks.slice(index, index + batchSize);
+    const vectors = await createEmbeddings(batch.map((chunk) => chunk.text));
+    for (let batchIndex = 0; batchIndex < batch.length; batchIndex += 1) {
+      const vector = vectors[batchIndex];
+      if (!vector) {
+        continue;
+      }
+      points.push({ retrievalChunkId: batch[batchIndex]!.id, vector });
     }
-    points.push({ retrievalChunkId: chunk.id, vector });
   }
   await deleteQdrantCollection(documentId);
   if (points.length > 0) {
@@ -560,6 +833,90 @@ function splitOversized(content: string, blockType: string): string[] {
 
 function uniqueOrdered<T>(values: T[]): T[] {
   return [...new Set(values)];
+}
+
+function sourceLocatorFromPages(pageNos: number[]): string | null {
+  const normalized = uniqueOrdered(
+    pageNos.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0),
+  );
+  if (normalized.length === 0) {
+    return null;
+  }
+  if (normalized.length === 1) {
+    return `page-${normalized[0]}`;
+  }
+  return `pages-${normalized.join("-")}`;
+}
+
+function toPublicChunkReference(item: GroupedEvidence): TraditionalRagChunkReference {
+  return {
+    citation_no: item.citationNo,
+    document_chunk_id: item.documentChunkId,
+    document_id: item.documentId,
+    document_name: item.documentName,
+    source_locator: item.sourceLocator,
+    show_full_chunk_detail: false,
+    retrieval_chunk_ids: item.retrievalChunkIds,
+    page_nos: item.pageNos,
+    bboxes: item.bboxes,
+    score: item.score,
+    source_link: item.sourceLink,
+    compression_applied: item.compressionApplied,
+  };
+}
+
+function toPublicChunkReferences(items: GroupedEvidence[]): TraditionalRagChunkReference[] {
+  const detailIds = new Set(selectHighScoreOversizedChunks(items).map((item) => item.documentChunkId));
+  return items.map((item) => ({
+    ...toPublicChunkReference(item),
+    show_full_chunk_detail: detailIds.has(item.documentChunkId),
+  }));
+}
+
+function parseCitationNumbers(value: string): number[] {
+  const citations: number[] = [];
+  for (const match of String(value || "").matchAll(/\[(\d+(?:\s*,\s*\d+)*)\]/g)) {
+    const raw = String(match[1] ?? "");
+    for (const piece of raw.split(",")) {
+      const parsed = Number.parseInt(piece.trim(), 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        citations.push(parsed);
+      }
+    }
+  }
+  return uniqueOrdered(citations);
+}
+
+function selectHighScoreOversizedChunks(chunks: GroupedEvidence[]): GroupedEvidence[] {
+  const oversized = chunks.filter((item) => item.hasOversizedSplitChild);
+  if (oversized.length === 0) {
+    return [];
+  }
+  const maxScore = Math.max(...oversized.map((item) => item.score), 0);
+  const threshold = maxScore * 0.85;
+  return oversized.filter((item) => item.score >= threshold);
+}
+
+function appendOversizedChunkLinks(answer: string, chunks: GroupedEvidence[]): string {
+  const selected = selectHighScoreOversizedChunks(chunks).filter((item) => item.sourceLink);
+  if (selected.length === 0) {
+    return answer;
+  }
+  const links = uniqueOrdered(
+    selected.map(
+      (item) =>
+        `- [引用 ${item.citationNo} 对应完整块](${item.sourceLink})`,
+    ),
+  );
+  const suffix = `详情内容如下：\n${links.join("\n")}`;
+  const trimmed = String(answer || "").trim();
+  if (!trimmed) {
+    return suffix;
+  }
+  if (links.every((link) => trimmed.includes(link))) {
+    return trimmed;
+  }
+  return `${trimmed}\n\n${suffix}`;
 }
 
 function composeEvidenceContent(input: {
@@ -803,6 +1160,110 @@ export class TraditionalRagService {
     keywordWeight?: number;
     semanticWeight?: number;
   }): Promise<TraditionalRagQueryResult> {
+    const prepared = await this.prepareEvidence(input);
+    const answered = await answerWithCitations({
+      question: prepared.question,
+      hits: prepared.chunks,
+    });
+    const selectedCitationNos =
+      answered?.citations?.length
+        ? answered.citations
+        : answered?.answer
+          ? parseCitationNumbers(answered.answer)
+          : [];
+    const usedChunks = this.selectChunksByCitationNos(prepared.chunks, selectedCitationNos);
+    const answer = appendOversizedChunkLinks(
+      answered?.answer?.trim() || buildFallbackAnswer(usedChunks),
+      usedChunks,
+    );
+
+    return {
+      mode: prepared.mode,
+      question: prepared.question,
+      answer,
+      used_chunks: toPublicChunkReferences(usedChunks),
+      warnings: prepared.warnings.length ? prepared.warnings : undefined,
+    };
+  }
+
+  async retrieve(input: {
+    question: string;
+    mode: TraditionalRetrievalMode;
+    documentIds?: string[] | null;
+    collectionIds?: string[] | null;
+    keywordWeight?: number;
+    semanticWeight?: number;
+  }): Promise<TraditionalRagRetrieveResult> {
+    const prepared = await this.prepareEvidence(input);
+    return {
+      mode: prepared.mode,
+      question: prepared.question,
+      retrieved_chunks: toPublicChunkReferences(prepared.chunks),
+      warnings: prepared.warnings.length ? prepared.warnings : undefined,
+    };
+  }
+
+  async *streamQuery(input: {
+    question: string;
+    mode: TraditionalRetrievalMode;
+    documentIds?: string[] | null;
+    collectionIds?: string[] | null;
+    keywordWeight?: number;
+    semanticWeight?: number;
+  }): AsyncIterable<
+    | { type: "start"; question: string; mode: TraditionalRetrievalMode; retrieved_count: number }
+    | { type: "answer_delta"; delta_text: string }
+    | { type: "complete"; answer: string; used_chunks: TraditionalRagChunkReference[]; warnings?: string[] }
+  > {
+    const prepared = await this.prepareEvidence(input);
+    yield {
+      type: "start",
+      question: prepared.question,
+      mode: prepared.mode,
+      retrieved_count: prepared.chunks.length,
+    };
+
+    let answer = "";
+    for await (const delta of streamAnswerFromModel({
+      question: prepared.question,
+      hits: prepared.chunks,
+    })) {
+      if (!delta) {
+        continue;
+      }
+      answer += delta;
+      yield {
+        type: "answer_delta",
+        delta_text: delta,
+      };
+    }
+
+    const trimmedAnswer = answer.trim() || buildFallbackAnswer(prepared.chunks);
+    const usedChunks = this.selectChunksByCitationNos(prepared.chunks, parseCitationNumbers(trimmedAnswer));
+    const finalAnswer = appendOversizedChunkLinks(trimmedAnswer, usedChunks);
+    const appendedSuffix = finalAnswer.slice(trimmedAnswer.length);
+    if (appendedSuffix) {
+      yield {
+        type: "answer_delta",
+        delta_text: appendedSuffix,
+      };
+    }
+    yield {
+      type: "complete",
+      answer: finalAnswer,
+      used_chunks: toPublicChunkReferences(usedChunks),
+      warnings: prepared.warnings.length ? prepared.warnings : undefined,
+    };
+  }
+
+  private async prepareEvidence(input: {
+    question: string;
+    mode: TraditionalRetrievalMode;
+    documentIds?: string[] | null;
+    collectionIds?: string[] | null;
+    keywordWeight?: number;
+    semanticWeight?: number;
+  }): Promise<PreparedEvidenceSet> {
     const scope = resolveDocumentScope({
       storage: this.storage,
       documentIds: input.documentIds ?? null,
@@ -888,47 +1349,30 @@ export class TraditionalRagService {
       this.groupHitsBySource(combined).slice(0, 8),
       question,
       getEvidenceCharBudget(),
-    );
-    const summarizerInput = groupedEvidence.map((item) => ({
-      documentChunkId: item.documentChunkId,
-      score: item.score,
-      content: item.content,
+    ).map((item, index) => ({
+      ...item,
+      citationNo: index + 1,
+      sourceLocator: item.sourceLocator || sourceLocatorFromPages(item.pageNos),
     }));
-    const modelAnswer = await summarizeAnswer({
-      question,
-      hits: summarizerInput,
-    });
-
-    const usedIds = new Set(
-      (modelAnswer?.used_chunks ?? summarizerInput).map((item) =>
-        "document_chunk_id" in item ? item.document_chunk_id : item.documentChunkId,
-      ),
-    );
-    const usedChunks = groupedEvidence
-      .filter((item) => usedIds.has(item.documentChunkId))
-      .map((item) => ({
-        document_chunk_id: item.documentChunkId,
-        retrieval_chunk_ids: item.retrievalChunkIds,
-        page_nos: item.pageNos,
-        bboxes: item.bboxes,
-        score: item.score,
-        content: item.content,
-        summary_text: item.summaryText,
-        source_link: item.sourceLink,
-        compression_applied: item.compressionApplied,
-      }));
-
-    const answer =
-      modelAnswer?.answer?.trim() ||
-      usedChunks.map((chunk) => chunk.content).filter(Boolean).join("\n\n").slice(0, 4000);
 
     return {
       mode: input.mode,
       question,
-      answer,
-      used_chunks: usedChunks,
-      warnings: warnings.length ? warnings : undefined,
+      warnings,
+      chunks: groupedEvidence,
     };
+  }
+
+  private selectChunksByCitationNos(
+    chunks: GroupedEvidence[],
+    citationNos: number[],
+  ): GroupedEvidence[] {
+    if (citationNos.length === 0) {
+      return chunks;
+    }
+    const byCitation = new Map(chunks.map((item) => [item.citationNo, item] as const));
+    const selected = citationNos.map((citationNo) => byCitation.get(citationNo)).filter(Boolean) as GroupedEvidence[];
+    return selected.length > 0 ? selected : chunks;
   }
 
   private combineHits(input: {
@@ -975,11 +1419,21 @@ export class TraditionalRagService {
         if (!source) {
           return null;
         }
+        const document = this.storage.getDocument(source.document_id);
         const orderedHits = [...items].sort((left, right) => left.ordinal - right.ordinal);
         const mergedExcerpt = normalizeWhitespace(orderedHits.map((item) => item.chunkText).join("\n\n"));
         const sourceLink = `/api/document-chunks/${source.id}/content`;
         return {
+          citationNo: 0,
           documentChunkId: source.id,
+          documentId: source.document_id,
+          documentName:
+            document?.original_filename ||
+            document?.relative_path ||
+            document?.absolute_path ||
+            source.document_id,
+          sourceLocator: sourceLocatorFromPages(parseJsonArray<number>(source.merged_page_nos_json, [source.page_no])),
+          hasOversizedSplitChild: orderedHits.some((item) => item.isSplitFromOversized),
           retrievalChunkIds: orderedHits.map((item) => item.retrievalChunkId),
           pageNos: parseJsonArray<number>(source.merged_page_nos_json, [source.page_no]),
           bboxes: parseJsonArray<[number, number, number, number]>(source.merged_bboxes_json, [
@@ -1199,7 +1653,7 @@ export class TraditionalRagService {
           if (!nextHead || nextHead.block_type !== block.block_type || !pageDominatedByType(nextUnit, block.block_type)) {
             break;
           }
-          mergedContent = normalizeWhitespace(`${mergedContent}\n\n${nextHead.markdown}`);
+          mergedContent = mergeContinuedBlockMarkdown(mergedContent, nextHead.markdown, block.block_type);
           mergedPageNos.push(nextPage.unitNo);
           mergedBboxes.push(nextHead.bbox);
           nextPage.blocks = nextPage.blocks.slice(1);
