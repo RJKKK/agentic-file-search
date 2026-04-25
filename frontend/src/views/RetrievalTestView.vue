@@ -1,11 +1,13 @@
 <script setup>
 import { Collection, Document, Refresh, Search } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
-import { computed, onMounted, reactive, watch } from "vue";
+import MarkdownIt from "markdown-it";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 
 import { documentStatusType, requestJson } from "../api.js";
 import { useRetrievalScope } from "../composables/useRetrievalScope.js";
 
+const markdown = new MarkdownIt({ html: false, linkify: true, breaks: true });
 const {
   appState,
   askOptions,
@@ -22,8 +24,38 @@ const retrievalState = reactive({
   warnings: [],
   error: "",
 });
+const promptState = reactive({
+  preview: null,
+  error: "",
+});
+const activeTab = ref("results");
+const promptViewMode = ref("structured");
 
 const resultCountText = computed(() => `${retrievalState.results.length} results`);
+const promptStatusText = computed(() => {
+  if (promptState.error) {
+    return promptState.error;
+  }
+  if (!promptState.preview) {
+    return "Prompt preview will appear here.";
+  }
+  return `${promptState.preview.messages?.length || 0} message(s) ready`;
+});
+
+function renderDebugMarkdown(value) {
+  return markdown.render(String(value || ""));
+}
+
+function buildRetrievalPayload() {
+  return {
+    question: askForm.task.trim(),
+    mode: askForm.retrievalMode,
+    document_ids: askForm.documentIds,
+    collection_ids: askForm.collectionIds,
+    keyword_weight: Number(askForm.keywordWeight || 0.5),
+    semantic_weight: Number(askForm.semanticWeight || 0.5),
+  };
+}
 
 onMounted(async () => {
   await Promise.all([refreshAskDocuments(), refreshCollections()]);
@@ -47,24 +79,38 @@ async function runRetrieval() {
   retrievalState.results = [];
   retrievalState.warnings = [];
   retrievalState.error = "";
+  promptState.preview = null;
+  promptState.error = "";
+  activeTab.value = "results";
+  promptViewMode.value = "structured";
+  const payload = buildRetrievalPayload();
   try {
-    const payload = await requestJson("/api/rag/retrieve", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        question: askForm.task.trim(),
-        mode: askForm.retrievalMode,
-        document_ids: askForm.documentIds,
-        collection_ids: askForm.collectionIds,
-        keyword_weight: Number(askForm.keywordWeight || 0.5),
-        semantic_weight: Number(askForm.semanticWeight || 0.5),
+    const [retrievalResult, promptResult] = await Promise.allSettled([
+      requestJson("/api/rag/retrieve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
       }),
-    });
-    retrievalState.results = payload.retrieved_chunks || [];
-    retrievalState.warnings = payload.warnings || [];
-  } catch (error) {
-    retrievalState.error = error.message;
-    ElMessage.error(error.message);
+      requestJson("/api/rag/prompt-preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }),
+    ]);
+
+    if (retrievalResult.status === "fulfilled") {
+      retrievalState.results = retrievalResult.value.retrieved_chunks || [];
+      retrievalState.warnings = retrievalResult.value.warnings || [];
+    } else {
+      retrievalState.error = retrievalResult.reason?.message || "Failed to load retrieval results.";
+      ElMessage.error(retrievalState.error);
+    }
+
+    if (promptResult.status === "fulfilled") {
+      promptState.preview = promptResult.value;
+    } else {
+      promptState.error = promptResult.reason?.message || "Failed to load prompt preview.";
+    }
   } finally {
     retrievalState.loading = false;
   }
@@ -186,43 +232,115 @@ async function runRetrieval() {
         <section class="answer-section">
           <div class="section-title">
             <div>
-              <h2>召回结果</h2>
-              <span>{{ retrievalState.error || resultCountText }}</span>
+              <h2>召回调试</h2>
+              <span>{{ activeTab === "results" ? retrievalState.error || resultCountText : promptStatusText }}</span>
             </div>
             <el-button type="primary" :icon="Search" :loading="retrievalState.loading" @click="runRetrieval">
               开始召回
             </el-button>
           </div>
           <div class="answer-scroll">
-            <el-alert
-              v-for="warning in retrievalState.warnings"
-              :key="warning"
-              type="warning"
-              :closable="false"
-              show-icon
-              class="rag-warning"
-              :title="warning"
-            />
-            <el-empty
-              v-if="!retrievalState.results.length"
-              description="召回结果会显示在这里"
-              :image-size="82"
-            />
-            <div v-else class="rag-citations">
-              <div v-for="chunk in retrievalState.results" :key="chunk.document_chunk_id" class="citation-card">
-                <div class="citation-meta">
-                  <span>[{{ chunk.citation_no }}]</span>
-                  <span>{{ chunk.document_name }}</span>
-                  <span>score {{ Number(chunk.score || 0).toFixed(4) }}</span>
-                  <span>pages {{ (chunk.page_nos || []).join(", ") }}</span>
-                  <span>locator {{ chunk.source_locator || "-" }}</span>
+            <el-tabs v-model="activeTab" class="retrieval-tabs">
+              <el-tab-pane label="Retrieval Results" name="results">
+                <el-alert
+                  v-for="warning in retrievalState.warnings"
+                  :key="warning"
+                  type="warning"
+                  :closable="false"
+                  show-icon
+                  class="rag-warning"
+                  :title="warning"
+                />
+                <el-empty
+                  v-if="!retrievalState.results.length"
+                  description="召回结果会显示在这里"
+                  :image-size="82"
+                />
+                <div v-else class="rag-citations">
+                  <div v-for="chunk in retrievalState.results" :key="chunk.reference_id" class="citation-card">
+                    <div class="citation-meta">
+                      <span>[{{ chunk.citation_no }}]</span>
+                      <span>{{ chunk.document_name }}</span>
+                      <span>{{ chunk.reference_kind }}</span>
+                      <span>score {{ Number(chunk.score || 0).toFixed(4) }}</span>
+                      <span>pages {{ (chunk.page_nos || []).join(", ") }}</span>
+                      <span>locator {{ chunk.source_locator || "-" }}</span>
+                    </div>
+                    <div class="citation-links">
+                      <span>retrieval ids: {{ (chunk.retrieval_unit_ids || []).join(", ") || "-" }}</span>
+                      <a :href="chunk.source_link" target="_blank" rel="noreferrer">Open Chunk</a>
+                    </div>
+                    <div v-if="chunk.debug_cer_context_refs?.length" class="citation-links">
+                      <span>
+                        CER contexts:
+                        {{
+                          chunk.debug_cer_context_refs
+                            .map((item) => `${item.reference_kind}:${item.reference_id}@${item.source_locator || "-"}`)
+                            .join(" | ")
+                        }}
+                      </span>
+                    </div>
+                    <div
+                      v-if="chunk.debug_enriched_content"
+                      class="markdown-body answer-markdown detail-markdown retrieval-debug-markdown"
+                      v-html="renderDebugMarkdown(chunk.debug_enriched_content)"
+                    />
+                  </div>
                 </div>
-                <div class="citation-links">
-                  <span>retrieval ids: {{ (chunk.retrieval_chunk_ids || []).join(", ") || "-" }}</span>
-                  <a :href="chunk.source_link" target="_blank" rel="noreferrer">Open Chunk</a>
+              </el-tab-pane>
+
+              <el-tab-pane label="Prompt Preview" name="prompt">
+                <el-alert
+                  v-if="promptState.error"
+                  type="error"
+                  :closable="false"
+                  show-icon
+                  class="rag-warning"
+                  :title="promptState.error"
+                />
+                <el-empty
+                  v-else-if="!promptState.preview"
+                  description="完整送模提示词会显示在这里"
+                  :image-size="82"
+                />
+                <div v-else class="prompt-preview">
+                  <div class="citation-meta">
+                    <span>variant {{ promptState.preview.prompt_variant }}</span>
+                    <span>model {{ promptState.preview.model || "-" }}</span>
+                    <span>temperature {{ promptState.preview.temperature }}</span>
+                    <span>messages {{ promptState.preview.messages?.length || 0 }}</span>
+                  </div>
+                  <div class="prompt-toolbar">
+                    <el-radio-group v-model="promptViewMode" size="small">
+                      <el-radio-button label="structured">分段阅读</el-radio-button>
+                      <el-radio-button label="raw">原始 JSON</el-radio-button>
+                    </el-radio-group>
+                  </div>
+
+                  <template v-if="promptViewMode === 'structured'">
+                    <div class="prompt-section">
+                      <h3>System Prompt</h3>
+                      <pre class="prompt-preview-pre">{{ promptState.preview.system_prompt }}</pre>
+                    </div>
+
+                    <div class="prompt-section">
+                      <h3>User Prompt</h3>
+                      <pre class="prompt-preview-pre">{{ promptState.preview.user_prompt }}</pre>
+                    </div>
+
+                    <div class="prompt-section">
+                      <h3>Request JSON</h3>
+                      <pre class="prompt-preview-pre">{{ promptState.preview.request_body_json }}</pre>
+                    </div>
+                  </template>
+
+                  <div v-else class="prompt-section">
+                    <h3>Raw Request JSON</h3>
+                    <pre class="prompt-preview-pre">{{ promptState.preview.request_body_json }}</pre>
+                  </div>
                 </div>
-              </div>
-            </div>
+              </el-tab-pane>
+            </el-tabs>
           </div>
         </section>
       </div>
@@ -250,3 +368,33 @@ async function runRetrieval() {
     </div>
   </section>
 </template>
+
+<style scoped>
+.prompt-preview {
+  display: grid;
+  gap: 16px;
+}
+
+.prompt-section h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.prompt-toolbar {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.prompt-preview-pre {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: #0f172a;
+  color: #e2e8f0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-x: auto;
+}
+</style>

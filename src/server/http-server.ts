@@ -375,6 +375,8 @@ export async function createHttpServer(
         chunk: {
           id: chunk.id,
           document_id: chunk.document_id,
+          ordinal: chunk.ordinal,
+          reference_retrieval_chunk_id: chunk.reference_retrieval_chunk_id,
           page_no: chunk.page_no,
           document_index: chunk.document_index,
           page_index: chunk.page_index,
@@ -383,8 +385,43 @@ export async function createHttpServer(
           content_md: chunk.content_md,
           size_class: chunk.size_class,
           summary_text: chunk.summary_text,
+          is_split_from_oversized: chunk.is_split_from_oversized,
+          split_index: chunk.split_index,
+          split_count: chunk.split_count,
           merged_page_nos: JSON.parse(chunk.merged_page_nos_json || "[]"),
           merged_bboxes: JSON.parse(chunk.merged_bboxes_json || "[]"),
+        },
+      },
+      { traceId },
+    );
+  });
+
+  app.get("/api/retrieval-chunks/:chunkId/content", async (request, reply) => {
+    const traceId = makeTraceId();
+    const { chunkId } = request.params as { chunkId: string };
+    const chunk = storage.getRetrievalChunk(chunkId);
+    if (!chunk) {
+      return errorResponse(reply, {
+        statusCode: 404,
+        errorCode: "retrieval_chunk_not_found",
+        message: "Retrieval chunk not found.",
+        traceId,
+      });
+    }
+    return withTrace(
+      reply,
+      {
+        chunk: {
+          id: chunk.id,
+          document_id: chunk.document_id,
+          ordinal: chunk.ordinal,
+          content_md: chunk.content_md,
+          size_class: chunk.size_class,
+          summary_text: chunk.summary_text,
+          source_document_chunk_ids: JSON.parse(chunk.source_document_chunk_ids_json || "[]"),
+          page_nos: JSON.parse(chunk.page_nos_json || "[]"),
+          source_locator: chunk.source_locator,
+          bboxes: JSON.parse(chunk.bboxes_json || "[]"),
         },
       },
       { traceId },
@@ -449,6 +486,29 @@ export async function createHttpServer(
       return errorResponse(reply, {
         statusCode: /selected|empty|embedding/i.test(String(error)) ? 400 : 500,
         errorCode: "rag_retrieve_failed",
+        message: error instanceof Error ? error.message : String(error),
+        traceId,
+      });
+    }
+  });
+
+  app.post("/api/rag/prompt-preview", async (request, reply) => {
+    const traceId = makeTraceId();
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    try {
+      const result = await traditionalRag.previewPrompt({
+        question: toStringValue(body.question),
+        mode: (toStringValue(body.mode, "hybrid") as "keyword" | "semantic" | "hybrid"),
+        documentIds: toStringArray(body.document_ids),
+        collectionIds: collectionIdsFromBody(body),
+        keywordWeight: Number(body.keyword_weight ?? 0.5),
+        semanticWeight: Number(body.semantic_weight ?? 0.5),
+      });
+      return withTrace(reply, result as unknown as Record<string, unknown>, { traceId });
+    } catch (error) {
+      return errorResponse(reply, {
+        statusCode: /selected|empty|embedding/i.test(String(error)) ? 400 : 500,
+        errorCode: "rag_prompt_preview_failed",
         message: error instanceof Error ? error.message : String(error),
         traceId,
       });

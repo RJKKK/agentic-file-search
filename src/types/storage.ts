@@ -147,6 +147,8 @@ export type DocumentChunkSizeClass = "small" | "normal" | "oversized";
 export interface StoredDocumentChunk {
   id: string;
   document_id: string;
+  ordinal: number;
+  reference_retrieval_chunk_id: string | null;
   page_no: number;
   document_index: number;
   page_index: number;
@@ -155,6 +157,9 @@ export interface StoredDocumentChunk {
   content_md: string;
   size_class: DocumentChunkSizeClass;
   summary_text: string | null;
+  is_split_from_oversized: boolean;
+  split_index: number;
+  split_count: number;
   merged_page_nos_json: string;
   merged_bboxes_json: string;
 }
@@ -162,6 +167,8 @@ export interface StoredDocumentChunk {
 export interface StorageDocumentChunkRecord {
   id: string;
   documentId: string;
+  ordinal?: number;
+  referenceRetrievalChunkId?: string | null;
   pageNo: number;
   documentIndex: number;
   pageIndex: number;
@@ -170,6 +177,9 @@ export interface StorageDocumentChunkRecord {
   contentMd: string;
   sizeClass: DocumentChunkSizeClass;
   summaryText?: string | null;
+  isSplitFromOversized?: boolean;
+  splitIndex?: number;
+  splitCount?: number;
   mergedPageNosJson?: string;
   mergedBboxesJson?: string;
 }
@@ -177,21 +187,27 @@ export interface StorageDocumentChunkRecord {
 export interface StoredRetrievalChunk {
   id: string;
   document_id: string;
-  source_document_chunk_id: string;
   ordinal: number;
-  chunk_text: string;
+  content_md: string;
   size_class: DocumentChunkSizeClass;
-  is_split_from_oversized: boolean;
+  summary_text: string | null;
+  source_document_chunk_ids_json: string;
+  page_nos_json: string;
+  source_locator: string | null;
+  bboxes_json: string;
 }
 
 export interface StorageRetrievalChunkRecord {
   id: string;
   documentId: string;
-  sourceDocumentChunkId: string;
   ordinal: number;
-  chunkText: string;
+  contentMd: string;
   sizeClass: DocumentChunkSizeClass;
-  isSplitFromOversized?: boolean;
+  summaryText?: string | null;
+  sourceDocumentChunkIdsJson: string;
+  pageNosJson: string;
+  sourceLocator?: string | null;
+  bboxesJson?: string;
 }
 
 export interface StoredImageSemanticCache {
@@ -258,12 +274,12 @@ export interface StorageDocumentParseTaskRecord {
   totalDurationMs?: number | null;
 }
 
-export interface RetrievalChunkKeywordHit {
-  retrieval_chunk_id: string;
+export interface DocumentChunkKeywordHit {
+  document_chunk_id: string;
   document_id: string;
-  source_document_chunk_id: string;
+  reference_retrieval_chunk_id: string | null;
   ordinal: number;
-  chunk_text: string;
+  content_md: string;
   size_class: DocumentChunkSizeClass;
   is_split_from_oversized: boolean;
   score: number;
@@ -332,12 +348,13 @@ export interface SqliteStorageBackend {
     documentId: string,
     chunks: StorageRetrievalChunkRecord[],
   ): { inserted: number; deleted: number };
+  getRetrievalChunk(chunkId: string): StoredRetrievalChunk | null;
   listRetrievalChunks(documentId: string): StoredRetrievalChunk[];
-  keywordSearchRetrievalChunks(input: {
+  keywordSearchDocumentChunks(input: {
     query: string;
     documentIds: string[];
     limit: number;
-  }): RetrievalChunkKeywordHit[];
+  }): DocumentChunkKeywordHit[];
   upsertImageSemantics(images: StorageImageSemanticRecord[]): number;
   getImageSemantics(imageHashes: string[]): Record<string, StoredImageSemantic>;
   listImageSemanticsForDocument(

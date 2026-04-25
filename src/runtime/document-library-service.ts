@@ -90,6 +90,7 @@ const TASK_STAGE_SEQUENCES: Record<DocumentParseTaskType, string[]> = {
     "build_document_chunks",
     "process_images",
     "build_retrieval_chunks",
+    "build_indexed_document_chunks",
     "build_embeddings",
     "finalize",
   ],
@@ -99,10 +100,11 @@ const TASK_STAGE_SEQUENCES: Record<DocumentParseTaskType, string[]> = {
     "build_document_chunks",
     "process_images",
     "build_retrieval_chunks",
+    "build_indexed_document_chunks",
     "build_embeddings",
     "finalize",
   ],
-  embed_only: ["load_retrieval_chunks", "build_embeddings", "finalize"],
+  embed_only: ["load_document_chunks", "build_embeddings", "finalize"],
 };
 
 const TASK_STAGE_LABELS: Record<string, string> = {
@@ -112,8 +114,9 @@ const TASK_STAGE_LABELS: Record<string, string> = {
   build_document_chunks: "Build document chunks",
   process_images: "Process images",
   build_retrieval_chunks: "Build retrieval chunks",
+  build_indexed_document_chunks: "Build indexed document chunks",
   build_embeddings: "Build embeddings",
-  load_retrieval_chunks: "Load retrieval chunks",
+  load_document_chunks: "Load document chunks",
   finalize: "Finalize",
 };
 
@@ -609,14 +612,14 @@ export class DocumentLibraryService {
     stageTimings: DocumentParseStageTiming[],
   ): Promise<void> {
     const document = this.requireDocument(task.documentId);
-    const retrievalChunks = await this.runTaskStage(task.taskId, stageTimings, "load_retrieval_chunks", async () =>
-      this.storage.listRetrievalChunks(document.id).map((chunk) => ({
+    const documentChunks = await this.runTaskStage(task.taskId, stageTimings, "load_document_chunks", async () =>
+      this.storage.listDocumentChunks(document.id).map((chunk) => ({
         id: chunk.id,
-        chunkText: chunk.chunk_text,
+        unitText: chunk.content_md,
       })),
     );
     const embeddingsWritten = await this.runTaskStage(task.taskId, stageTimings, "build_embeddings", async () =>
-      this.traditionalRag.buildEmbeddingsForChunks(document.id, retrievalChunks),
+      this.traditionalRag.buildEmbeddingsForChunks(document.id, documentChunks),
     );
     await this.runTaskStage(task.taskId, stageTimings, "finalize", async () => {
       this.storage.updateDocumentFeatureFlags(document.id, {
@@ -652,7 +655,7 @@ export class DocumentLibraryService {
       await this.skipTaskStage(input.taskId, input.stageTimings, "process_images");
     }
 
-    const documentChunks = await this.runTaskStage(
+    const sourceChunks = await this.runTaskStage(
       input.taskId,
       input.stageTimings,
       "build_document_chunks",
@@ -676,11 +679,18 @@ export class DocumentLibraryService {
       input.taskId,
       input.stageTimings,
       "build_retrieval_chunks",
+      async () => this.traditionalRag.createRetrievalChunks(input.document.id, sourceChunks),
+    );
+
+    const documentChunks = await this.runTaskStage(
+      input.taskId,
+      input.stageTimings,
+      "build_indexed_document_chunks",
       async () => {
-        const chunks = this.traditionalRag.createRetrievalChunks(input.document.id, documentChunks);
-        this.storage.replaceDocumentChunks(input.document.id, documentChunks);
-        this.storage.replaceRetrievalChunks(input.document.id, chunks);
-        const chunkCounts = pageChunkCounts(documentChunks);
+        const units = this.traditionalRag.createIndexedDocumentChunks(input.document.id, sourceChunks, retrievalChunks);
+        this.storage.replaceDocumentChunks(input.document.id, units);
+        this.storage.replaceRetrievalChunks(input.document.id, retrievalChunks);
+        const chunkCounts = pageChunkCounts(units);
         this.storage.syncDocumentPages(
           input.document.id,
           input.storedPages.map((page) => ({
@@ -688,7 +698,7 @@ export class DocumentLibraryService {
             chunkCount: chunkCounts.get(page.pageNo) ?? 0,
           })),
         );
-        return chunks;
+        return units;
       },
     );
 
@@ -698,7 +708,14 @@ export class DocumentLibraryService {
         input.taskId,
         input.stageTimings,
         "build_embeddings",
-        async () => this.traditionalRag.buildEmbeddingsForChunks(input.document.id, retrievalChunks),
+        async () =>
+          this.traditionalRag.buildEmbeddingsForChunks(
+            input.document.id,
+            documentChunks.map((chunk) => ({
+              id: chunk.id,
+              unitText: chunk.contentMd,
+            })),
+          ),
       );
     } else {
       await this.traditionalRag.deleteDocumentIndex(input.document.id);

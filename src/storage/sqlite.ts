@@ -15,8 +15,8 @@ import type {
   DocumentParseTaskStatus,
   DocumentParseTaskType,
   DocumentChunkSizeClass,
+  DocumentChunkKeywordHit,
   PublicCollectionRecord,
-  RetrievalChunkKeywordHit,
   SqliteStorageBackend,
   StorageDocumentParseTaskRecord,
   StorageDocumentChunkRecord,
@@ -168,6 +168,9 @@ function normalizeStoredDocumentChunk(row: SqliteRow): StoredDocumentChunk {
   return {
     id: String(row.id),
     document_id: String(row.document_id),
+    ordinal: Number(row.ordinal ?? 0),
+    reference_retrieval_chunk_id:
+      row.reference_retrieval_chunk_id == null ? null : String(row.reference_retrieval_chunk_id),
     page_no: Number(row.page_no),
     document_index: Number(row.document_index),
     page_index: Number(row.page_index),
@@ -176,6 +179,9 @@ function normalizeStoredDocumentChunk(row: SqliteRow): StoredDocumentChunk {
     content_md: String(row.content_md ?? ""),
     size_class: String(row.size_class ?? "normal") as DocumentChunkSizeClass,
     summary_text: row.summary_text == null ? null : String(row.summary_text),
+    is_split_from_oversized: Boolean(row.is_split_from_oversized),
+    split_index: Number(row.split_index ?? 0),
+    split_count: Number(row.split_count ?? 1),
     merged_page_nos_json: normalizeJsonText(String(row.merged_page_nos_json ?? "[]")),
     merged_bboxes_json: normalizeJsonText(String(row.merged_bboxes_json ?? "[]")),
   };
@@ -185,11 +191,19 @@ function normalizeStoredRetrievalChunk(row: SqliteRow): StoredRetrievalChunk {
   return {
     id: String(row.id),
     document_id: String(row.document_id),
-    source_document_chunk_id: String(row.source_document_chunk_id),
     ordinal: Number(row.ordinal ?? 0),
-    chunk_text: String(row.chunk_text ?? ""),
+    content_md: String(row.content_md ?? row.chunk_text ?? ""),
     size_class: String(row.size_class ?? "normal") as DocumentChunkSizeClass,
-    is_split_from_oversized: Boolean(row.is_split_from_oversized),
+    summary_text: row.summary_text == null ? null : String(row.summary_text),
+    source_document_chunk_ids_json: normalizeJsonText(
+      String(
+        row.source_document_chunk_ids_json ??
+          JSON.stringify(row.source_document_chunk_id ? [row.source_document_chunk_id] : []),
+      ),
+    ),
+    page_nos_json: normalizeJsonText(String(row.page_nos_json ?? "[]")),
+    source_locator: row.source_locator == null ? null : String(row.source_locator),
+    bboxes_json: normalizeJsonText(String(row.bboxes_json ?? "[]")),
   };
 }
 
@@ -258,7 +272,7 @@ export class SqliteStorage implements SqliteStorageBackend {
   initialize(): void {
     const migrate = this.db.transaction(() => {
       this.createSchemaTables();
-      this.migrateSchemaColumns();
+      this.migrateSchemaColumns({ invalidateTraditionalRagIndex: false });
       this.backfillSchemaDefaults();
       this.createSchemaIndexes();
     });
@@ -329,6 +343,8 @@ export class SqliteStorage implements SqliteStorageBackend {
       CREATE TABLE IF NOT EXISTS document_chunks (
         id TEXT PRIMARY KEY,
         document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL DEFAULT 0,
+        reference_retrieval_chunk_id TEXT,
         page_no INTEGER NOT NULL,
         document_index INTEGER NOT NULL,
         page_index INTEGER NOT NULL,
@@ -337,6 +353,9 @@ export class SqliteStorage implements SqliteStorageBackend {
         content_md TEXT NOT NULL,
         size_class TEXT NOT NULL,
         summary_text TEXT,
+        is_split_from_oversized INTEGER NOT NULL DEFAULT 0,
+        split_index INTEGER NOT NULL DEFAULT 0,
+        split_count INTEGER NOT NULL DEFAULT 1,
         merged_page_nos_json TEXT NOT NULL DEFAULT '[]',
         merged_bboxes_json TEXT NOT NULL DEFAULT '[]',
         created_at TEXT NOT NULL,
@@ -349,7 +368,13 @@ export class SqliteStorage implements SqliteStorageBackend {
         source_document_chunk_id TEXT NOT NULL REFERENCES document_chunks(id) ON DELETE CASCADE,
         ordinal INTEGER NOT NULL,
         chunk_text TEXT NOT NULL,
+        content_md TEXT NOT NULL DEFAULT '',
         size_class TEXT NOT NULL,
+        summary_text TEXT,
+        source_document_chunk_ids_json TEXT NOT NULL DEFAULT '[]',
+        page_nos_json TEXT NOT NULL DEFAULT '[]',
+        source_locator TEXT,
+        bboxes_json TEXT NOT NULL DEFAULT '[]',
         is_split_from_oversized INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -417,6 +442,13 @@ export class SqliteStorage implements SqliteStorageBackend {
         document_id UNINDEXED,
         chunk_text
       );
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS document_chunks_fts USING fts5(
+        chunk_id UNINDEXED,
+        document_id UNINDEXED,
+        chunk_text
+      );
+
     `);
   }
 
@@ -442,6 +474,12 @@ export class SqliteStorage implements SqliteStorageBackend {
       CREATE INDEX IF NOT EXISTS idx_document_chunks_document
       ON document_chunks (document_id, document_index);
 
+      CREATE INDEX IF NOT EXISTS idx_document_chunks_ordinal
+      ON document_chunks (document_id, ordinal);
+
+      CREATE INDEX IF NOT EXISTS idx_document_chunks_reference
+      ON document_chunks (reference_retrieval_chunk_id);
+
       CREATE INDEX IF NOT EXISTS idx_retrieval_chunks_document
       ON retrieval_chunks (document_id, ordinal);
 
@@ -462,87 +500,124 @@ export class SqliteStorage implements SqliteStorageBackend {
     `);
   }
 
-  private migrateSchemaColumns(): void {
-    this.addColumnIfMissing("collections", "kind", "TEXT NOT NULL DEFAULT 'user'");
-    this.addColumnIfMissing("collections", "corpus_id", "TEXT");
-    this.addColumnIfMissing("collections", "root_path", "TEXT");
-    this.addColumnIfMissing("collections", "is_deleted", "INTEGER NOT NULL DEFAULT 0");
-    this.addColumnIfMissing("collections", "created_at", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("collections", "updated_at", "TEXT NOT NULL DEFAULT ''");
+  private migrateSchemaColumns(input: { invalidateTraditionalRagIndex: boolean }): void {
+    let invalidateTraditionalRagIndex = input.invalidateTraditionalRagIndex;
+    const addColumn = (tableName: string, columnName: string, definition: string) => {
+      const added = this.addColumnIfMissing(tableName, columnName, definition);
+      return added;
+    };
 
-    this.addColumnIfMissing("documents", "corpus_id", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("documents", "relative_path", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("documents", "absolute_path", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("documents", "original_filename", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("documents", "object_key", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("documents", "source_object_key", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("documents", "pages_prefix", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("documents", "storage_uri", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("documents", "content_type", "TEXT");
-    this.addColumnIfMissing("documents", "upload_status", "TEXT NOT NULL DEFAULT 'uploaded'");
-    this.addColumnIfMissing("documents", "page_count", "INTEGER NOT NULL DEFAULT 0");
-    this.addColumnIfMissing("documents", "content", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("documents", "metadata_json", "TEXT NOT NULL DEFAULT '{}'");
-    this.addColumnIfMissing("documents", "file_mtime", "REAL NOT NULL DEFAULT 0");
-    this.addColumnIfMissing("documents", "file_size", "INTEGER NOT NULL DEFAULT 0");
-    this.addColumnIfMissing("documents", "content_sha256", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("documents", "parsed_content_sha256", "TEXT");
-    this.addColumnIfMissing("documents", "parsed_is_complete", "INTEGER NOT NULL DEFAULT 0");
-    this.addColumnIfMissing("documents", "embedding_enabled", "INTEGER NOT NULL DEFAULT 1");
-    this.addColumnIfMissing("documents", "has_embeddings", "INTEGER NOT NULL DEFAULT 0");
-    this.addColumnIfMissing("documents", "image_semantic_enabled", "INTEGER NOT NULL DEFAULT 1");
-    this.addColumnIfMissing("documents", "last_indexed_at", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("documents", "is_deleted", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("collections", "kind", "TEXT NOT NULL DEFAULT 'user'");
+    addColumn("collections", "corpus_id", "TEXT");
+    addColumn("collections", "root_path", "TEXT");
+    addColumn("collections", "is_deleted", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("collections", "created_at", "TEXT NOT NULL DEFAULT ''");
+    addColumn("collections", "updated_at", "TEXT NOT NULL DEFAULT ''");
 
-    this.addColumnIfMissing("document_pages", "object_key", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("document_pages", "heading", "TEXT");
-    this.addColumnIfMissing("document_pages", "source_locator", "TEXT");
-    this.addColumnIfMissing("document_pages", "content_hash", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("document_pages", "char_count", "INTEGER NOT NULL DEFAULT 0");
-    this.addColumnIfMissing("document_pages", "chunk_count", "INTEGER NOT NULL DEFAULT 0");
-    this.addColumnIfMissing("document_pages", "is_synthetic_page", "INTEGER NOT NULL DEFAULT 0");
-    this.addColumnIfMissing("document_pages", "updated_at", "TEXT NOT NULL DEFAULT ''");
+    addColumn("documents", "corpus_id", "TEXT NOT NULL DEFAULT ''");
+    addColumn("documents", "relative_path", "TEXT NOT NULL DEFAULT ''");
+    addColumn("documents", "absolute_path", "TEXT NOT NULL DEFAULT ''");
+    addColumn("documents", "original_filename", "TEXT NOT NULL DEFAULT ''");
+    addColumn("documents", "object_key", "TEXT NOT NULL DEFAULT ''");
+    addColumn("documents", "source_object_key", "TEXT NOT NULL DEFAULT ''");
+    addColumn("documents", "pages_prefix", "TEXT NOT NULL DEFAULT ''");
+    addColumn("documents", "storage_uri", "TEXT NOT NULL DEFAULT ''");
+    addColumn("documents", "content_type", "TEXT");
+    addColumn("documents", "upload_status", "TEXT NOT NULL DEFAULT 'uploaded'");
+    addColumn("documents", "page_count", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("documents", "content", "TEXT NOT NULL DEFAULT ''");
+    addColumn("documents", "metadata_json", "TEXT NOT NULL DEFAULT '{}'");
+    addColumn("documents", "file_mtime", "REAL NOT NULL DEFAULT 0");
+    addColumn("documents", "file_size", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("documents", "content_sha256", "TEXT NOT NULL DEFAULT ''");
+    addColumn("documents", "parsed_content_sha256", "TEXT");
+    addColumn("documents", "parsed_is_complete", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("documents", "embedding_enabled", "INTEGER NOT NULL DEFAULT 1");
+    addColumn("documents", "has_embeddings", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("documents", "image_semantic_enabled", "INTEGER NOT NULL DEFAULT 1");
+    addColumn("documents", "last_indexed_at", "TEXT NOT NULL DEFAULT ''");
+    addColumn("documents", "is_deleted", "INTEGER NOT NULL DEFAULT 0");
 
-    this.addColumnIfMissing("image_semantics", "source_document_id", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("image_semantics", "source_page_no", "INTEGER NOT NULL DEFAULT 0");
-    this.addColumnIfMissing("image_semantics", "source_image_index", "INTEGER NOT NULL DEFAULT 0");
-    this.addColumnIfMissing("image_semantics", "mime_type", "TEXT");
-    this.addColumnIfMissing("image_semantics", "width", "INTEGER");
-    this.addColumnIfMissing("image_semantics", "height", "INTEGER");
-    this.addColumnIfMissing("image_semantics", "bbox_json", "TEXT");
-    this.addColumnIfMissing("image_semantics", "object_key", "TEXT");
-    this.addColumnIfMissing("image_semantics", "storage_uri", "TEXT");
-    this.addColumnIfMissing("image_semantics", "has_text", "INTEGER");
-    this.addColumnIfMissing("image_semantics", "interference_score", "REAL");
-    this.addColumnIfMissing("image_semantics", "is_dropped", "INTEGER NOT NULL DEFAULT 0");
-    this.addColumnIfMissing("image_semantics", "recognizable", "INTEGER");
-    this.addColumnIfMissing("image_semantics", "accessible_url", "TEXT");
-    this.addColumnIfMissing("image_semantics", "semantic_text", "TEXT");
-    this.addColumnIfMissing("image_semantics", "semantic_model", "TEXT");
-    this.addColumnIfMissing("image_semantics", "last_enhanced_at", "TEXT");
+    addColumn("document_pages", "object_key", "TEXT NOT NULL DEFAULT ''");
+    addColumn("document_pages", "heading", "TEXT");
+    addColumn("document_pages", "source_locator", "TEXT");
+    addColumn("document_pages", "content_hash", "TEXT NOT NULL DEFAULT ''");
+    addColumn("document_pages", "char_count", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("document_pages", "chunk_count", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("document_pages", "is_synthetic_page", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("document_pages", "updated_at", "TEXT NOT NULL DEFAULT ''");
 
-    this.addColumnIfMissing("document_parse_tasks", "document_id", "TEXT");
-    this.addColumnIfMissing("document_parse_tasks", "document_filename", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("document_parse_tasks", "task_type", "TEXT NOT NULL DEFAULT 'upload_parse'");
-    this.addColumnIfMissing("document_parse_tasks", "status", "TEXT NOT NULL DEFAULT 'queued'");
-    this.addColumnIfMissing("document_parse_tasks", "progress_percent", "INTEGER NOT NULL DEFAULT 0");
-    this.addColumnIfMissing("document_parse_tasks", "current_stage", "TEXT");
-    this.addColumnIfMissing("document_parse_tasks", "options_json", "TEXT NOT NULL DEFAULT '{}'");
-    this.addColumnIfMissing("document_parse_tasks", "stage_timings_json", "TEXT NOT NULL DEFAULT '[]'");
-    this.addColumnIfMissing("document_parse_tasks", "error_message", "TEXT");
-    this.addColumnIfMissing("document_parse_tasks", "created_at", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("document_parse_tasks", "started_at", "TEXT");
-    this.addColumnIfMissing("document_parse_tasks", "finished_at", "TEXT");
-    this.addColumnIfMissing("document_parse_tasks", "updated_at", "TEXT NOT NULL DEFAULT ''");
-    this.addColumnIfMissing("document_parse_tasks", "total_duration_ms", "INTEGER");
+    invalidateTraditionalRagIndex =
+      addColumn("document_chunks", "ordinal", "INTEGER NOT NULL DEFAULT 0") || invalidateTraditionalRagIndex;
+    invalidateTraditionalRagIndex =
+      addColumn("document_chunks", "reference_retrieval_chunk_id", "TEXT") || invalidateTraditionalRagIndex;
+    invalidateTraditionalRagIndex =
+      addColumn("document_chunks", "is_split_from_oversized", "INTEGER NOT NULL DEFAULT 0") ||
+      invalidateTraditionalRagIndex;
+    invalidateTraditionalRagIndex =
+      addColumn("document_chunks", "split_index", "INTEGER NOT NULL DEFAULT 0") || invalidateTraditionalRagIndex;
+    invalidateTraditionalRagIndex =
+      addColumn("document_chunks", "split_count", "INTEGER NOT NULL DEFAULT 1") || invalidateTraditionalRagIndex;
+
+    invalidateTraditionalRagIndex =
+      addColumn("retrieval_chunks", "content_md", "TEXT NOT NULL DEFAULT ''") || invalidateTraditionalRagIndex;
+    invalidateTraditionalRagIndex =
+      addColumn("retrieval_chunks", "summary_text", "TEXT") || invalidateTraditionalRagIndex;
+    invalidateTraditionalRagIndex =
+      addColumn("retrieval_chunks", "source_document_chunk_ids_json", "TEXT NOT NULL DEFAULT '[]'") ||
+      invalidateTraditionalRagIndex;
+    invalidateTraditionalRagIndex =
+      addColumn("retrieval_chunks", "page_nos_json", "TEXT NOT NULL DEFAULT '[]'") || invalidateTraditionalRagIndex;
+    invalidateTraditionalRagIndex =
+      addColumn("retrieval_chunks", "source_locator", "TEXT") || invalidateTraditionalRagIndex;
+    invalidateTraditionalRagIndex =
+      addColumn("retrieval_chunks", "bboxes_json", "TEXT NOT NULL DEFAULT '[]'") || invalidateTraditionalRagIndex;
+
+    addColumn("image_semantics", "source_document_id", "TEXT NOT NULL DEFAULT ''");
+    addColumn("image_semantics", "source_page_no", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("image_semantics", "source_image_index", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("image_semantics", "mime_type", "TEXT");
+    addColumn("image_semantics", "width", "INTEGER");
+    addColumn("image_semantics", "height", "INTEGER");
+    addColumn("image_semantics", "bbox_json", "TEXT");
+    addColumn("image_semantics", "object_key", "TEXT");
+    addColumn("image_semantics", "storage_uri", "TEXT");
+    addColumn("image_semantics", "has_text", "INTEGER");
+    addColumn("image_semantics", "interference_score", "REAL");
+    addColumn("image_semantics", "is_dropped", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("image_semantics", "recognizable", "INTEGER");
+    addColumn("image_semantics", "accessible_url", "TEXT");
+    addColumn("image_semantics", "semantic_text", "TEXT");
+    addColumn("image_semantics", "semantic_model", "TEXT");
+    addColumn("image_semantics", "last_enhanced_at", "TEXT");
+
+    addColumn("document_parse_tasks", "document_id", "TEXT");
+    addColumn("document_parse_tasks", "document_filename", "TEXT NOT NULL DEFAULT ''");
+    addColumn("document_parse_tasks", "task_type", "TEXT NOT NULL DEFAULT 'upload_parse'");
+    addColumn("document_parse_tasks", "status", "TEXT NOT NULL DEFAULT 'queued'");
+    addColumn("document_parse_tasks", "progress_percent", "INTEGER NOT NULL DEFAULT 0");
+    addColumn("document_parse_tasks", "current_stage", "TEXT");
+    addColumn("document_parse_tasks", "options_json", "TEXT NOT NULL DEFAULT '{}'");
+    addColumn("document_parse_tasks", "stage_timings_json", "TEXT NOT NULL DEFAULT '[]'");
+    addColumn("document_parse_tasks", "error_message", "TEXT");
+    addColumn("document_parse_tasks", "created_at", "TEXT NOT NULL DEFAULT ''");
+    addColumn("document_parse_tasks", "started_at", "TEXT");
+    addColumn("document_parse_tasks", "finished_at", "TEXT");
+    addColumn("document_parse_tasks", "updated_at", "TEXT NOT NULL DEFAULT ''");
+    addColumn("document_parse_tasks", "total_duration_ms", "INTEGER");
+
+    if (invalidateTraditionalRagIndex) {
+      this.invalidateTraditionalRagIndexState();
+    }
   }
 
-  private addColumnIfMissing(tableName: string, columnName: string, definition: string): void {
+  private addColumnIfMissing(tableName: string, columnName: string, definition: string): boolean {
     const columns = this.tableColumns(tableName);
     if (columns.has(columnName)) {
-      return;
+      return false;
     }
     this.db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+    return true;
   }
 
   private backfillSchemaDefaults(): void {
@@ -583,6 +658,25 @@ export class SqliteStorage implements SqliteStorageBackend {
       SET updated_at = created_at
       WHERE updated_at = '' AND created_at <> '';
     `);
+  }
+
+  private invalidateTraditionalRagIndexState(): void {
+    this.db.exec(`
+      DELETE FROM document_chunks_fts;
+      DELETE FROM retrieval_chunks_fts;
+      DELETE FROM retrieval_chunks;
+      DELETE FROM document_chunks;
+      UPDATE documents
+      SET has_embeddings = 0
+      WHERE has_embeddings <> 0;
+    `);
+  }
+
+  private tableExists(tableName: string): boolean {
+    const row = this.db
+      .prepare("SELECT 1 AS found FROM sqlite_master WHERE type IN ('table', 'view') AND name = ? LIMIT 1")
+      .get(tableName) as SqliteRow | undefined;
+    return Boolean(row?.found);
   }
 
   private tableColumns(tableName: string): Set<string> {
@@ -721,6 +815,7 @@ export class SqliteStorage implements SqliteStorageBackend {
       // Reference: legacy/python/src/fs_explorer/storage/postgres.py upsert_document_stub clears stale page/image rows.
       this.db.prepare("DELETE FROM document_pages WHERE document_id = ?").run(document.id);
       this.db.prepare("DELETE FROM retrieval_chunks_fts WHERE document_id = ?").run(document.id);
+      this.db.prepare("DELETE FROM document_chunks_fts WHERE document_id = ?").run(document.id);
       this.db.prepare("DELETE FROM retrieval_chunks WHERE document_id = ?").run(document.id);
       this.db.prepare("DELETE FROM document_chunks WHERE document_id = ?").run(document.id);
       this.db.prepare("DELETE FROM image_semantics WHERE source_document_id = ?").run(document.id);
@@ -786,6 +881,7 @@ export class SqliteStorage implements SqliteStorageBackend {
       return null;
     }
     this.db.prepare("DELETE FROM retrieval_chunks_fts WHERE document_id = ?").run(docId);
+    this.db.prepare("DELETE FROM document_chunks_fts WHERE document_id = ?").run(docId);
     this.db.prepare("DELETE FROM documents WHERE id = ?").run(docId);
     return existing;
   }
@@ -908,25 +1004,34 @@ export class SqliteStorage implements SqliteStorageBackend {
     const deleted = Number(
       this.db.prepare("DELETE FROM document_chunks WHERE document_id = ?").run(documentId).changes ?? 0,
     );
+    this.db.prepare("DELETE FROM document_chunks_fts WHERE document_id = ?").run(documentId);
     if (chunks.length === 0) {
       return { inserted: 0, deleted };
     }
     const now = utcNowIso();
     const run = this.db.transaction(() => {
-      const statement = this.db.prepare(
-        `
+        const statement = this.db.prepare(
+          `
           INSERT INTO document_chunks (
-            id, document_id, page_no, document_index, page_index, block_type,
-            bbox_json, content_md, size_class, summary_text, merged_page_nos_json,
-            merged_bboxes_json, created_at, updated_at
+            id, document_id, ordinal, reference_retrieval_chunk_id, page_no, document_index, page_index,
+            block_type, bbox_json, content_md, size_class, summary_text, is_split_from_oversized,
+            split_index, split_count, merged_page_nos_json, merged_bboxes_json, created_at, updated_at
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        );
+      const ftsStatement = this.db.prepare(
+        `
+          INSERT INTO document_chunks_fts (chunk_id, document_id, chunk_text)
+          VALUES (?, ?, ?)
         `,
       );
       for (const chunk of chunks) {
         statement.run(
           chunk.id,
           chunk.documentId,
+          chunk.ordinal ?? 0,
+          chunk.referenceRetrievalChunkId ?? null,
           chunk.pageNo,
           chunk.documentIndex,
           chunk.pageIndex,
@@ -935,11 +1040,15 @@ export class SqliteStorage implements SqliteStorageBackend {
           chunk.contentMd,
           chunk.sizeClass,
           chunk.summaryText ?? null,
+          chunk.isSplitFromOversized ? 1 : 0,
+          chunk.splitIndex ?? 0,
+          chunk.splitCount ?? 1,
           chunk.mergedPageNosJson ?? "[]",
           chunk.mergedBboxesJson ?? "[]",
           now,
           now,
         );
+        ftsStatement.run(chunk.id, chunk.documentId, chunk.contentMd);
       }
     });
     run();
@@ -953,7 +1062,7 @@ export class SqliteStorage implements SqliteStorageBackend {
           SELECT *
           FROM document_chunks
           WHERE document_id = ?
-          ORDER BY document_index ASC
+          ORDER BY document_index ASC, split_index ASC, ordinal ASC
         `,
       )
       .all(documentId) as SqliteRow[];
@@ -985,35 +1094,43 @@ export class SqliteStorage implements SqliteStorageBackend {
       const chunkStatement = this.db.prepare(
         `
           INSERT INTO retrieval_chunks (
-            id, document_id, source_document_chunk_id, ordinal, chunk_text,
-            size_class, is_split_from_oversized, created_at, updated_at
+            id, document_id, source_document_chunk_id, ordinal, chunk_text, content_md,
+            size_class, summary_text, source_document_chunk_ids_json, page_nos_json, source_locator, bboxes_json,
+            is_split_from_oversized, created_at, updated_at
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `,
-      );
-      const ftsStatement = this.db.prepare(
-        `
-          INSERT INTO retrieval_chunks_fts (chunk_id, document_id, chunk_text)
-          VALUES (?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       );
       for (const chunk of chunks) {
+        const sourceDocumentChunkIds = JSON.parse(chunk.sourceDocumentChunkIdsJson || "[]") as string[];
         chunkStatement.run(
           chunk.id,
           chunk.documentId,
-          chunk.sourceDocumentChunkId,
+          sourceDocumentChunkIds[0] ?? "",
           chunk.ordinal,
-          chunk.chunkText,
+          chunk.contentMd,
+          chunk.contentMd,
           chunk.sizeClass,
-          chunk.isSplitFromOversized ? 1 : 0,
+          chunk.summaryText ?? null,
+          chunk.sourceDocumentChunkIdsJson,
+          chunk.pageNosJson,
+          chunk.sourceLocator ?? null,
+          chunk.bboxesJson ?? "[]",
+          0,
           now,
           now,
         );
-        ftsStatement.run(chunk.id, chunk.documentId, chunk.chunkText);
       }
     });
     run();
     return { inserted: chunks.length, deleted: Math.max(deletedFts, deletedChunks) };
+  }
+
+  getRetrievalChunk(chunkId: string): StoredRetrievalChunk | null {
+    const row = this.db
+      .prepare("SELECT * FROM retrieval_chunks WHERE id = ? LIMIT 1")
+      .get(chunkId) as SqliteRow | undefined;
+    return row ? normalizeStoredRetrievalChunk(row) : null;
   }
 
   listRetrievalChunks(documentId: string): StoredRetrievalChunk[] {
@@ -1030,11 +1147,11 @@ export class SqliteStorage implements SqliteStorageBackend {
     return rows.map(normalizeStoredRetrievalChunk);
   }
 
-  keywordSearchRetrievalChunks(input: {
+  keywordSearchDocumentChunks(input: {
     query: string;
     documentIds: string[];
     limit: number;
-  }): RetrievalChunkKeywordHit[] {
+  }): DocumentChunkKeywordHit[] {
     const documentIds = [...new Set(input.documentIds.map((item) => String(item).trim()).filter(Boolean))];
     if (!input.query.trim() || documentIds.length === 0) {
       return [];
@@ -1044,29 +1161,30 @@ export class SqliteStorage implements SqliteStorageBackend {
       .prepare(
         `
           SELECT
-            rc.id AS retrieval_chunk_id,
-            rc.document_id,
-            rc.source_document_chunk_id,
-            rc.ordinal,
-            rc.chunk_text,
-            rc.size_class,
-            rc.is_split_from_oversized,
-            -bm25(retrieval_chunks_fts) AS score
-          FROM retrieval_chunks_fts
-          JOIN retrieval_chunks rc ON rc.id = retrieval_chunks_fts.chunk_id
-          WHERE retrieval_chunks_fts MATCH ?
-            AND rc.document_id IN (${placeholders})
-          ORDER BY score DESC, rc.ordinal ASC
+            dc.id AS document_chunk_id,
+            dc.document_id,
+            dc.reference_retrieval_chunk_id,
+            dc.ordinal,
+            dc.content_md,
+            dc.size_class,
+            dc.is_split_from_oversized,
+            -bm25(document_chunks_fts) AS score
+          FROM document_chunks_fts
+          JOIN document_chunks dc ON dc.id = document_chunks_fts.chunk_id
+          WHERE document_chunks_fts MATCH ?
+            AND dc.document_id IN (${placeholders})
+          ORDER BY score DESC, dc.ordinal ASC
           LIMIT ?
         `,
       )
       .all(input.query, ...documentIds, Math.max(Number(input.limit || 10), 1)) as SqliteRow[];
     return rows.map((row) => ({
-      retrieval_chunk_id: String(row.retrieval_chunk_id),
+      document_chunk_id: String(row.document_chunk_id),
       document_id: String(row.document_id),
-      source_document_chunk_id: String(row.source_document_chunk_id),
+      reference_retrieval_chunk_id:
+        row.reference_retrieval_chunk_id == null ? null : String(row.reference_retrieval_chunk_id),
       ordinal: Number(row.ordinal ?? 0),
-      chunk_text: String(row.chunk_text ?? ""),
+      content_md: String(row.content_md ?? ""),
       size_class: String(row.size_class ?? "normal") as DocumentChunkSizeClass,
       is_split_from_oversized: Boolean(row.is_split_from_oversized),
       score: Number(row.score ?? 0),

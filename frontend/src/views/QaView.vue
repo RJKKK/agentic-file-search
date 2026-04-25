@@ -46,6 +46,7 @@ const ragState = reactive({
   loading: false,
   answer: "",
   usedChunks: [],
+  detailChunks: [],
   warnings: [],
   error: "",
   detailContentByChunkId: {},
@@ -59,7 +60,11 @@ const isAsking = computed(() =>
 );
 
 const expandableDetailChunks = computed(() =>
-  (ragState.usedChunks || []).filter((chunk) => chunk.show_full_chunk_detail),
+  [...(ragState.detailChunks || []), ...(ragState.usedChunks || [])]
+    .filter((chunk, index, list) =>
+      chunk.show_full_chunk_detail &&
+      list.findIndex((item) => item.reference_id === chunk.reference_id && item.reference_kind === chunk.reference_kind) === index,
+    ),
 );
 
 const renderedAnswer = computed(() => {
@@ -145,6 +150,7 @@ async function startTraditionalQuery() {
   ragState.loading = true;
   ragState.answer = "";
   ragState.usedChunks = [];
+  ragState.detailChunks = [];
   ragState.warnings = [];
   ragState.error = "";
   ragState.detailContentByChunkId = {};
@@ -179,6 +185,7 @@ async function startTraditionalQuery() {
         complete(payload) {
           ragState.answer = payload.answer || ragState.answer;
           ragState.usedChunks = payload.used_chunks || [];
+          ragState.detailChunks = payload.detail_chunks || [];
           ragState.warnings = payload.warnings || [];
         },
         error(payload) {
@@ -377,7 +384,7 @@ function escapeRegExp(value) {
 }
 
 function buildInlineDetailMarkup(chunk) {
-  const chunkId = chunk.document_chunk_id;
+  const chunkId = chunk.reference_id;
   const open = Boolean(ragState.detailOpenByChunkId[chunkId]);
   const loading = Boolean(ragState.detailLoadingByChunkId[chunkId]);
   const error = String(ragState.detailErrorByChunkId[chunkId] || "");
@@ -421,7 +428,7 @@ function decorateTraditionalAnswerHtml(html) {
 }
 
 async function toggleFullChunkDetail(chunk) {
-  const chunkId = chunk.document_chunk_id;
+  const chunkId = chunk.reference_id;
   const isOpen = Boolean(ragState.detailOpenByChunkId[chunkId]);
   if (isOpen) {
     ragState.detailOpenByChunkId = {
@@ -473,7 +480,8 @@ function handleAnswerInteraction(event) {
   }
   event.preventDefault();
   const chunkId = button.getAttribute("data-chunk-id") || "";
-  const chunk = (ragState.usedChunks || []).find((item) => item.document_chunk_id === chunkId);
+  const chunk = [...(ragState.detailChunks || []), ...(ragState.usedChunks || [])]
+    .find((item) => item.reference_id === chunkId);
   if (!chunk) {
     return;
   }
@@ -682,17 +690,18 @@ function scrollAnswerToBottom() {
 
             <div v-if="queryMode === 'traditional' && ragState.usedChunks.length" class="rag-citations">
               <h3>详情内容如下</h3>
-              <div v-for="chunk in ragState.usedChunks" :key="chunk.document_chunk_id" class="citation-card">
+              <div v-for="chunk in ragState.usedChunks" :key="chunk.reference_id" class="citation-card">
                 <div class="citation-meta">
                   <span>[{{ chunk.citation_no }}]</span>
                   <span>{{ chunk.document_name }}</span>
+                  <span>{{ chunk.reference_kind }}</span>
                   <span>score {{ Number(chunk.score || 0).toFixed(4) }}</span>
                   <span>pages {{ (chunk.page_nos || []).join(", ") }}</span>
                   <span>locator {{ chunk.source_locator || "-" }}</span>
                   <span>compression {{ chunk.compression_applied ? "yes" : "no" }}</span>
                 </div>
                 <div class="citation-links">
-                  <span>retrieval ids: {{ (chunk.retrieval_chunk_ids || []).join(", ") || "-" }}</span>
+                  <span>retrieval ids: {{ (chunk.retrieval_unit_ids || []).join(", ") || "-" }}</span>
                   <a :href="chunk.source_link" target="_blank" rel="noreferrer">Open Chunk</a>
                 </div>
               </div>

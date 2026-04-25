@@ -296,122 +296,262 @@ describe("http server", () => {
 
   it("supports traditional rag answers plus chunk and image asset routes", async () => {
     const { app, storage, blobStore } = await createAppFixture();
-    const corpusId = storage.getOrCreateCorpus("test-root");
-    const docId = "manual-doc";
-    storage.upsertDocumentStub({
-      id: docId,
-      corpusId,
-      relativePath: "alpha.pdf",
-      absolutePath: join(tmpdir(), "alpha.pdf"),
-      content: "",
-      metadataJson: "{}",
-      fileMtime: 1,
-      fileSize: 1,
-      contentSha256: "hash-alpha",
-      originalFilename: "alpha.pdf",
-      objectKey: "documents/alpha.pdf",
-      sourceObjectKey: "documents/alpha.pdf",
-      pagesPrefix: "documents/alpha/pages",
-      storageUri: "storage://alpha.pdf",
-      contentType: "application/pdf",
-      uploadStatus: "completed",
-      pageCount: 1,
-      parsedContentSha256: "parsed-alpha",
-      parsedIsComplete: true,
-      embeddingEnabled: false,
-      hasEmbeddings: false,
-      imageSemanticEnabled: false,
-    });
-    storage.replaceDocumentChunks(docId, [
-      {
-        id: "manual-dchunk-1",
-        documentId: docId,
-        pageNo: 1,
-        documentIndex: 1,
-        pageIndex: 1,
-        blockType: "paragraph",
-        bboxJson: "[0,0,1,1]",
-        contentMd: "The purchase price is $45,000,000.",
-        sizeClass: "normal",
-        summaryText: null,
-        mergedPageNosJson: "[1]",
-        mergedBboxesJson: "[[0,0,1,1]]",
-      },
-    ]);
-    storage.replaceRetrievalChunks(docId, [
-      {
-        id: "manual-rchunk-1",
-        documentId: docId,
-        sourceDocumentChunkId: "manual-dchunk-1",
-        ordinal: 1,
-        chunkText: "The purchase price is $45,000,000.",
-        sizeClass: "normal",
-        isSplitFromOversized: false,
-      },
-    ]);
-    const chunks = storage.listDocumentChunks(docId);
-    assert.equal(chunks.length, 1);
+    const previousServerBaseUrl = process.env.FS_EXPLORER_SERVER_BASE_URL;
+    const previousPort = process.env.FS_EXPLORER_PORT;
+    delete process.env.FS_EXPLORER_SERVER_BASE_URL;
+    process.env.FS_EXPLORER_PORT = "8000";
+    try {
+      const corpusId = storage.getOrCreateCorpus("test-root");
+      const docId = "manual-doc";
+      storage.upsertDocumentStub({
+        id: docId,
+        corpusId,
+        relativePath: "alpha.pdf",
+        absolutePath: join(tmpdir(), "alpha.pdf"),
+        content: "",
+        metadataJson: "{}",
+        fileMtime: 1,
+        fileSize: 1,
+        contentSha256: "hash-alpha",
+        originalFilename: "alpha.pdf",
+        objectKey: "documents/alpha.pdf",
+        sourceObjectKey: "documents/alpha.pdf",
+        pagesPrefix: "documents/alpha/pages",
+        storageUri: "storage://alpha.pdf",
+        contentType: "application/pdf",
+        uploadStatus: "completed",
+        pageCount: 1,
+        parsedContentSha256: "parsed-alpha",
+        parsedIsComplete: true,
+        embeddingEnabled: false,
+        hasEmbeddings: false,
+        imageSemanticEnabled: false,
+      });
+      storage.replaceDocumentChunks(docId, [
+        {
+          id: "manual-dchunk-1",
+          documentId: docId,
+          ordinal: 1,
+          referenceRetrievalChunkId: "manual-rchunk-1",
+          pageNo: 1,
+          documentIndex: 1,
+          pageIndex: 1,
+          blockType: "paragraph",
+          bboxJson: "[0,0,1,1]",
+          contentMd: "The purchase price is $45,000,000.",
+          sizeClass: "normal",
+          summaryText: null,
+          isSplitFromOversized: false,
+          splitIndex: 0,
+          splitCount: 1,
+          mergedPageNosJson: "[1]",
+          mergedBboxesJson: "[[0,0,1,1]]",
+        },
+      ]);
+      storage.replaceRetrievalChunks(docId, [
+        {
+          id: "manual-rchunk-1",
+          documentId: docId,
+          ordinal: 1,
+          contentMd: "The purchase price is $45,000,000.",
+          sizeClass: "normal",
+          sourceDocumentChunkIdsJson: JSON.stringify(["manual-dchunk-1"]),
+          pageNosJson: JSON.stringify([1]),
+          sourceLocator: "page-1",
+          bboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+        },
+      ]);
+      const chunks = storage.listDocumentChunks(docId);
+      assert.equal(chunks.length, 1);
 
-    const rag = await app.inject({
-      method: "POST",
-      url: "/api/rag/query",
-      payload: {
-        question: "What is the purchase price?",
-        mode: "keyword",
-        document_ids: [docId],
-      },
-    });
-    assert.equal(rag.statusCode, 200);
-    assert.equal(rag.json().used_chunks[0].document_chunk_id, chunks[0]?.id);
-    assert.equal("content" in rag.json().used_chunks[0], false);
-    assert.equal(rag.json().used_chunks[0].citation_no, 1);
-    assert.equal(rag.json().used_chunks[0].document_name, "alpha.pdf");
+      const rag = await app.inject({
+        method: "POST",
+        url: "/api/rag/query",
+        payload: {
+          question: "What is the purchase price?",
+          mode: "keyword",
+          document_ids: [docId],
+        },
+      });
+      assert.equal(rag.statusCode, 200);
+      assert.equal(rag.json().used_chunks[0].reference_id, "manual-rchunk-1");
+      assert.equal(rag.json().used_chunks[0].reference_kind, "retrieval_chunk");
+      assert.equal("content" in rag.json().used_chunks[0], false);
+      assert.equal(rag.json().used_chunks[0].citation_no, 1);
+      assert.equal(rag.json().used_chunks[0].document_name, "alpha.pdf");
+      assert.match(
+        rag.json().used_chunks[0].source_link,
+        /^http:\/\/localhost:8000\/api\/retrieval-chunks\/manual-rchunk-1\/content$/,
+      );
 
-    const retrieve = await app.inject({
-      method: "POST",
-      url: "/api/rag/retrieve",
-      payload: {
-        question: "What is the purchase price?",
-        mode: "keyword",
-        document_ids: [docId],
-      },
-    });
-    assert.equal(retrieve.statusCode, 200);
-    assert.equal(retrieve.json().retrieved_chunks[0].document_chunk_id, chunks[0]?.id);
-    assert.equal("content" in retrieve.json().retrieved_chunks[0], false);
+      const retrieve = await app.inject({
+        method: "POST",
+        url: "/api/rag/retrieve",
+        payload: {
+          question: "What is the purchase price?",
+          mode: "keyword",
+          document_ids: [docId],
+        },
+      });
+      assert.equal(retrieve.statusCode, 200);
+      assert.equal(retrieve.json().retrieved_chunks[0].reference_id, "manual-rchunk-1");
+      assert.equal(retrieve.json().retrieved_chunks[0].reference_kind, "retrieval_chunk");
+      assert.equal("content" in retrieve.json().retrieved_chunks[0], false);
+      assert.match(String(retrieve.json().retrieved_chunks[0].debug_enriched_content || ""), /purchase price/i);
+      assert.doesNotMatch(
+        String(retrieve.json().retrieved_chunks[0].debug_enriched_content || ""),
+        /\/api\/retrieval-chunks\/manual-rchunk-1\/content/,
+      );
 
-    const chunkContent = await app.inject({
-      method: "GET",
-      url: `/api/document-chunks/${chunks[0]?.id}/content`,
-    });
-    assert.equal(chunkContent.statusCode, 200);
-    assert.match(chunkContent.json().chunk.content_md, /purchase price/i);
+      const chunkContent = await app.inject({
+        method: "GET",
+        url: "/api/retrieval-chunks/manual-rchunk-1/content",
+      });
+      assert.equal(chunkContent.statusCode, 200);
+      assert.match(chunkContent.json().chunk.content_md, /purchase price/i);
 
-    await blobStore.put({
-      objectKey: "documents/alpha.pdf/images/img-1.png",
-      data: Buffer.from("png-bytes", "utf8"),
-    });
-    storage.upsertImageSemantics([
-      {
-        imageHash: "img-1",
-        sourceDocumentId: docId,
-        sourcePageNo: 1,
-        sourceImageIndex: 0,
-        mimeType: "image/png",
+      const documentChunkContent = await app.inject({
+        method: "GET",
+        url: `/api/document-chunks/${chunks[0]?.id}/content`,
+      });
+      assert.equal(documentChunkContent.statusCode, 200);
+      assert.match(documentChunkContent.json().chunk.content_md, /purchase price/i);
+
+      await blobStore.put({
         objectKey: "documents/alpha.pdf/images/img-1.png",
-        accessibleUrl: "/api/assets/images/img-1",
-      },
-    ]);
-    const image = await app.inject({
-      method: "GET",
-      url: "/api/assets/images/img-1",
-    });
-    assert.equal(image.statusCode, 200);
-    assert.equal(image.headers["content-type"], "image/png");
-    assert.equal(image.body, "png-bytes");
+        data: Buffer.from("png-bytes", "utf8"),
+      });
+      storage.upsertImageSemantics([
+        {
+          imageHash: "img-1",
+          sourceDocumentId: docId,
+          sourcePageNo: 1,
+          sourceImageIndex: 0,
+          mimeType: "image/png",
+          objectKey: "documents/alpha.pdf/images/img-1.png",
+          accessibleUrl: "/api/assets/images/img-1",
+        },
+      ]);
+      const image = await app.inject({
+        method: "GET",
+        url: "/api/assets/images/img-1",
+      });
+      assert.equal(image.statusCode, 200);
+      assert.equal(image.headers["content-type"], "image/png");
+      assert.equal(image.body, "png-bytes");
+    } finally {
+      process.env.FS_EXPLORER_SERVER_BASE_URL = previousServerBaseUrl;
+      process.env.FS_EXPLORER_PORT = previousPort;
+      await app.close();
+      storage.close();
+    }
+  });
 
-    await app.close();
-    storage.close();
+  it("returns the final traditional rag prompt preview before the model request", async () => {
+    const { app, storage } = await createAppFixture();
+    const previousServerBaseUrl = process.env.FS_EXPLORER_SERVER_BASE_URL;
+    const previousPort = process.env.FS_EXPLORER_PORT;
+    process.env.FS_EXPLORER_SERVER_BASE_URL = "https://rag.example.com";
+    process.env.FS_EXPLORER_PORT = "8000";
+    try {
+      const corpusId = storage.getOrCreateCorpus("test-root");
+      const docId = "prompt-preview-doc";
+      storage.upsertDocumentStub({
+        id: docId,
+        corpusId,
+        relativePath: "prompt-preview.pdf",
+        absolutePath: join(tmpdir(), "prompt-preview.pdf"),
+        content: "",
+        metadataJson: "{}",
+        fileMtime: 1,
+        fileSize: 1,
+        contentSha256: "hash-prompt-preview",
+        originalFilename: "prompt-preview.pdf",
+        objectKey: "documents/prompt-preview.pdf",
+        sourceObjectKey: "documents/prompt-preview.pdf",
+        pagesPrefix: "documents/prompt-preview/pages",
+        storageUri: "storage://prompt-preview.pdf",
+        contentType: "application/pdf",
+        uploadStatus: "completed",
+        pageCount: 1,
+        parsedContentSha256: "parsed-prompt-preview",
+        parsedIsComplete: true,
+        embeddingEnabled: false,
+        hasEmbeddings: false,
+        imageSemanticEnabled: false,
+      });
+      storage.replaceDocumentChunks(docId, [
+        {
+          id: "prompt-dchunk-1",
+          documentId: docId,
+          ordinal: 1,
+          referenceRetrievalChunkId: "prompt-rchunk-1",
+          pageNo: 1,
+          documentIndex: 1,
+          pageIndex: 1,
+          blockType: "paragraph",
+          bboxJson: "[0,0,1,1]",
+          contentMd: "The purchase price is $45,000,000.",
+          sizeClass: "normal",
+          summaryText: "Purchase price appendix summary",
+          isSplitFromOversized: true,
+          splitIndex: 0,
+          splitCount: 1,
+          mergedPageNosJson: "[1]",
+          mergedBboxesJson: "[[0,0,1,1]]",
+        },
+      ]);
+      storage.replaceRetrievalChunks(docId, [
+        {
+          id: "prompt-rchunk-1",
+          documentId: docId,
+          ordinal: 1,
+          contentMd: "The purchase price is $45,000,000.",
+          sizeClass: "oversized",
+          summaryText: "Purchase price appendix summary",
+          sourceDocumentChunkIdsJson: JSON.stringify(["prompt-dchunk-1"]),
+          pageNosJson: JSON.stringify([1]),
+          sourceLocator: "page-1",
+          bboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+        },
+      ]);
+      const preview = await app.inject({
+        method: "POST",
+        url: "/api/rag/prompt-preview",
+        payload: {
+          question: "What is the purchase price?",
+          mode: "keyword",
+          document_ids: [docId],
+        },
+      });
+      assert.equal(preview.statusCode, 200);
+      const payload = preview.json();
+      assert.equal(payload.prompt_variant, "stream");
+      assert.equal(payload.messages[0]?.role, "system");
+      assert.equal(payload.messages[1]?.role, "user");
+      assert.match(String(payload.system_prompt || ""), /direct link/i);
+      assert.match(String(payload.user_prompt || ""), /Question:/);
+      assert.match(String(payload.user_prompt || ""), /Evidence:/);
+      assert.match(String(payload.user_prompt || ""), /chunk\[1\] summary:/i);
+      assert.match(String(payload.user_prompt || ""), /chunk\[1\] compressed excerpt:/i);
+      assert.match(String(payload.user_prompt || ""), /compressed excerpt/i);
+      assert.match(
+        String(payload.user_prompt || ""),
+        /Full content is available at https:\/\/rag\.example\.com\/api\/retrieval-chunks\/prompt-rchunk-1\/content, and you may provide this link directly to the user when it is helpful\./i,
+      );
+      assert.match(
+        String(payload.user_prompt || ""),
+        /https:\/\/rag\.example\.com\/api\/retrieval-chunks\/prompt-rchunk-1\/content/,
+      );
+      assert.doesNotMatch(String(payload.user_prompt || ""), /Source:/);
+      assert.match(String(payload.user_prompt || ""), /purchase price/i);
+      assert.match(String(payload.request_body_json || ""), /"stream": true/);
+    } finally {
+      process.env.FS_EXPLORER_SERVER_BASE_URL = previousServerBaseUrl;
+      process.env.FS_EXPLORER_PORT = previousPort;
+      await app.close();
+      storage.close();
+    }
   });
 
   it("maps model citation numbers back to lightweight retrieved chunks", async () => {
@@ -453,6 +593,8 @@ describe("http server", () => {
       Array.from({ length: 5 }, (_, index) => ({
         id: `dchunk-${index + 1}`,
         documentId: docId,
+        ordinal: index + 1,
+        referenceRetrievalChunkId: index === 4 ? null : `rchunk-${index + 1}`,
         pageNo: index + 1,
         documentIndex: index + 1,
         pageIndex: 1,
@@ -461,23 +603,27 @@ describe("http server", () => {
         contentMd: `purchase price evidence ${index + 1}`,
         sizeClass: "normal",
         summaryText: null,
+        isSplitFromOversized: index === 4,
+        splitIndex: 0,
+        splitCount: 1,
         mergedPageNosJson: JSON.stringify([index + 1]),
         mergedBboxesJson: JSON.stringify([[0, 0, 1, 1]]),
       })),
     );
     storage.replaceRetrievalChunks(
       docId,
-      Array.from({ length: 5 }, (_, index) => ({
+      Array.from({ length: 4 }, (_, index) => ({
         id: `rchunk-${index + 1}`,
         documentId: docId,
-        sourceDocumentChunkId: `dchunk-${index + 1}`,
         ordinal: index + 1,
-        chunkText: `purchase price evidence ${index + 1}`,
+        contentMd: `purchase price evidence ${index + 1}`,
         sizeClass: "normal",
-        isSplitFromOversized: index === 4,
+        sourceDocumentChunkIdsJson: JSON.stringify([`dchunk-${index + 1}`]),
+        pageNosJson: JSON.stringify([index + 1]),
+        sourceLocator: `page-${index + 1}`,
+        bboxesJson: JSON.stringify([[0, 0, 1, 1]]),
       })),
     );
-
     const originalFetch = globalThis.fetch;
     const previousEmbeddingUrl = process.env.EMBEDDING_BASE_URL;
     const previousEmbeddingKey = process.env.EMBEDDING_API_KEY;
@@ -507,7 +653,7 @@ describe("http server", () => {
             result: Array.from({ length: 5 }, (_, index) => ({
               id: `qdrant-${index + 1}`,
               score: 10 - index,
-              payload: { retrieval_chunk_id: `rchunk-${index + 1}` },
+              payload: { retrieval_unit_id: `dchunk-${index + 1}` },
             })),
           }),
           { status: 200, headers: { "Content-Type": "application/json" } },
@@ -549,12 +695,17 @@ describe("http server", () => {
         [2, 5],
       );
       assert.deepEqual(
-        result.used_chunks.map((chunk) => chunk.document_chunk_id),
-        ["dchunk-2", "dchunk-5"],
+        result.used_chunks.map((chunk) => chunk.reference_id),
+        ["rchunk-2", "dchunk-5"],
       );
+      assert.deepEqual(
+        result.used_chunks.map((chunk) => chunk.reference_kind),
+        ["retrieval_chunk", "document_chunk"],
+      );
+      assert.deepEqual(result.detail_chunks?.map((chunk) => chunk.reference_id), ["dchunk-5"]);
       assert.equal(result.used_chunks[0]?.document_name, "semantic.pdf");
       assert.equal("content" in result.used_chunks[0], false);
-      assert.match(result.answer, /详情内容如下/);
+      assert.equal("debug_enriched_content" in result.used_chunks[0], false);
       assert.match(result.answer, /\/api\/document-chunks\/dchunk-5\/content/);
 
       const streamEvents = [];
@@ -572,7 +723,7 @@ describe("http server", () => {
         completeEvent?.used_chunks.map((chunk) => chunk.citation_no),
         [2, 5],
       );
-      assert.match(String(completeEvent?.answer || ""), /详情内容如下/);
+      assert.deepEqual(completeEvent?.detail_chunks.map((chunk) => chunk.reference_id), ["dchunk-5"]);
       assert.match(String(completeEvent?.answer || ""), /\/api\/document-chunks\/dchunk-5\/content/);
     } finally {
       globalThis.fetch = originalFetch;
@@ -582,6 +733,679 @@ describe("http server", () => {
       process.env.TEXT_API_KEY = previousTextKey;
       process.env.QDRANT_URL = previousQdrantUrl;
       storage.close();
+    }
+  });
+
+  it("enriches retrieval evidence with adjacent retrieval and oversized context segments", async () => {
+    const root = await mkdtemp(join(tmpdir(), "afs-cer-"));
+    const storage = new SqliteStorage({ dbPath: join(root, "storage.sqlite") });
+    storage.initialize();
+    const blobStore = new LocalBlobStore(join(root, "object-store"));
+    const rag = new TraditionalRagService(storage, blobStore);
+    const previousServerBaseUrl = process.env.FS_EXPLORER_SERVER_BASE_URL;
+    const previousPort = process.env.FS_EXPLORER_PORT;
+    delete process.env.FS_EXPLORER_SERVER_BASE_URL;
+    process.env.FS_EXPLORER_PORT = "8000";
+    const corpusId = storage.getOrCreateCorpus(root);
+    const docId = "doc-cer";
+    const oversizedContent =
+      `${"leading context ".repeat(120)}purchase price appears inside the oversized appendix. ` +
+      `${"trailing context ".repeat(120)}`;
+
+    storage.upsertDocumentStub({
+      id: docId,
+      corpusId,
+      relativePath: "cer.pdf",
+      absolutePath: join(root, "cer.pdf"),
+      content: "",
+      metadataJson: "{}",
+      fileMtime: 1,
+      fileSize: 1,
+      contentSha256: "hash-cer",
+      originalFilename: "cer.pdf",
+      objectKey: "documents/cer.pdf",
+      sourceObjectKey: "documents/cer.pdf",
+      pagesPrefix: "documents/cer/pages",
+      storageUri: "storage://cer.pdf",
+      contentType: "application/pdf",
+      uploadStatus: "completed",
+      pageCount: 4,
+      parsedContentSha256: "parsed-cer",
+      parsedIsComplete: true,
+      embeddingEnabled: true,
+      hasEmbeddings: true,
+      imageSemanticEnabled: false,
+    });
+
+    storage.replaceDocumentChunks(docId, [
+      {
+        id: "dchunk-ov-1",
+        documentId: docId,
+        ordinal: 1,
+        referenceRetrievalChunkId: "rchunk-1",
+        pageNo: 1,
+        documentIndex: 1,
+        pageIndex: 1,
+        blockType: "paragraph",
+        bboxJson: "[0,0,1,1]",
+        contentMd: oversizedContent.slice(0, Math.ceil(oversizedContent.length / 2)),
+        sizeClass: "normal",
+        summaryText: "Oversized appendix summary",
+        isSplitFromOversized: true,
+        splitIndex: 0,
+        splitCount: 2,
+        mergedPageNosJson: "[1]",
+        mergedBboxesJson: "[[0,0,1,1]]",
+      },
+      {
+        id: "dchunk-2",
+        documentId: docId,
+        ordinal: 2,
+        referenceRetrievalChunkId: "rchunk-2",
+        pageNo: 2,
+        documentIndex: 2,
+        pageIndex: 1,
+        blockType: "paragraph",
+        bboxJson: "[0,0,1,1]",
+        contentMd: "Context before the purchase discussion.",
+        sizeClass: "normal",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: "[2]",
+        mergedBboxesJson: "[[0,0,1,1]]",
+      },
+      {
+        id: "dchunk-3",
+        documentId: docId,
+        ordinal: 3,
+        referenceRetrievalChunkId: "rchunk-3",
+        pageNo: 3,
+        documentIndex: 3,
+        pageIndex: 1,
+        blockType: "paragraph",
+        bboxJson: "[0,0,1,1]",
+        contentMd: "Purchase price evidence in the main context block.",
+        sizeClass: "normal",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: "[3]",
+        mergedBboxesJson: "[[0,0,1,1]]",
+      },
+      {
+        id: "dchunk-ov-2",
+        documentId: docId,
+        ordinal: 4,
+        referenceRetrievalChunkId: "rchunk-1",
+        pageNo: 1,
+        documentIndex: 1,
+        pageIndex: 1,
+        blockType: "paragraph",
+        bboxJson: "[0,0,1,1]",
+        contentMd: oversizedContent.slice(Math.ceil(oversizedContent.length / 2)),
+        sizeClass: "normal",
+        summaryText: "Oversized appendix summary",
+        isSplitFromOversized: true,
+        splitIndex: 1,
+        splitCount: 2,
+        mergedPageNosJson: "[1]",
+        mergedBboxesJson: "[[0,0,1,1]]",
+      },
+      {
+        id: "dchunk-4",
+        documentId: docId,
+        ordinal: 5,
+        referenceRetrievalChunkId: "rchunk-4",
+        pageNo: 4,
+        documentIndex: 4,
+        pageIndex: 1,
+        blockType: "paragraph",
+        bboxJson: "[0,0,1,1]",
+        contentMd: "Context after the oversized appendix.",
+        sizeClass: "normal",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: "[4]",
+        mergedBboxesJson: "[[0,0,1,1]]",
+      },
+    ]);
+
+    storage.replaceRetrievalChunks(docId, [
+      {
+        id: "rchunk-1",
+        documentId: docId,
+        ordinal: 1,
+        contentMd: oversizedContent,
+        sizeClass: "oversized",
+        summaryText: "Oversized appendix summary",
+        sourceDocumentChunkIdsJson: JSON.stringify(["dchunk-ov-1", "dchunk-ov-2"]),
+        pageNosJson: JSON.stringify([1]),
+        sourceLocator: "page-1",
+        bboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+      },
+      {
+        id: "rchunk-2",
+        documentId: docId,
+        ordinal: 2,
+        contentMd: "Context before the purchase discussion.",
+        sizeClass: "normal",
+        sourceDocumentChunkIdsJson: JSON.stringify(["dchunk-2"]),
+        pageNosJson: JSON.stringify([2]),
+        sourceLocator: "page-2",
+        bboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+      },
+      {
+        id: "rchunk-3",
+        documentId: docId,
+        ordinal: 3,
+        contentMd: "Purchase price evidence in the main context block.",
+        sizeClass: "normal",
+        sourceDocumentChunkIdsJson: JSON.stringify(["dchunk-3"]),
+        pageNosJson: JSON.stringify([3]),
+        sourceLocator: "page-3",
+        bboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+      },
+      {
+        id: "rchunk-4",
+        documentId: docId,
+        ordinal: 4,
+        contentMd: "Context after the oversized appendix.",
+        sizeClass: "normal",
+        sourceDocumentChunkIdsJson: JSON.stringify(["dchunk-4"]),
+        pageNosJson: JSON.stringify([4]),
+        sourceLocator: "page-4",
+        bboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+      },
+    ]);
+
+    const originalFetch = globalThis.fetch;
+    const previousEmbeddingUrl = process.env.EMBEDDING_BASE_URL;
+    const previousEmbeddingKey = process.env.EMBEDDING_API_KEY;
+    const previousTextUrl = process.env.TEXT_BASE_URL;
+    const previousTextKey = process.env.TEXT_API_KEY;
+    const previousQdrantUrl = process.env.QDRANT_URL;
+
+    process.env.EMBEDDING_BASE_URL = "https://example.test/v1";
+    process.env.EMBEDDING_API_KEY = "embed-test-key";
+    process.env.TEXT_BASE_URL = "https://example.test/v1";
+    process.env.TEXT_API_KEY = "text-test-key";
+    process.env.QDRANT_URL = "https://qdrant.test";
+
+    globalThis.fetch = (async (input, init) => {
+      const url = String(input);
+      if (url === "https://example.test/v1/embeddings") {
+        return new Response(
+          JSON.stringify({
+            data: [{ embedding: [0.1, 0.2, 0.3], index: 0 }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url === "https://qdrant.test/collections/doc_doc-cer/points/search") {
+        return new Response(
+          JSON.stringify({
+            result: [
+              { id: "qdrant-1", score: 10, payload: { retrieval_unit_id: "dchunk-3" } },
+              { id: "qdrant-2", score: 9, payload: { retrieval_unit_id: "dchunk-ov-1" } },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url === "https://example.test/v1/chat/completions") {
+        const body = String(init?.body ?? "");
+        if (body.includes('"stream":true')) {
+          return new Response("stream unsupported", { status: 400 });
+        }
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    answer:
+                      "The answer is supported by [1] and [2]. Full detail is available at [Citation 2 full chunk](http://localhost:8000/api/retrieval-chunks/rchunk-1/content).",
+                    citations: [1, 2],
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof globalThis.fetch;
+
+    try {
+      const retrieveResult = await rag.retrieve({
+        question: "purchase price",
+        mode: "semantic",
+        documentIds: [docId],
+      });
+
+      const retrievalChunk = retrieveResult.retrieved_chunks.find((chunk) => chunk.reference_id === "rchunk-3");
+      assert.equal(retrievalChunk?.debug_cer_applied, true);
+      assert.deepEqual(
+        retrievalChunk?.debug_cer_context_refs?.map((item) => item.reference_id),
+        ["rchunk-1", "rchunk-4"],
+      );
+      assert.match(String(retrievalChunk?.debug_enriched_content || ""), /Oversized appendix summary/);
+      assert.match(String(retrievalChunk?.debug_enriched_content || ""), /chunk\[1-p-1\] summary:/i);
+      assert.match(String(retrievalChunk?.debug_enriched_content || ""), /chunk\[1\] compressed excerpt:/i);
+      assert.match(String(retrievalChunk?.debug_enriched_content || ""), /chunk\[1-n-1\] compressed excerpt:/i);
+      assert.match(String(retrievalChunk?.debug_enriched_content || ""), /compressed excerpt/i);
+      assert.match(String(retrievalChunk?.debug_enriched_content || ""), /\/api\/retrieval-chunks\/rchunk-1\/content/);
+      assert.doesNotMatch(String(retrievalChunk?.debug_enriched_content || ""), /\/api\/retrieval-chunks\/rchunk-2\/content/);
+      assert.doesNotMatch(String(retrievalChunk?.debug_enriched_content || ""), /\/api\/retrieval-chunks\/rchunk-3\/content/);
+      assert.doesNotMatch(String(retrievalChunk?.debug_enriched_content || ""), /\/api\/retrieval-chunks\/rchunk-4\/content/);
+
+      const oversizedChunk = retrieveResult.retrieved_chunks.find((chunk) => chunk.reference_id === "rchunk-1");
+      assert.equal(oversizedChunk?.reference_kind, "retrieval_chunk");
+      assert.equal(oversizedChunk?.debug_cer_applied, true);
+      assert.deepEqual(
+        oversizedChunk?.debug_cer_context_refs?.map((item) => item.reference_id),
+        ["rchunk-2"],
+      );
+      assert.match(String(oversizedChunk?.debug_enriched_content || ""), /Oversized appendix summary/);
+      assert.match(String(oversizedChunk?.debug_enriched_content || ""), /chunk\[2\] summary:/i);
+      assert.match(String(oversizedChunk?.debug_enriched_content || ""), /chunk\[2-n-1\] compressed excerpt:/i);
+      assert.match(String(oversizedChunk?.debug_enriched_content || ""), /compressed excerpt/i);
+      assert.doesNotMatch(String(oversizedChunk?.debug_enriched_content || ""), /\/api\/retrieval-chunks\/rchunk-2\/content/);
+      assert.doesNotMatch(String(oversizedChunk?.debug_enriched_content || ""), /\/api\/retrieval-chunks\/rchunk-4\/content/);
+      assert.match(String(oversizedChunk?.debug_enriched_content || ""), /\/api\/retrieval-chunks\/rchunk-1\/content/);
+
+      const queryResult = await rag.query({
+        question: "purchase price",
+        mode: "semantic",
+        documentIds: [docId],
+      });
+      assert.deepEqual(queryResult.detail_chunks?.map((chunk) => chunk.reference_id), ["rchunk-1"]);
+      assert.equal("debug_enriched_content" in queryResult.used_chunks[0], false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.EMBEDDING_BASE_URL = previousEmbeddingUrl;
+      process.env.EMBEDDING_API_KEY = previousEmbeddingKey;
+      process.env.TEXT_BASE_URL = previousTextUrl;
+      process.env.TEXT_API_KEY = previousTextKey;
+      process.env.QDRANT_URL = previousQdrantUrl;
+      process.env.FS_EXPLORER_SERVER_BASE_URL = previousServerBaseUrl;
+      process.env.FS_EXPLORER_PORT = previousPort;
+      storage.close();
+    }
+  });
+
+  it("keeps only the next CER chunk when the center chunk is a short heading block", async () => {
+    const root = await mkdtemp(join(tmpdir(), "afs-cer-heading-"));
+    const storage = new SqliteStorage({ dbPath: join(root, "storage.sqlite") });
+    storage.initialize();
+    const blobStore = new LocalBlobStore(join(root, "object-store"));
+    const rag = new TraditionalRagService(storage, blobStore);
+    const previousServerBaseUrl = process.env.FS_EXPLORER_SERVER_BASE_URL;
+    const previousPort = process.env.FS_EXPLORER_PORT;
+    delete process.env.FS_EXPLORER_SERVER_BASE_URL;
+    process.env.FS_EXPLORER_PORT = "8000";
+    const corpusId = storage.getOrCreateCorpus(root);
+    const docId = "doc-cer-heading";
+
+    storage.upsertDocumentStub({
+      id: docId,
+      corpusId,
+      relativePath: "heading.pdf",
+      absolutePath: join(root, "heading.pdf"),
+      content: "",
+      metadataJson: "{}",
+      fileMtime: 1,
+      fileSize: 1,
+      contentSha256: "hash-heading",
+      originalFilename: "heading.pdf",
+      objectKey: "documents/heading.pdf",
+      sourceObjectKey: "documents/heading.pdf",
+      pagesPrefix: "documents/heading/pages",
+      storageUri: "storage://heading.pdf",
+      contentType: "application/pdf",
+      uploadStatus: "completed",
+      pageCount: 3,
+      parsedContentSha256: "parsed-heading",
+      parsedIsComplete: true,
+      embeddingEnabled: true,
+      hasEmbeddings: true,
+      imageSemanticEnabled: false,
+    });
+
+    storage.replaceDocumentChunks(docId, [
+      {
+        id: "heading-dchunk-1",
+        documentId: docId,
+        ordinal: 1,
+        referenceRetrievalChunkId: "heading-rchunk-1",
+        pageNo: 108,
+        documentIndex: 1,
+        pageIndex: 1,
+        blockType: "text",
+        bboxJson: "[0,0,1,1]",
+        contentMd: "母公司资产负债表尾部：流动资产、货币资金、应收账款。",
+        sizeClass: "normal",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: "[108]",
+        mergedBboxesJson: "[[0,0,1,1]]",
+      },
+      {
+        id: "heading-dchunk-2",
+        documentId: docId,
+        ordinal: 2,
+        referenceRetrievalChunkId: "heading-rchunk-2",
+        pageNo: 109,
+        documentIndex: 2,
+        pageIndex: 1,
+        blockType: "text",
+        bboxJson: "[0,0,1,1]",
+        contentMd: "## **4** 、母公司利润表\n\n单位：元",
+        sizeClass: "normal",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: "[109]",
+        mergedBboxesJson: "[[0,0,1,1]]",
+      },
+      {
+        id: "heading-dchunk-3",
+        documentId: docId,
+        ordinal: 3,
+        referenceRetrievalChunkId: "heading-rchunk-3",
+        pageNo: 110,
+        documentIndex: 3,
+        pageIndex: 1,
+        blockType: "text",
+        bboxJson: "[0,0,1,1]",
+        contentMd: "营业收入 1,000.00 营业成本 600.00 利润总额 200.00 净利润 180.00",
+        sizeClass: "normal",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: "[110]",
+        mergedBboxesJson: "[[0,0,1,1]]",
+      },
+    ]);
+
+    storage.replaceRetrievalChunks(docId, [
+      {
+        id: "heading-rchunk-1",
+        documentId: docId,
+        ordinal: 1,
+        contentMd: "母公司资产负债表尾部：流动资产、货币资金、应收账款。",
+        sizeClass: "normal",
+        sourceDocumentChunkIdsJson: JSON.stringify(["heading-dchunk-1"]),
+        pageNosJson: JSON.stringify([108]),
+        sourceLocator: "page-108",
+        bboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+      },
+      {
+        id: "heading-rchunk-2",
+        documentId: docId,
+        ordinal: 2,
+        contentMd: "## **4** 、母公司利润表\n\n单位：元",
+        sizeClass: "normal",
+        sourceDocumentChunkIdsJson: JSON.stringify(["heading-dchunk-2"]),
+        pageNosJson: JSON.stringify([109]),
+        sourceLocator: "page-109",
+        bboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+      },
+      {
+        id: "heading-rchunk-3",
+        documentId: docId,
+        ordinal: 3,
+        contentMd: "营业收入 1,000.00 营业成本 600.00 利润总额 200.00 净利润 180.00",
+        sizeClass: "normal",
+        sourceDocumentChunkIdsJson: JSON.stringify(["heading-dchunk-3"]),
+        pageNosJson: JSON.stringify([110]),
+        sourceLocator: "page-110",
+        bboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+      },
+    ]);
+
+    const originalFetch = globalThis.fetch;
+    const previousEmbeddingUrl = process.env.EMBEDDING_BASE_URL;
+    const previousEmbeddingKey = process.env.EMBEDDING_API_KEY;
+    const previousQdrantUrl = process.env.QDRANT_URL;
+
+    process.env.EMBEDDING_BASE_URL = "https://example.test/v1";
+    process.env.EMBEDDING_API_KEY = "embed-test-key";
+    process.env.QDRANT_URL = "https://qdrant.test";
+
+    globalThis.fetch = (async (input) => {
+      const url = String(input);
+      if (url === "https://example.test/v1/embeddings") {
+        return new Response(
+          JSON.stringify({
+            data: [{ embedding: [0.1, 0.2, 0.3], index: 0 }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url === "https://qdrant.test/collections/doc_doc-cer-heading/points/search") {
+        return new Response(
+          JSON.stringify({
+            result: [{ id: "qdrant-heading", score: 10, payload: { retrieval_unit_id: "heading-dchunk-2" } }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof globalThis.fetch;
+
+    try {
+      const retrieveResult = await rag.retrieve({
+        question: "请输出母公司利润表的内容",
+        mode: "semantic",
+        documentIds: [docId],
+      });
+
+      const centerChunk = retrieveResult.retrieved_chunks.find((chunk) => chunk.reference_id === "heading-rchunk-2");
+      assert.equal(centerChunk?.debug_cer_applied, true);
+      assert.deepEqual(
+        centerChunk?.debug_cer_context_refs?.map((item) => item.reference_id),
+        ["heading-rchunk-3"],
+      );
+      assert.match(String(centerChunk?.debug_enriched_content || ""), /chunk\[1\] compressed excerpt:/i);
+      assert.match(String(centerChunk?.debug_enriched_content || ""), /chunk\[1-n-1\] compressed excerpt:/i);
+      assert.doesNotMatch(String(centerChunk?.debug_enriched_content || ""), /chunk\[1-p-1\]/i);
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.EMBEDDING_BASE_URL = previousEmbeddingUrl;
+      process.env.EMBEDDING_API_KEY = previousEmbeddingKey;
+      process.env.QDRANT_URL = previousQdrantUrl;
+      process.env.FS_EXPLORER_SERVER_BASE_URL = previousServerBaseUrl;
+      process.env.FS_EXPLORER_PORT = previousPort;
+      storage.close();
+    }
+  });
+
+  it("builds embeddings with controlled batch concurrency", async () => {
+    const rag = new TraditionalRagService({} as never, {} as never);
+    const originalFetch = globalThis.fetch;
+    const previousEmbeddingUrl = process.env.EMBEDDING_BASE_URL;
+    const previousEmbeddingKey = process.env.EMBEDDING_API_KEY;
+    const previousBatchSize = process.env.EMBEDDING_BATCH_SIZE;
+    const previousConcurrency = process.env.EMBEDDING_CONCURRENCY;
+    const previousQdrantUrl = process.env.QDRANT_URL;
+
+    process.env.EMBEDDING_BASE_URL = "https://example.test/v1";
+    process.env.EMBEDDING_API_KEY = "embed-test-key";
+    process.env.EMBEDDING_BATCH_SIZE = "2";
+    process.env.EMBEDDING_CONCURRENCY = "2";
+    process.env.QDRANT_URL = "https://qdrant.test";
+
+    let activeEmbeddingRequests = 0;
+    let maxConcurrentEmbeddingRequests = 0;
+    globalThis.fetch = (async (input) => {
+      const url = String(input);
+      if (url === "https://example.test/v1/embeddings") {
+        activeEmbeddingRequests += 1;
+        maxConcurrentEmbeddingRequests = Math.max(maxConcurrentEmbeddingRequests, activeEmbeddingRequests);
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        activeEmbeddingRequests -= 1;
+        return new Response(
+          JSON.stringify({
+            data: [
+              { embedding: [0.1, 0.2, 0.3], index: 0 },
+              { embedding: [0.4, 0.5, 0.6], index: 1 },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url === "https://qdrant.test/collections/doc_doc-concurrency/points?wait=true") {
+        return new Response(JSON.stringify({ status: "ok" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url === "https://qdrant.test/collections/doc_doc-concurrency") {
+        return new Response(JSON.stringify({ status: "ok" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof globalThis.fetch;
+
+    try {
+      const written = await rag.buildEmbeddingsForChunks(
+        "doc-concurrency",
+        Array.from({ length: 6 }, (_, index) => ({
+          id: `unit-${index + 1}`,
+          unitText: `embedding payload ${index + 1}`,
+        })),
+      );
+      assert.equal(written, 6);
+      assert.equal(maxConcurrentEmbeddingRequests, 2);
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.EMBEDDING_BASE_URL = previousEmbeddingUrl;
+      process.env.EMBEDDING_API_KEY = previousEmbeddingKey;
+      process.env.EMBEDDING_BATCH_SIZE = previousBatchSize;
+      process.env.EMBEDDING_CONCURRENCY = previousConcurrency;
+      process.env.QDRANT_URL = previousQdrantUrl;
+    }
+  });
+
+  it("surfaces endpoint and batch details when embedding fetch fails", async () => {
+    const rag = new TraditionalRagService({} as never, {} as never);
+    const originalFetch = globalThis.fetch;
+    const previousEmbeddingUrl = process.env.EMBEDDING_BASE_URL;
+    const previousEmbeddingKey = process.env.EMBEDDING_API_KEY;
+    const previousBatchSize = process.env.EMBEDDING_BATCH_SIZE;
+    const previousConcurrency = process.env.EMBEDDING_CONCURRENCY;
+
+    process.env.EMBEDDING_BASE_URL = "https://example.test/v1";
+    process.env.EMBEDDING_API_KEY = "embed-test-key";
+    process.env.EMBEDDING_BATCH_SIZE = "2";
+    process.env.EMBEDDING_CONCURRENCY = "1";
+
+    globalThis.fetch = (async (input) => {
+      const url = String(input);
+      if (url === "https://example.test/v1/embeddings") {
+        throw new Error("fetch failed");
+      }
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof globalThis.fetch;
+
+    try {
+      await assert.rejects(
+        () =>
+          rag.buildEmbeddingsForChunks("doc-failure", [
+            { id: "unit-1", unitText: "a" },
+            { id: "unit-2", unitText: "b" },
+          ]),
+        /Embedding request failed for batch 1\/1 \(2 texts, https:\/\/example\.test\/v1\/embeddings\): fetch failed/,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.EMBEDDING_BASE_URL = previousEmbeddingUrl;
+      process.env.EMBEDDING_API_KEY = previousEmbeddingKey;
+      process.env.EMBEDDING_BATCH_SIZE = previousBatchSize;
+      process.env.EMBEDDING_CONCURRENCY = previousConcurrency;
+    }
+  });
+
+  it("splits Qdrant point upserts into smaller batches", async () => {
+    const rag = new TraditionalRagService({} as never, {} as never);
+    const originalFetch = globalThis.fetch;
+    const previousEmbeddingUrl = process.env.EMBEDDING_BASE_URL;
+    const previousEmbeddingKey = process.env.EMBEDDING_API_KEY;
+    const previousBatchSize = process.env.EMBEDDING_BATCH_SIZE;
+    const previousConcurrency = process.env.EMBEDDING_CONCURRENCY;
+    const previousQdrantUrl = process.env.QDRANT_URL;
+    const previousQdrantUpsertBatchSize = process.env.QDRANT_UPSERT_BATCH_SIZE;
+
+    process.env.EMBEDDING_BASE_URL = "https://example.test/v1";
+    process.env.EMBEDDING_API_KEY = "embed-test-key";
+    process.env.EMBEDDING_BATCH_SIZE = "3";
+    process.env.EMBEDDING_CONCURRENCY = "1";
+    process.env.QDRANT_URL = "https://qdrant.test";
+    process.env.QDRANT_UPSERT_BATCH_SIZE = "2";
+
+    const upsertBatchSizes: number[] = [];
+    globalThis.fetch = (async (input, init) => {
+      const url = String(input);
+      if (url === "https://example.test/v1/embeddings") {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(
+          JSON.stringify({
+            data: (body.input || []).map((_: unknown, index: number) => ({
+              embedding: [index + 0.1, index + 0.2, index + 0.3],
+              index,
+            })),
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url === "https://qdrant.test/collections/doc_doc-upsert-batches") {
+        return new Response(JSON.stringify({ status: "ok" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url === "https://qdrant.test/collections/doc_doc-upsert-batches/points?wait=true") {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        upsertBatchSizes.push((body.points || []).length);
+        return new Response(JSON.stringify({ status: "ok" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof globalThis.fetch;
+
+    try {
+      const written = await rag.buildEmbeddingsForChunks(
+        "doc-upsert-batches",
+        Array.from({ length: 5 }, (_, index) => ({
+          id: `unit-${index + 1}`,
+          unitText: `payload ${index + 1}`,
+        })),
+      );
+      assert.equal(written, 5);
+      assert.deepEqual(upsertBatchSizes, [2, 2, 1]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.EMBEDDING_BASE_URL = previousEmbeddingUrl;
+      process.env.EMBEDDING_API_KEY = previousEmbeddingKey;
+      process.env.EMBEDDING_BATCH_SIZE = previousBatchSize;
+      process.env.EMBEDDING_CONCURRENCY = previousConcurrency;
+      process.env.QDRANT_URL = previousQdrantUrl;
+      process.env.QDRANT_UPSERT_BATCH_SIZE = previousQdrantUpsertBatchSize;
     }
   });
 
