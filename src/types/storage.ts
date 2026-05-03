@@ -124,6 +124,7 @@ export interface StoredImageSemantic {
   recognizable: boolean | null;
   accessible_url: string | null;
   semantic_text: string | null;
+  semantic_detail_text: string | null;
   semantic_model: string | null;
 }
 
@@ -144,6 +145,7 @@ export interface StorageImageSemanticRecord {
   recognizable?: boolean | null;
   accessibleUrl?: string | null;
   semanticText?: string | null;
+  semanticDetailText?: string | null;
   semanticModel?: string | null;
 }
 
@@ -249,6 +251,8 @@ export interface StoredImageSemanticCache {
   contains_text: boolean | null;
   visible_text: string | null;
   summary: string | null;
+  detail_markdown: string | null;
+  detail_truncated: boolean | null;
   entities_json: string;
   keywords_json: string;
   qa_hints_json: string;
@@ -337,6 +341,8 @@ export interface StorageImageSemanticCacheRecord {
   containsText?: boolean | null;
   visibleText?: string | null;
   summary?: string | null;
+  detailMarkdown?: string | null;
+  detailTruncated?: boolean | null;
   entitiesJson?: string;
   keywordsJson?: string;
   qaHintsJson?: string;

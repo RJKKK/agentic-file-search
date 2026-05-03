@@ -8,6 +8,7 @@ import {
   REPEATED_TOOLCALL_PROMPT,
   renderActionRepairPrompt,
 } from "../src/agent/prompts.js";
+import { buildVisionPromptMessages, renderImageSemantic } from "../src/runtime/image-semantic.js";
 import { loadSkills } from "../src/runtime/load-skills.js";
 import { buildToolRegistry } from "../src/runtime/registry.js";
 
@@ -61,5 +62,37 @@ describe("system prompt", () => {
     assert.match(repairPrompt, /`get_document`/);
     assert.match(REPEATED_TOOLCALL_PROMPT, /Do not repeat the exact same tool call again/);
     assert.match(BEST_EFFORT_FINAL_PROMPT, /Stop using tools now/);
+  });
+
+  it("builds a vision prompt that requires detailed diagram semantics and strict JSON", () => {
+    const prompt = buildVisionPromptMessages();
+
+    assert.match(prompt.systemPrompt, /Return strict JSON only/i);
+    assert.match(prompt.systemPrompt, /retrieval_summary/i);
+    assert.match(prompt.systemPrompt, /detail_markdown/i);
+    assert.match(prompt.userPrompt, /流程图、业务图、时序图：务必详尽描述/);
+    assert.match(prompt.userPrompt, /结构图、架构图、关系图、网络拓扑图：务必详尽描述/);
+    assert.match(prompt.userPrompt, /统计图表：务必详尽描述/);
+    assert.match(prompt.userPrompt, /detail_truncated/);
+  });
+
+  it("renders layered image semantics with a short retrieval text and a separate detailed text", () => {
+    const rendered = renderImageSemantic({
+      accessibleUrl: "/api/assets/images/demo",
+      payload: {
+        recognizable: true,
+        retrieval_summary: "流程图描述采购申请到审批完成的主流程。",
+        detail_markdown: "## 关键结构与关系\n- 发起 -> 审批 -> 归档\n\n## 详细说明\n" + "节点说明 ".repeat(1200),
+        visible_text: "发起审批归档".repeat(120),
+        keywords: ["采购申请", "审批流", "归档"],
+        detail_truncated: false,
+      },
+    });
+
+    assert.match(rendered.shortMarkdown ?? "", /流程图描述采购申请到审批完成的主流程/);
+    assert.match(rendered.shortMarkdown ?? "", /\[Keywords\]/);
+    assert.match(rendered.semanticDetailText ?? "", /## 关键结构与关系/);
+    assert.match(rendered.semanticDetailText ?? "", /\[detail_truncated=true\]/);
+    assert.equal((rendered.semanticText?.length ?? 0) > 0, true);
   });
 });

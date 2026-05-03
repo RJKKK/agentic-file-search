@@ -1,3 +1,8 @@
+/*
+Reference: legacy/python/src/fs_explorer/document_parsing.py
+Reference: legacy/python/src/fs_explorer/server.py
+*/
+
 import type { PythonImageInspection } from "./python-document-assets.js";
 
 export const IMAGE_SEMANTIC_INTERFERENCE_DROP_THRESHOLD = 0.65;

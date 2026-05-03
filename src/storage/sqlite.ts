@@ -167,6 +167,8 @@ function normalizeStoredImageSemantic(row: SqliteRow): StoredImageSemantic {
     recognizable: row.recognizable == null ? null : Boolean(row.recognizable),
     accessible_url: row.accessible_url == null ? null : String(row.accessible_url),
     semantic_text: row.semantic_text == null ? null : String(row.semantic_text),
+    semantic_detail_text:
+      row.semantic_detail_text == null ? null : String(row.semantic_detail_text),
     semantic_model: row.semantic_model == null ? null : String(row.semantic_model),
   };
 }
@@ -238,6 +240,8 @@ function normalizeStoredImageSemanticCache(row: SqliteRow): StoredImageSemanticC
     contains_text: row.contains_text == null ? null : Boolean(row.contains_text),
     visible_text: row.visible_text == null ? null : String(row.visible_text),
     summary: row.summary == null ? null : String(row.summary),
+    detail_markdown: row.detail_markdown == null ? null : String(row.detail_markdown),
+    detail_truncated: row.detail_truncated == null ? null : Boolean(row.detail_truncated),
     entities_json: normalizeJsonText(String(row.entities_json ?? "[]")),
     keywords_json: normalizeJsonText(String(row.keywords_json ?? "[]")),
     qa_hints_json: normalizeJsonText(String(row.qa_hints_json ?? "[]")),
@@ -421,6 +425,7 @@ export class SqliteStorage implements SqliteStorageBackend {
         recognizable INTEGER,
         accessible_url TEXT,
         semantic_text TEXT,
+        semantic_detail_text TEXT,
         semantic_model TEXT,
         last_enhanced_at TEXT
       );
@@ -450,6 +455,8 @@ export class SqliteStorage implements SqliteStorageBackend {
         contains_text INTEGER,
         visible_text TEXT,
         summary TEXT,
+        detail_markdown TEXT,
+        detail_truncated INTEGER,
         entities_json TEXT NOT NULL DEFAULT '[]',
         keywords_json TEXT NOT NULL DEFAULT '[]',
         qa_hints_json TEXT NOT NULL DEFAULT '[]',
@@ -650,8 +657,12 @@ export class SqliteStorage implements SqliteStorageBackend {
     addColumn("image_semantics", "recognizable", "INTEGER");
     addColumn("image_semantics", "accessible_url", "TEXT");
     addColumn("image_semantics", "semantic_text", "TEXT");
+    addColumn("image_semantics", "semantic_detail_text", "TEXT");
     addColumn("image_semantics", "semantic_model", "TEXT");
     addColumn("image_semantics", "last_enhanced_at", "TEXT");
+
+    addColumn("image_semantic_cache", "detail_markdown", "TEXT");
+    addColumn("image_semantic_cache", "detail_truncated", "INTEGER");
 
     addColumn("document_parse_tasks", "document_id", "TEXT");
     addColumn("document_parse_tasks", "document_filename", "TEXT NOT NULL DEFAULT ''");
@@ -1515,9 +1526,9 @@ export class SqliteStorage implements SqliteStorageBackend {
             image_hash, source_document_id, source_page_no, source_image_index,
             mime_type, width, height, bbox_json, object_key, storage_uri,
             has_text, interference_score, is_dropped, recognizable, accessible_url,
-            semantic_text, semantic_model
+            semantic_text, semantic_detail_text, semantic_model
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(image_hash) DO UPDATE SET
             mime_type = COALESCE(image_semantics.mime_type, excluded.mime_type),
             width = COALESCE(image_semantics.width, excluded.width),
@@ -1550,6 +1561,7 @@ export class SqliteStorage implements SqliteStorageBackend {
           image.recognizable == null ? null : image.recognizable ? 1 : 0,
           image.accessibleUrl ?? null,
           image.semanticText ?? null,
+          image.semanticDetailText ?? null,
           image.semanticModel ?? null,
         );
       }
@@ -1570,7 +1582,7 @@ export class SqliteStorage implements SqliteStorageBackend {
             image_hash, source_document_id, source_page_no, source_image_index,
             mime_type, width, height, bbox_json, object_key, storage_uri,
             has_text, interference_score, is_dropped, recognizable, accessible_url,
-            semantic_text, semantic_model
+            semantic_text, semantic_detail_text, semantic_model
           FROM image_semantics
           WHERE image_hash IN (${placeholders})
         `,
@@ -1589,7 +1601,7 @@ export class SqliteStorage implements SqliteStorageBackend {
         image_hash, source_document_id, source_page_no, source_image_index,
         mime_type, width, height, bbox_json, object_key, storage_uri,
         has_text, interference_score, is_dropped, recognizable, accessible_url,
-        semantic_text, semantic_model
+        semantic_text, semantic_detail_text, semantic_model
       FROM image_semantics
       WHERE source_document_id = ?
     `;
@@ -1646,16 +1658,19 @@ export class SqliteStorage implements SqliteStorageBackend {
         `
           INSERT INTO image_semantic_cache (
             image_hash, prompt_version, recognizable, image_kind, contains_text,
-            visible_text, summary, entities_json, keywords_json, qa_hints_json,
-            drop_reason, semantic_model, created_at, updated_at
+            visible_text, summary, detail_markdown, detail_truncated,
+            entities_json, keywords_json, qa_hints_json, drop_reason,
+            semantic_model, created_at, updated_at
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(image_hash, prompt_version) DO UPDATE SET
             recognizable = excluded.recognizable,
             image_kind = excluded.image_kind,
             contains_text = excluded.contains_text,
             visible_text = excluded.visible_text,
             summary = excluded.summary,
+            detail_markdown = excluded.detail_markdown,
+            detail_truncated = excluded.detail_truncated,
             entities_json = excluded.entities_json,
             keywords_json = excluded.keywords_json,
             qa_hints_json = excluded.qa_hints_json,
@@ -1672,6 +1687,8 @@ export class SqliteStorage implements SqliteStorageBackend {
         record.containsText == null ? null : record.containsText ? 1 : 0,
         record.visibleText ?? null,
         record.summary ?? null,
+        record.detailMarkdown ?? null,
+        record.detailTruncated == null ? null : record.detailTruncated ? 1 : 0,
         record.entitiesJson ?? "[]",
         record.keywordsJson ?? "[]",
         record.qaHintsJson ?? "[]",

@@ -1641,6 +1641,61 @@ describe("http server", () => {
     assert.doesNotMatch(String(documentChunks[0]?.contentMd || ""), /\|\s*A1\s*\|\s*B1\s*\|\n\n\|/);
   });
 
+  it("splits long image semantic markdown in fixed chunk mode without exceeding the configured limit", () => {
+    const rag = new TraditionalRagService({} as never, {} as never);
+    const longImageSemantic = [
+      "![image](/api/assets/images/demo)",
+      "## 图片摘要",
+      "这是一张流程图，描述采购申请、部门审批、财务复核和归档。",
+      "## 关键结构与关系",
+      "- 发起人提交申请",
+      "- 部门经理审批",
+      "- 财务复核预算",
+      "- 系统归档记录",
+      "## 详细说明",
+      "节点说明 ".repeat(60),
+    ].join("\n\n");
+    const sourceChunks = rag.createDocumentChunks({
+      documentId: "doc-picture-fixed",
+      imageRenderMap: new Map([["img-fixed-1", { dropped: false, markdown: longImageSemantic }]]),
+      parsedDocument: {
+        parser_name: "test",
+        parser_version: "1",
+        units: [
+          {
+            unit_no: 1,
+            markdown: "placeholder",
+            content_hash: "hash-picture-fixed",
+            heading: "Image heavy page",
+            source_locator: "page-1",
+            images: [],
+            blocks: [
+              {
+                index: 0,
+                block_type: "picture",
+                bbox: [0, 0, 100, 100],
+                markdown: "placeholder",
+                char_count: longImageSemantic.length,
+                image_hash: "img-fixed-1",
+                source_image_index: 1,
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    const fixedChunks = rag.createFixedRetrievalChunks({
+      documentId: "doc-picture-fixed",
+      sourceChunks,
+      fixedChunkChars: 120,
+    });
+
+    assert.equal(fixedChunks.length > 1, true);
+    assert.equal(fixedChunks.every((chunk) => chunk.contentMd.length <= 120), true);
+    assert.match(fixedChunks[0]?.contentMd ?? "", /图片摘要|!\[image\]/);
+  });
+
   it("supports exploration session create/get/reply and keeps unsupported index routes explicit", async () => {
     const { app, storage } = await createAppFixture();
     const upload = multipartBody({

@@ -174,4 +174,32 @@ describe("index search service", () => {
     fixture.storage.close();
   });
 
+  it("renders only short image semantics in document context and truncates long entries", async () => {
+    const fixture = await createIndexedFixture();
+    fixture.storage.upsertImageSemantics([
+      {
+        imageHash: "img-alpha-1",
+        sourceDocumentId: "doc-alpha",
+        sourcePageNo: 1,
+        sourceImageIndex: 1,
+        semanticText: "Short retrieval summary.\n" + "A".repeat(500),
+        semanticDetailText: "Detailed semantic markdown that should stay out of document context.",
+        semanticModel: "gpt-4o-mini",
+      },
+    ]);
+    const service = new IndexSearchService({
+      storage: fixture.storage,
+      blobStore: fixture.blobStore,
+      documentIds: ["doc-alpha"],
+    });
+
+    const document = await service.getDocument("doc-alpha");
+    assert.match(document.rendered, /Image semantics cache:/);
+    assert.match(document.rendered, /Short retrieval summary/);
+    assert.match(document.rendered, /\[truncated\]/);
+    assert.doesNotMatch(document.rendered, /Detailed semantic markdown/);
+
+    fixture.storage.close();
+  });
+
 });

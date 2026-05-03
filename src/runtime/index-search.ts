@@ -7,6 +7,7 @@ Reference: legacy/python/src/fs_explorer/document_library.py
 
 import { resolve } from "node:path";
 
+import { truncateImageSemanticPreview } from "./image-semantic.js";
 import type { BlobStore, DocumentScope, LoadedDocumentPage } from "../types/library.js";
 import type {
   IndexedDocumentReadResult,
@@ -153,7 +154,10 @@ function formatImageSemanticCache(input: {
   for (const pageNo of [...grouped.keys()].sort((left, right) => left - right)) {
     const entries = (grouped.get(pageNo) ?? [])
       .filter((image) => image.semantic_text)
-      .map((image) => `- image ${image.source_image_index}: ${image.semantic_text}`);
+      .map(
+        (image) =>
+          `- image ${image.source_image_index}: ${truncateImageSemanticPreview(image.semantic_text ?? "")}`,
+      );
     if (entries.length === 0) {
       continue;
     }

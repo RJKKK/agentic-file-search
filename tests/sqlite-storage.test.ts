@@ -350,7 +350,34 @@ describe("sqlite storage", () => {
     storage.updateImageSemantic("img-1", "A chart", "gemini");
     const updated = storage.listImageSemanticsForDocument(docId);
     assert.equal(updated[0]?.semantic_text, "A chart");
+    assert.equal(updated[0]?.semantic_detail_text, null);
     assert.equal(updated[0]?.semantic_model, "gemini");
+
+    storage.upsertImageSemantics([
+      {
+        imageHash: "img-2",
+        sourceDocumentId: docId,
+        sourcePageNo: 1,
+        sourceImageIndex: 1,
+        semanticText: "Short retrieval summary",
+        semanticDetailText: "Detailed semantic markdown",
+        semanticModel: "gpt-4o-mini",
+      },
+    ]);
+    storage.upsertImageSemanticCache({
+      imageHash: "img-2",
+      promptVersion: "v2",
+      recognizable: true,
+      summary: "Short retrieval summary",
+      detailMarkdown: "## 详细说明\nA -> B",
+      detailTruncated: true,
+      semanticModel: "gpt-4o-mini",
+    });
+    const imageWithDetail = storage.getImageSemantics(["img-2"])["img-2"];
+    assert.equal(imageWithDetail?.semantic_detail_text, "Detailed semantic markdown");
+    const cache = storage.getImageSemanticCache("img-2", "v2");
+    assert.equal(cache?.detail_markdown, "## 详细说明\nA -> B");
+    assert.equal(cache?.detail_truncated, true);
 
     storage.close();
   });

@@ -9,6 +9,11 @@ import { extname } from "node:path";
 
 import { resolveDocumentScope } from "./document-library.js";
 import { evaluateImageSemanticCandidateInspection } from "./image-semantic-screening.js";
+import {
+  buildVisionPromptMessages,
+  renderImageSemantic,
+  type ImageSemanticPayload,
+} from "./image-semantic.js";
 import { resolveEmbeddingConfig, resolveTextConfig, resolveVisionConfig } from "./model-config.js";
 import { PythonDocumentAssetBridge } from "./python-document-assets.js";
 import type { BlobStore } from "../types/library.js";
@@ -41,7 +46,7 @@ const DEFAULT_NORMAL_CHUNK_MAX_CHARS = 2000;
 const DEFAULT_EVIDENCE_CHAR_BUDGET = 12000;
 const CER_CONTEXT_EXCERPT_TARGET = 600;
 const MAX_IMAGE_BYTES_FOR_VISION = 4 * 1024 * 1024;
-const IMAGE_PROMPT_VERSION = "v1";
+const IMAGE_PROMPT_VERSION = "v2";
 
 interface ChunkThresholds {
   smallMaxChars: number;
@@ -84,18 +89,6 @@ interface FixedChunkPiece {
   mergedPageNosJson: string;
   mergedBboxesJson: string;
   bboxJson: string;
-}
-
-interface ImageSemanticPayload {
-  recognizable: boolean;
-  image_kind?: string | null;
-  contains_text?: boolean | null;
-  visible_text?: string | null;
-  summary?: string | null;
-  entities?: string[];
-  keywords?: string[];
-  qa_hints?: string[];
-  drop_reason?: string | null;
 }
 
 export interface ImageChunkRendering {
@@ -528,6 +521,7 @@ async function describeImageWithVision(input: {
   }
   const baseUrl = (config.baseUrl?.trim() || "https://api.openai.com/v1").replace(/\/+$/, "");
   const dataUrl = `data:${input.mimeType};base64,${Buffer.from(input.bytes).toString("base64")}`;
+  const prompts = buildVisionPromptMessages();
   const payload = await fetchJsonWithTimeout(
     `${baseUrl}/chat/completions`,
     {
@@ -543,15 +537,14 @@ async function describeImageWithVision(input: {
         messages: [
           {
             role: "system",
-            content:
-              "Return strict JSON with fields recognizable, image_kind, contains_text, visible_text, summary, entities, keywords, qa_hints, drop_reason.",
+            content: prompts.systemPrompt,
           },
           {
             role: "user",
             content: [
               {
                 type: "text",
-                text: "Analyze this document image for retrieval. Keep summary concise and factual.",
+                text: prompts.userPrompt,
               },
               {
                 type: "image_url",
@@ -1053,6 +1046,46 @@ function splitFixedChunkText(content: string, maxChars: number): string[] {
     const breakAt = bestBreakAt >= 0 ? bestBreakAt : maxChars;
     const end = breakAt > Math.floor(maxChars * 0.5) ? breakAt : maxChars;
     parts.push(remaining.slice(0, end).trim());
+    remaining = remaining.slice(end).trimStart();
+  }
+  if (remaining.trim()) {
+    parts.push(remaining.trim());
+  }
+  return parts.filter((part) => part.length > 0);
+}
+
+function splitFixedChunkTextSmart(content: string, maxChars: number): string[] {
+  const text = normalizeWhitespace(String(content || ""));
+  if (text.length <= maxChars) {
+    return [text];
+  }
+  const parts: string[] = [];
+  let remaining = text;
+  while (remaining.length > maxChars) {
+    const slice = remaining.slice(0, maxChars);
+    const bestBreakAt = Math.max(
+      ...[
+        "\n## ",
+        "\n### ",
+        "\n#### ",
+        "\n- ",
+        "\n1. ",
+        "\n2. ",
+        "\n3. ",
+        "\n\n",
+        "\n",
+        "。",
+        "！",
+        "？",
+        "；",
+        ". ",
+        "; ",
+        " ",
+      ].map((marker) => slice.lastIndexOf(marker)),
+    );
+    const breakAt = bestBreakAt >= 0 ? bestBreakAt : maxChars;
+    const end = breakAt > Math.floor(maxChars * 0.5) ? breakAt : maxChars;
+    parts.push(slice.slice(0, end).trim());
     remaining = remaining.slice(end).trimStart();
   }
   if (remaining.trim()) {
@@ -2652,10 +2685,12 @@ export class TraditionalRagService {
             image_kind: cached.image_kind,
             contains_text: cached.contains_text,
             visible_text: cached.visible_text,
-            summary: cached.summary,
+            retrieval_summary: cached.summary,
+            detail_markdown: cached.detail_markdown,
             entities: parseJsonArray<string>(cached.entities_json, []),
             keywords: parseJsonArray<string>(cached.keywords_json, []),
             qa_hints: parseJsonArray<string>(cached.qa_hints_json, []),
+            detail_truncated: cached.detail_truncated,
             drop_reason: cached.drop_reason,
           };
         } else {
@@ -2671,7 +2706,9 @@ export class TraditionalRagService {
               imageKind: semanticPayload.image_kind ?? null,
               containsText: semanticPayload.contains_text ?? null,
               visibleText: semanticPayload.visible_text ?? null,
-              summary: semanticPayload.summary ?? null,
+              summary: semanticPayload.retrieval_summary ?? null,
+              detailMarkdown: semanticPayload.detail_markdown ?? null,
+              detailTruncated: semanticPayload.detail_truncated ?? null,
               entitiesJson: JSON.stringify(semanticPayload.entities ?? []),
               keywordsJson: JSON.stringify(semanticPayload.keywords ?? []),
               qaHintsJson: JSON.stringify(semanticPayload.qa_hints ?? []),
@@ -2704,16 +2741,14 @@ export class TraditionalRagService {
         continue;
       }
 
-      const semanticText = semanticPayload
-        ? [semanticPayload.summary, semanticPayload.visible_text, ...(semanticPayload.keywords ?? [])]
-            .filter(Boolean)
-            .join("\n")
-            .trim()
-        : null;
-      const markdown = semanticText
-        ? `![image](${accessibleUrl})\n\n${semanticText}`
-        : `![image](${accessibleUrl})`;
-      renderMap.set(image.image_hash, { dropped: false, markdown });
+      const renderedSemantic = renderImageSemantic({
+        payload: semanticPayload,
+        accessibleUrl,
+      });
+      renderMap.set(image.image_hash, {
+        dropped: false,
+        markdown: renderedSemantic.shortMarkdown || `![image](${accessibleUrl})`,
+      });
       rows.push({
         imageHash: image.image_hash,
         sourceDocumentId: input.documentId,
@@ -2730,7 +2765,8 @@ export class TraditionalRagService {
         isDropped: false,
         recognizable: semanticPayload ? semanticPayload.recognizable !== false : null,
         accessibleUrl,
-        semanticText: semanticText || null,
+        semanticText: renderedSemantic.semanticText,
+        semanticDetailText: renderedSemantic.semanticDetailText,
         semanticModel: semanticPayload && input.enableImageSemantic ? resolveVisionConfig().modelName : null,
       });
     }
@@ -2918,19 +2954,7 @@ export class TraditionalRagService {
     const maxChars = Math.max(Number(input.fixedChunkChars || 0), 1);
     const pieces: FixedChunkPiece[] = [];
     for (const chunk of input.sourceChunks) {
-      if (chunk.blockType === "picture") {
-        pieces.push({
-          sourceChunkId: chunk.id,
-          pageNo: chunk.pageNo,
-          contentMd: chunk.contentMd,
-          blockType: chunk.blockType,
-          mergedPageNosJson: chunk.mergedPageNosJson,
-          mergedBboxesJson: chunk.mergedBboxesJson,
-          bboxJson: chunk.bboxJson,
-        });
-        continue;
-      }
-      const contentParts = splitFixedChunkText(chunk.contentMd, maxChars);
+      const contentParts = splitFixedChunkTextSmart(chunk.contentMd, maxChars);
       for (const part of contentParts) {
         pieces.push({
           sourceChunkId: chunk.id,
@@ -2985,17 +3009,6 @@ export class TraditionalRagService {
       }
       const currentText = normalizeWhitespace(pendingPieces.map((item) => item.contentMd).join("\n\n"));
       const candidate = normalizeWhitespace([currentText, pieceText].filter(Boolean).join("\n\n"));
-      if (piece.blockType === "picture") {
-        if (pendingPieces.length === 0) {
-          pendingPieces = [piece];
-          continue;
-        }
-        pendingPieces.push(piece);
-        if (candidate.length >= maxChars) {
-          flushPending();
-        }
-        continue;
-      }
       if (candidate.length > maxChars && pendingPieces.length > 0) {
         flushPending();
       }
