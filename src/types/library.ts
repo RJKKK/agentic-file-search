@@ -12,6 +12,7 @@ import type {
   DocumentParseTaskType,
   DocumentParseStageTiming,
   PublicCollectionRecord,
+  RetrievalChunkingStrategy,
   SqliteStorageBackend,
   StoredDocument,
   StoredImageSemantic,
@@ -75,6 +76,8 @@ export interface UploadDocumentInput {
   contentType?: string | null;
   enableEmbedding?: boolean;
   enableImageSemantic?: boolean;
+  chunkingStrategy?: RetrievalChunkingStrategy;
+  fixedChunkChars?: number | null;
 }
 
 export interface DocumentSummaryPayload {
@@ -98,6 +101,8 @@ export interface DocumentSummaryPayload {
   embedding_enabled: boolean;
   has_embeddings: boolean;
   image_semantic_enabled: boolean;
+  retrieval_chunking_strategy: RetrievalChunkingStrategy;
+  fixed_chunk_chars: number | null;
   is_deleted: boolean;
   status: string;
   metadata: Record<string, unknown>;

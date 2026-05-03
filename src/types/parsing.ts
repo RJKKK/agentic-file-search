@@ -42,6 +42,8 @@ export const ParsedBlockSchema = z.object({
   char_count: z.number().int().min(0).optional().default(0),
   image_hash: z.string().nullable().optional(),
   source_image_index: z.number().int().min(0).nullable().optional(),
+  text_start: z.number().int().min(0).nullable().optional(),
+  text_end: z.number().int().min(0).nullable().optional(),
 });
 
 export const ParsedUnitSchema = z.object({

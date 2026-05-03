@@ -399,7 +399,7 @@ export async function createHttpServer(
   app.get("/api/retrieval-chunks/:chunkId/content", async (request, reply) => {
     const traceId = makeTraceId();
     const { chunkId } = request.params as { chunkId: string };
-    const chunk = storage.getRetrievalChunk(chunkId);
+    const chunk = storage.getRetrievalChunk(chunkId) ?? storage.getFixedRetrievalChunk(chunkId);
     if (!chunk) {
       return errorResponse(reply, {
         statusCode: 404,
@@ -721,6 +721,12 @@ export async function createHttpServer(
         contentType: part.mimetype,
         enableEmbedding: toBoolValue(fields.enable_embedding?.value, true),
         enableImageSemantic: toBoolValue(fields.enable_image_semantic?.value, true),
+        chunkingStrategy:
+          toStringValue(fields.chunking_strategy?.value, "").trim() === "fixed" ? "fixed" : "small_to_big",
+        fixedChunkChars:
+          fields.fixed_chunk_chars?.value == null || String(fields.fixed_chunk_chars.value).trim() === ""
+            ? null
+            : Number(fields.fixed_chunk_chars.value),
       });
       return withTrace(
         reply,
@@ -845,6 +851,14 @@ export async function createHttpServer(
           body.enable_embedding == null ? undefined : toBoolValue(body.enable_embedding, true),
         enableImageSemantic:
           body.enable_image_semantic == null ? undefined : toBoolValue(body.enable_image_semantic, true),
+        chunkingStrategy:
+          body.chunking_strategy == null
+            ? undefined
+            : (toStringValue(body.chunking_strategy, "small_to_big") === "fixed" ? "fixed" : "small_to_big"),
+        fixedChunkChars:
+          body.fixed_chunk_chars == null || String(body.fixed_chunk_chars).trim() === ""
+            ? undefined
+            : Number(body.fixed_chunk_chars),
       });
       return withTrace(
         reply,

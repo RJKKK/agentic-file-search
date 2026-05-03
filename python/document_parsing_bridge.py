@@ -68,6 +68,8 @@ def _serialize_block(block: ParsedBlock) -> dict[str, Any]:
         "char_count": int(block.char_count),
         "image_hash": block.image_hash,
         "source_image_index": block.source_image_index,
+        "text_start": block.text_start,
+        "text_end": block.text_end,
     }
 
 
@@ -183,9 +185,9 @@ def _parse_document_for_bridge(
 
 
 def main() -> int:
-    raw = sys.stdin.read()
+    raw = sys.stdin.buffer.read()
     try:
-        payload = json.loads(raw or "{}")
+        payload = json.loads(raw.decode("utf-8") or "{}")
         operation = str(payload.get("operation") or "").strip()
         if operation == "parse_document":
             file_path = str(payload.get("file_path") or "").strip()

@@ -70,10 +70,22 @@ class DelayedSequenceModel implements ActionModel {
   }
 }
 
-function multipartBody(input: { filename: string; content: string; contentType?: string }) {
+function multipartBody(input: {
+  filename: string;
+  content: string;
+  contentType?: string;
+  fields?: Record<string, string>;
+}) {
   const boundary = "----afs-test-boundary";
+  const fieldParts = Object.entries(input.fields ?? {}).flatMap(([name, value]) => [
+    `--${boundary}`,
+    `Content-Disposition: form-data; name="${name}"`,
+    "",
+    value,
+  ]);
   const body = Buffer.from(
     [
+      ...fieldParts,
       `--${boundary}`,
       `Content-Disposition: form-data; name="file"; filename="${input.filename}"`,
       `Content-Type: ${input.contentType ?? "application/pdf"}`,
@@ -104,6 +116,21 @@ async function createAppFixture() {
   return { app, storage, blobStore };
 }
 
+async function waitForDocumentDetail(
+  app: Awaited<ReturnType<typeof createHttpServer>>,
+  docId: string,
+  predicate: (document: Record<string, unknown>) => boolean,
+): Promise<Record<string, unknown>> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const detail = await app.inject({ method: "GET", url: `/api/documents/${docId}` });
+    if (detail.statusCode === 200 && predicate(detail.json().document as Record<string, unknown>)) {
+      return detail.json().document as Record<string, unknown>;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Document ${docId} did not reach the expected state.`);
+}
+
 describe("http server", () => {
   it("supports document upload, listing, detail, pages, search, and delete", async () => {
     const { app, storage } = await createAppFixture();
@@ -118,6 +145,10 @@ describe("http server", () => {
     const upload = multipartBody({
       filename: "alpha.pdf",
       content: "%PDF fake",
+      fields: {
+        enable_embedding: "false",
+        enable_image_semantic: "false",
+      },
     });
     const uploaded = await app.inject({
       method: "POST",
@@ -125,19 +156,30 @@ describe("http server", () => {
       headers: { "content-type": upload.contentType },
       payload: upload.body,
     });
-    assert.equal(uploaded.statusCode, 201);
+    assert.equal(uploaded.statusCode, 202);
     assert.ok(uploaded.headers["x-trace-id"]);
     const uploadPayload = uploaded.json();
     const docId = uploadPayload.document.id as string;
-    assert.equal(uploadPayload.upload_result.page_naming_scheme, "page-0001.md");
+    assert.equal(uploadPayload.document.retrieval_chunking_strategy, "small_to_big");
+    assert.equal(uploadPayload.document.fixed_chunk_chars, null);
+    assert.equal(uploadPayload.task.options.chunking_strategy, "small_to_big");
+    assert.equal(uploadPayload.task.options.fixed_chunk_chars, null);
 
     const list = await app.inject({ method: "GET", url: "/api/documents?page=1&page_size=10" });
     assert.equal(list.statusCode, 200);
     assert.equal(list.json().total, 1);
+    assert.equal(list.json().items[0].retrieval_chunking_strategy, "small_to_big");
 
+    await waitForDocumentDetail(
+      app,
+      docId,
+      (document) => document.upload_status === "completed" && document.page_count === 1,
+    );
     const detail = await app.inject({ method: "GET", url: `/api/documents/${docId}` });
     assert.equal(detail.statusCode, 200);
     assert.equal(detail.json().page_summary.page_count, 1);
+    assert.equal(detail.json().document.retrieval_chunking_strategy, "small_to_big");
+    assert.equal(detail.json().document.fixed_chunk_chars, null);
 
     const pages = await app.inject({ method: "GET", url: `/api/documents/${docId}/pages` });
     assert.equal(pages.statusCode, 200);
@@ -162,9 +204,129 @@ describe("http server", () => {
     storage.close();
   });
 
+  it("accepts fixed chunking options on upload and reparse, and serves fixed retrieval chunk content", async () => {
+    const { app, storage } = await createAppFixture();
+    const upload = multipartBody({
+      filename: "fixed.pdf",
+      content: "%PDF fake",
+      fields: {
+        enable_embedding: "false",
+        enable_image_semantic: "false",
+      },
+    });
+    const uploaded = await app.inject({
+      method: "POST",
+      url: "/api/documents",
+      headers: { "content-type": upload.contentType },
+      payload: upload.body,
+    });
+    assert.equal(uploaded.statusCode, 202);
+    const initialPayload = uploaded.json();
+    const docId = initialPayload.document.id as string;
+
+    const fixedUpload = multipartBody({
+      filename: "fixed-two.pdf",
+      content: "%PDF fixed",
+      fields: {
+        enable_embedding: "false",
+        enable_image_semantic: "false",
+        chunking_strategy: "fixed",
+        fixed_chunk_chars: "120",
+      },
+    });
+    const fixedUploaded = await app.inject({
+      method: "POST",
+      url: "/api/documents",
+      headers: { "content-type": fixedUpload.contentType },
+      payload: fixedUpload.body,
+    });
+    assert.equal(fixedUploaded.statusCode, 202);
+    const fixedPayload = fixedUploaded.json();
+    const fixedDocId = fixedPayload.document.id as string;
+    assert.equal(fixedPayload.document.retrieval_chunking_strategy, "fixed");
+    assert.equal(fixedPayload.document.fixed_chunk_chars, 120);
+    assert.equal(fixedPayload.task.options.chunking_strategy, "fixed");
+    assert.equal(fixedPayload.task.options.fixed_chunk_chars, 120);
+
+    const reparsed = await app.inject({
+      method: "POST",
+      url: `/api/documents/${encodeURIComponent(docId)}/parse`,
+      payload: {
+        force: true,
+        chunking_strategy: "fixed",
+        fixed_chunk_chars: 64,
+        enable_embedding: false,
+        enable_image_semantic: false,
+      },
+    });
+    assert.equal(reparsed.statusCode, 202);
+    assert.equal(reparsed.json().task.options.chunking_strategy, "fixed");
+    assert.equal(reparsed.json().task.options.fixed_chunk_chars, 64);
+    const reparsedDocument = await waitForDocumentDetail(
+      app,
+      docId,
+      (document) =>
+        document.retrieval_chunking_strategy === "fixed" && document.fixed_chunk_chars === 64,
+    );
+    assert.equal(reparsedDocument.retrieval_chunking_strategy, "fixed");
+    assert.equal(reparsedDocument.fixed_chunk_chars, 64);
+
+    storage.replaceDocumentChunks(fixedDocId, [
+      {
+        id: "manual-dchunk-1",
+        documentId: fixedDocId,
+        ordinal: 0,
+        referenceRetrievalChunkId: "manual-frchunk-1",
+        pageNo: 1,
+        documentIndex: 0,
+        pageIndex: 0,
+        blockType: "paragraph",
+        bboxJson: JSON.stringify([0, 0, 1, 1]),
+        contentMd: "Purchase price fixed chunk.",
+        sizeClass: "normal",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: JSON.stringify([1]),
+        mergedBboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+      },
+    ]);
+    storage.replaceFixedRetrievalChunks(fixedDocId, [
+      {
+        id: "manual-frchunk-1",
+        documentId: fixedDocId,
+        ordinal: 0,
+        contentMd: "Purchase price fixed chunk.",
+        sizeClass: "normal",
+        summaryText: null,
+        sourceDocumentChunkIdsJson: JSON.stringify(["manual-dchunk-1"]),
+        pageNosJson: JSON.stringify([1]),
+        sourceLocator: "page-1",
+        bboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+      },
+    ]);
+    const fixedChunkContent = await app.inject({
+      method: "GET",
+      url: "/api/retrieval-chunks/manual-frchunk-1/content",
+    });
+    assert.equal(fixedChunkContent.statusCode, 200);
+    assert.match(fixedChunkContent.json().chunk.content_md, /fixed chunk/i);
+
+    await app.close();
+    storage.close();
+  });
+
   it("supports collection CRUD and document attachment routes", async () => {
     const { app, storage } = await createAppFixture();
-    const upload = multipartBody({ filename: "alpha.pdf", content: "%PDF fake" });
+    const upload = multipartBody({
+      filename: "alpha.pdf",
+      content: "%PDF fake",
+      fields: {
+        enable_embedding: "false",
+        enable_image_semantic: "false",
+      },
+    });
     const uploaded = await app.inject({
       method: "POST",
       url: "/api/documents",
@@ -172,7 +334,14 @@ describe("http server", () => {
       payload: upload.body,
     });
     const docId = uploaded.json().document.id as string;
-    const uploadB = multipartBody({ filename: "beta.pdf", content: "%PDF fake" });
+    const uploadB = multipartBody({
+      filename: "beta.pdf",
+      content: "%PDF fake",
+      fields: {
+        enable_embedding: "false",
+        enable_image_semantic: "false",
+      },
+    });
     const uploadedB = await app.inject({
       method: "POST",
       url: "/api/documents",
@@ -180,6 +349,10 @@ describe("http server", () => {
       payload: uploadB.body,
     });
     const docIdB = uploadedB.json().document.id as string;
+    await Promise.all([
+      waitForDocumentDetail(app, docId, (document) => document.upload_status === "completed"),
+      waitForDocumentDetail(app, docIdB, (document) => document.upload_status === "completed"),
+    ]);
 
     const created = await app.inject({
       method: "POST",
@@ -1470,7 +1643,14 @@ describe("http server", () => {
 
   it("supports exploration session create/get/reply and keeps unsupported index routes explicit", async () => {
     const { app, storage } = await createAppFixture();
-    const upload = multipartBody({ filename: "alpha.pdf", content: "%PDF fake" });
+    const upload = multipartBody({
+      filename: "alpha.pdf",
+      content: "%PDF fake",
+      fields: {
+        enable_embedding: "false",
+        enable_image_semantic: "false",
+      },
+    });
     const uploaded = await app.inject({
       method: "POST",
       url: "/api/documents",
@@ -1478,6 +1658,7 @@ describe("http server", () => {
       payload: upload.body,
     });
     const docId = uploaded.json().document.id as string;
+    await waitForDocumentDetail(app, docId, (document) => document.upload_status === "completed");
     const collection = storage.createCollection("Answers");
     storage.attachDocumentsToCollection(collection.id, [docId]);
 
@@ -1540,14 +1721,22 @@ describe("http server", () => {
     assert.ok(address && typeof address === "object");
     const baseUrl = `http://127.0.0.1:${address.port}`;
 
-    const upload = multipartBody({ filename: "alpha.pdf", content: "%PDF fake" });
+    const upload = multipartBody({
+      filename: "alpha.pdf",
+      content: "%PDF fake",
+      fields: {
+        enable_embedding: "false",
+        enable_image_semantic: "false",
+      },
+    });
     const uploaded = await fetch(`${baseUrl}/api/documents`, {
       method: "POST",
       headers: { "content-type": upload.contentType },
       body: upload.body,
     });
-    assert.equal(uploaded.status, 201);
+    assert.equal(uploaded.status, 202);
     const uploadedPayload = (await uploaded.json()) as { document: { id: string } };
+    await waitForDocumentDetail(app, uploadedPayload.document.id, (document) => document.upload_status === "completed");
 
     const started = await fetch(`${baseUrl}/api/explore/sessions`, {
       method: "POST",

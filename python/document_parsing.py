@@ -132,6 +132,8 @@ class ParsedBlock:
     char_count: int
     image_hash: str | None = None
     source_image_index: int | None = None
+    text_start: int | None = None
+    text_end: int | None = None
 
 
 @dataclass(frozen=True)
@@ -424,6 +426,8 @@ def reconstruct_parsed_document(units: list[dict[str, object]]) -> ParseCacheHit
                     char_count=int(block.get("char_count") or len(str(block.get("markdown") or ""))),
                     image_hash=_optional_str(block.get("image_hash")),
                     source_image_index=_optional_int(block.get("source_image_index")),
+                    text_start=_optional_int(block.get("text_start")),
+                    text_end=_optional_int(block.get("text_end")),
                 )
                 for block in _coerce_block_list(unit.get("blocks"))
             ),
@@ -554,6 +558,15 @@ def inspect_image_bytes(
             "supported": False,
             "has_text": False,
             "interference_score": 0.0,
+            "width": None,
+            "height": None,
+            "pixel_area": None,
+            "aspect_ratio": None,
+            "grayscale_stddev": None,
+            "edge_density": None,
+            "grayscale_entropy": None,
+            "grayscale_mean": None,
+            "hue_stddev": None,
             "compressed_bytes_base64": base64.b64encode(image_bytes).decode("ascii"),
             "compressed_byte_size": len(image_bytes),
             "output_mime_type": effective_mime,
@@ -561,16 +574,51 @@ def inspect_image_bytes(
 
     has_text = False
     interference_score = 0.0
+    width = None
+    height = None
+    pixel_area = None
+    aspect_ratio = None
+    grayscale_stddev = None
+    edge_density = None
+    grayscale_entropy = None
+    grayscale_mean = None
+    hue_stddev = None
     if cv2 is not None and np is not None:
         try:
             array = np.frombuffer(image_bytes, dtype=np.uint8)
             image = cv2.imdecode(array, cv2.IMREAD_COLOR)
             if image is not None:
+                height = int(image.shape[0])
+                width = int(image.shape[1])
+                pixel_area = int(width * height)
+                aspect_ratio = float(max(width, height) / max(min(width, height), 1))
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                grayscale_stddev = float(np.std(gray))
+                grayscale_mean = float(np.mean(gray))
+                area = float(height * width)
+                edges = cv2.Canny(gray, 80, 180)
+                edge_density = float(np.count_nonzero(edges)) / max(area, 1.0)
+                histogram = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
+                histogram /= max(float(histogram.sum()), 1.0)
+                grayscale_entropy = float(
+                    -np.sum([value * np.log2(value) for value in histogram if value > 0]) / 8.0
+                )
+                hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype("float32")
+                hue_stddev = float(np.std(hsv[:, :, 0]))
                 has_text = _opencv_has_text(image)
                 interference_score = _opencv_interference_score(image)
         except Exception:
             has_text = False
             interference_score = 0.0
+            width = None
+            height = None
+            pixel_area = None
+            aspect_ratio = None
+            grayscale_stddev = None
+            edge_density = None
+            grayscale_entropy = None
+            grayscale_mean = None
+            hue_stddev = None
 
     compressed_bytes = image_bytes
     output_mime_type = effective_mime
@@ -578,11 +626,16 @@ def inspect_image_bytes(
         try:
             with Image.open(io.BytesIO(image_bytes)) as image:
                 image = image.convert("RGB")
-                width, height = image.size
-                max_side = max(width, height, 1)
+                pil_width, pil_height = image.size
+                if width is None or height is None:
+                    width = int(pil_width)
+                    height = int(pil_height)
+                    pixel_area = int(width * height)
+                    aspect_ratio = float(max(width, height) / max(min(width, height), 1))
+                max_side = max(pil_width, pil_height, 1)
                 if max_side > 1600:
                     scale = 1600 / max_side
-                    image = image.resize((max(1, int(width * scale)), max(1, int(height * scale))))
+                    image = image.resize((max(1, int(pil_width * scale)), max(1, int(pil_height * scale))))
                 buffer = io.BytesIO()
                 image.save(buffer, format="JPEG", quality=80, optimize=True)
                 compressed_bytes = buffer.getvalue()
@@ -595,6 +648,15 @@ def inspect_image_bytes(
         "supported": True,
         "has_text": has_text,
         "interference_score": float(interference_score),
+        "width": width,
+        "height": height,
+        "pixel_area": pixel_area,
+        "aspect_ratio": aspect_ratio,
+        "grayscale_stddev": grayscale_stddev,
+        "edge_density": edge_density,
+        "grayscale_entropy": grayscale_entropy,
+        "grayscale_mean": grayscale_mean,
+        "hue_stddev": hue_stddev,
         "compressed_bytes_base64": base64.b64encode(compressed_bytes).decode("ascii"),
         "compressed_byte_size": len(compressed_bytes),
         "output_mime_type": output_mime_type,
@@ -1045,6 +1107,8 @@ def _parsed_document_from_pdf_json(
                     char_count=len(normalized_block),
                     image_hash=image_hash,
                     source_image_index=source_image_index,
+                    text_start=_pdf_json_block_text_start(raw_block),
+                    text_end=_pdf_json_block_text_end(raw_block),
                 )
             )
 
@@ -1351,6 +1415,27 @@ def _pdf_json_block_bbox(block: dict[str, object]) -> tuple[float, float, float,
         return None
     x0, y0, x1, y1 = values
     return (float(x0), float(y0), float(x1), float(y1))
+
+
+def _pdf_json_block_pos(block: dict[str, object]) -> tuple[int, int] | None:
+    pos = block.get("pos")
+    if not isinstance(pos, (list, tuple)) or len(pos) != 2:
+        return None
+    start = _optional_int(pos[0])
+    end = _optional_int(pos[1])
+    if start is None or end is None or start < 0 or end < start:
+        return None
+    return (start, end)
+
+
+def _pdf_json_block_text_start(block: dict[str, object]) -> int | None:
+    pos = _pdf_json_block_pos(block)
+    return pos[0] if pos is not None else None
+
+
+def _pdf_json_block_text_end(block: dict[str, object]) -> int | None:
+    pos = _pdf_json_block_pos(block)
+    return pos[1] if pos is not None else None
 
 
 def _normalize_block_markdown(*, markdown: str, block_type: str) -> str:

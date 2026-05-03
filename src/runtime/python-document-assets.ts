@@ -4,6 +4,7 @@ Reference: legacy/python/src/fs_explorer/fs.py
 */
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -18,9 +19,11 @@ function defaultPythonExecutable(repositoryRoot: string): string {
     return process.env.FS_EXPLORER_PYTHON_BIN.trim();
   }
   if (process.platform === "win32") {
-    return resolve(repositoryRoot, ".venv", "Scripts", "python.exe");
+    const venvPython = resolve(repositoryRoot, ".venv", "Scripts", "python.exe");
+    return existsSync(venvPython) ? venvPython : "python";
   }
-  return resolve(repositoryRoot, ".venv", "bin", "python");
+  const venvPython = resolve(repositoryRoot, ".venv", "bin", "python");
+  return existsSync(venvPython) ? venvPython : "python";
 }
 
 function defaultBridgeScript(repositoryRoot: string): string {
@@ -42,6 +45,15 @@ export interface PythonImageInspection {
   supported: boolean;
   has_text: boolean;
   interference_score: number;
+  width?: number | null;
+  height?: number | null;
+  pixel_area?: number | null;
+  aspect_ratio?: number | null;
+  grayscale_stddev?: number | null;
+  edge_density?: number | null;
+  grayscale_entropy?: number | null;
+  grayscale_mean?: number | null;
+  hue_stddev?: number | null;
   compressed_bytes_base64: string;
   compressed_byte_size: number;
   output_mime_type: string;
@@ -89,6 +101,11 @@ export class PythonDocumentAssetBridge {
     return await new Promise<string>((resolvePromise, rejectPromise) => {
       const child = spawn(this.pythonExecutable, [this.bridgeScript], {
         cwd: this.repositoryRoot,
+        env: {
+          ...process.env,
+          PYTHONIOENCODING: "utf-8",
+          PYTHONUTF8: "1",
+        },
         stdio: ["pipe", "pipe", "pipe"],
       });
 

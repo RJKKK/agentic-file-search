@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import { extname } from "node:path";
 
 import { resolveDocumentScope } from "./document-library.js";
+import { evaluateImageSemanticCandidateInspection } from "./image-semantic-screening.js";
 import { resolveEmbeddingConfig, resolveTextConfig, resolveVisionConfig } from "./model-config.js";
 import { PythonDocumentAssetBridge } from "./python-document-assets.js";
 import type { BlobStore } from "../types/library.js";
@@ -25,10 +26,12 @@ import type {
 import type {
   SqliteStorageBackend,
   StorageDocumentChunkRecord,
+  StorageFixedRetrievalChunkRecord,
   StorageImageSemanticRecord,
   StorageRetrievalChunkRecord,
   StoredDocument,
   StoredDocumentChunk,
+  StoredFixedRetrievalChunk,
   StoredImageSemantic,
   StoredRetrievalChunk,
 } from "../types/storage.js";
@@ -73,6 +76,16 @@ interface RetrievalChunkPlan {
   bboxesJson: string;
 }
 
+interface FixedChunkPiece {
+  sourceChunkId: string;
+  pageNo: number;
+  contentMd: string;
+  blockType: string;
+  mergedPageNosJson: string;
+  mergedBboxesJson: string;
+  bboxJson: string;
+}
+
 interface ImageSemanticPayload {
   recognizable: boolean;
   image_kind?: string | null;
@@ -100,6 +113,8 @@ interface RankedChunkHit {
   unitText: string;
   isSplitFromOversized: boolean;
 }
+
+type TraditionalRetrievalChunkRecord = StoredRetrievalChunk | StoredFixedRetrievalChunk;
 
 interface GroupedEvidence {
   citationNo: number;
@@ -1018,6 +1033,34 @@ function splitOversized(content: string, blockType: string): string[] {
   return parts;
 }
 
+function splitFixedChunkText(content: string, maxChars: number): string[] {
+  const text = String(content || "");
+  if (text.length <= maxChars) {
+    return [text];
+  }
+  const parts: string[] = [];
+  let remaining = text;
+  while (remaining.length > maxChars) {
+    const slice = remaining.slice(0, maxChars);
+    const bestBreakAt = Math.max(
+      slice.lastIndexOf("\n\n"),
+      slice.lastIndexOf("。"),
+      slice.lastIndexOf("！"),
+      slice.lastIndexOf("？"),
+      slice.lastIndexOf(". "),
+      slice.lastIndexOf(" "),
+    );
+    const breakAt = bestBreakAt >= 0 ? bestBreakAt : maxChars;
+    const end = breakAt > Math.floor(maxChars * 0.5) ? breakAt : maxChars;
+    parts.push(remaining.slice(0, end).trim());
+    remaining = remaining.slice(end).trimStart();
+  }
+  if (remaining.trim()) {
+    parts.push(remaining.trim());
+  }
+  return parts.filter((part) => part.length > 0);
+}
+
 function isHeadingLikeShortCenterSegment(segment: EvidenceSegment): boolean {
   if (!segment.isCenter) {
     return false;
@@ -1029,16 +1072,21 @@ function isHeadingLikeShortCenterSegment(segment: EvidenceSegment): boolean {
   if (!text || text.length > 160) {
     return false;
   }
-  // const lines = String(segment.mergedExcerpt || "")
-  //   .split(/\r?\n/)
-  //   .map((line) => line.trim())
-  //   .filter(Boolean);
-  // const headingLikeLine = lines.some((line) =>
-  //   /^#{1,6}\s*/.test(line) ||
-  //   /(利润表|资产负债表|现金流量表|所有者权益变动表|附注|注释)$/.test(line.replace(/\*+/g, "").trim()),
-  // );
-  // const tableKeyword = /(利润表|资产负债表|现金流量表|所有者权益变动表)/.test(text);
-  return true
+  const lines = String(segment.mergedExcerpt || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return false;
+  }
+  return lines.some((line) => {
+    const normalizedLine = line.replace(/\*+/g, "").trim();
+    return (
+      /^#{1,6}\s*/.test(line) ||
+      /^(section|chapter|appendix)\b/i.test(normalizedLine) ||
+      /(利润表|资产负债表|现金流量表|所有者权益变动表|附注|注释)$/.test(normalizedLine)
+    );
+  });
 }
 
 function uniqueOrdered<T>(values: T[]): T[] {
@@ -1577,7 +1625,11 @@ export class TraditionalRagService {
   }
 
   async buildEmbeddingsForDocument(documentId: string): Promise<number> {
-    const retrievalUnits = this.storage.listDocumentChunks(documentId);
+    const document = this.storage.getDocument(documentId);
+    const retrievalUnits =
+      document?.retrieval_chunking_strategy === "fixed"
+        ? this.storage.listFixedRetrievalChunks(documentId)
+        : this.storage.listDocumentChunks(documentId);
     return this.buildEmbeddingsForChunks(
       documentId,
       retrievalUnits.map((chunk) => ({
@@ -1628,16 +1680,47 @@ export class TraditionalRagService {
     return this.buildRetrievalChunks(documentId, documentChunks);
   }
 
+  createFixedRetrievalChunks(input: {
+    documentId: string;
+    sourceChunks: SourceChunkRecord[];
+    fixedChunkChars: number;
+  }): StorageFixedRetrievalChunkRecord[] {
+    return this.buildFixedRetrievalChunks(input);
+  }
+
   createIndexedDocumentChunks(
     documentId: string,
     sourceChunks: SourceChunkRecord[],
     retrievalChunks: StorageRetrievalChunkRecord[],
+    fixedRetrievalChunks: StorageFixedRetrievalChunkRecord[] = [],
   ): StorageDocumentChunkRecord[] {
-    return this.buildIndexedDocumentChunks(documentId, sourceChunks, retrievalChunks);
+    return this.buildIndexedDocumentChunks(documentId, sourceChunks, retrievalChunks, fixedRetrievalChunks);
   }
 
   async deleteDocumentIndex(documentId: string): Promise<void> {
     await deleteQdrantCollection(documentId);
+  }
+
+  private listTraditionalRetrievalChunks(documentId: string): TraditionalRetrievalChunkRecord[] {
+    const document = this.storage.getDocument(documentId);
+    if (document?.retrieval_chunking_strategy === "fixed") {
+      return this.storage.listFixedRetrievalChunks(documentId);
+    }
+    return this.storage.listRetrievalChunks(documentId);
+  }
+
+  private getTraditionalRetrievalChunk(
+    chunkId: string,
+    input: { documentId?: string | null } = {},
+  ): TraditionalRetrievalChunkRecord | null {
+    if (input.documentId) {
+      const document = this.storage.getDocument(input.documentId);
+      if (document?.retrieval_chunking_strategy === "fixed") {
+        return this.storage.getFixedRetrievalChunk(chunkId);
+      }
+      return this.storage.getRetrievalChunk(chunkId);
+    }
+    return this.storage.getRetrievalChunk(chunkId) ?? this.storage.getFixedRetrievalChunk(chunkId);
   }
 
   async query(input: {
@@ -1811,6 +1894,11 @@ export class TraditionalRagService {
     const documentsWithEmbeddings = scope.documents.filter((document) => document.has_embeddings);
     const documentIdsWithEmbeddings = new Set(documentsWithEmbeddings.map((document) => document.id));
     const missingEmbeddingDocuments = scope.documents.filter((document) => !document.has_embeddings);
+    const fixedDocuments = scope.documents.filter((document) => document.retrieval_chunking_strategy === "fixed");
+    const fixedDocumentIds = fixedDocuments.map((document) => document.id);
+    const smallToBigDocumentIds = scope.documents
+      .filter((document) => document.retrieval_chunking_strategy !== "fixed")
+      .map((document) => document.id);
     if (input.mode === "semantic" && documentsWithEmbeddings.length === 0) {
       throw new Error("Selected documents do not have embeddings yet.");
     }
@@ -1820,12 +1908,13 @@ export class TraditionalRagService {
       );
     }
 
-    const keywordHits =
-      input.mode === "semantic"
-        ? []
-        : this.storage.keywordSearchDocumentChunks({
+    const keywordHits: RankedChunkHit[] = [];
+    if (input.mode !== "semantic") {
+      if (smallToBigDocumentIds.length > 0) {
+        keywordHits.push(
+          ...this.storage.keywordSearchDocumentChunks({
             query: toFtsQuery(question),
-            documentIds: scope.documentIds,
+            documentIds: smallToBigDocumentIds,
             limit: 24,
           }).map((item) => ({
             retrievalUnitId: item.document_chunk_id,
@@ -1836,20 +1925,44 @@ export class TraditionalRagService {
             score: item.score,
             unitText: item.content_md,
             isSplitFromOversized: item.is_split_from_oversized,
-          }));
+          })),
+        );
+      }
+      if (fixedDocumentIds.length > 0) {
+        keywordHits.push(
+          ...this.storage.keywordSearchFixedRetrievalChunks({
+            query: toFtsQuery(question),
+            documentIds: fixedDocumentIds,
+            limit: 24,
+          }).map((item) => ({
+            retrievalUnitId: item.retrieval_chunk_id,
+            documentId: item.document_id,
+            sourceDocumentChunkId:
+              parseJsonArray<string>(item.source_document_chunk_ids_json, [item.retrieval_chunk_id])[0] ??
+              item.retrieval_chunk_id,
+            referenceRetrievalChunkId: item.retrieval_chunk_id,
+            ordinal: item.ordinal,
+            score: item.score,
+            unitText: item.content_md,
+            isSplitFromOversized: false,
+          })),
+        );
+      }
+    }
 
     const semanticHits: RankedChunkHit[] = [];
     if (input.mode !== "keyword" && documentsWithEmbeddings.length > 0) {
       const vector = await createEmbedding(question);
       if (vector) {
-        for (const documentId of scope.documentIds) {
-          if (!documentIdsWithEmbeddings.has(documentId)) {
+        for (const document of scope.documents) {
+          if (!documentIdsWithEmbeddings.has(document.id)) {
             continue;
           }
-          const matches = await searchQdrant(documentId, vector, 8);
-          const retrievalMap = new Map(
-            this.storage.listDocumentChunks(documentId).map((chunk) => [chunk.id, chunk] as const),
-          );
+          const matches = await searchQdrant(document.id, vector, 8);
+          const retrievalMap =
+            document.retrieval_chunking_strategy === "fixed"
+              ? new Map(this.storage.listFixedRetrievalChunks(document.id).map((chunk) => [chunk.id, chunk] as const))
+              : new Map(this.storage.listDocumentChunks(document.id).map((chunk) => [chunk.id, chunk] as const));
           for (const match of matches) {
             const chunk = retrievalMap.get(match.id);
             if (!chunk) {
@@ -1858,12 +1971,19 @@ export class TraditionalRagService {
             semanticHits.push({
               retrievalUnitId: chunk.id,
               documentId: chunk.document_id,
-              sourceDocumentChunkId: chunk.id,
-              referenceRetrievalChunkId: chunk.reference_retrieval_chunk_id,
+              sourceDocumentChunkId:
+                "reference_retrieval_chunk_id" in chunk
+                  ? chunk.id
+                  : parseJsonArray<string>(chunk.source_document_chunk_ids_json, [chunk.id])[0] ?? chunk.id,
+              referenceRetrievalChunkId:
+                "reference_retrieval_chunk_id" in chunk
+                  ? chunk.reference_retrieval_chunk_id
+                  : chunk.id,
               ordinal: chunk.ordinal,
               score: match.score,
               unitText: chunk.content_md,
-              isSplitFromOversized: chunk.is_split_from_oversized,
+              isSplitFromOversized:
+                "is_split_from_oversized" in chunk ? chunk.is_split_from_oversized : false,
             });
           }
         }
@@ -2005,9 +2125,10 @@ export class TraditionalRagService {
     const documentIds = uniqueOrdered(items.map((item) => item.documentId));
     const documentChunksByDocument = new Map<string, StoredDocumentChunk[]>();
     const documentChunkById = new Map<string, StoredDocumentChunk>();
-    const retrievalChunksByDocument = new Map<string, StoredRetrievalChunk[]>();
-    const retrievalChunkById = new Map<string, StoredRetrievalChunk>();
+    const retrievalChunksByDocument = new Map<string, TraditionalRetrievalChunkRecord[]>();
+    const retrievalChunkById = new Map<string, TraditionalRetrievalChunkRecord>();
     const retrievalRangesById = new Map<string, { start: number; end: number }>();
+    const retrievalStrategyByDocument = new Map<string, "small_to_big" | "fixed">();
 
     for (const documentId of documentIds) {
       const documentChunks = this.storage
@@ -2018,9 +2139,11 @@ export class TraditionalRagService {
         documentChunkById.set(chunk.id, chunk);
       }
 
-      const retrievalChunks = this.storage
-        .listRetrievalChunks(documentId)
-        .sort((left, right) => left.ordinal - right.ordinal);
+      const retrievalChunks = this.listTraditionalRetrievalChunks(documentId).sort(
+        (left, right) => left.ordinal - right.ordinal,
+      );
+      const document = this.storage.getDocument(documentId);
+      retrievalStrategyByDocument.set(documentId, document?.retrieval_chunking_strategy === "fixed" ? "fixed" : "small_to_big");
       retrievalChunksByDocument.set(documentId, retrievalChunks);
       for (const chunk of retrievalChunks) {
         retrievalChunkById.set(chunk.id, chunk);
@@ -2050,12 +2173,21 @@ export class TraditionalRagService {
         const retrievalChunks = retrievalChunksByDocument.get(item.documentId) ?? [];
         if (retrievalChunk) {
           const currentIndex = retrievalChunks.findIndex((chunk) => chunk.id === retrievalChunk.id);
-          const centerSegment = [...segments.values()].find((segment) => segment.isCenter) ?? null;
-          const onlyKeepNext = centerSegment ? isHeadingLikeShortCenterSegment(centerSegment) : false;
-          if (!onlyKeepNext) {
-            addSegment(this.selectRetrievalChunkCerSide(retrievalChunks, currentIndex, "left", documentChunkById));
+          if (retrievalStrategyByDocument.get(item.documentId) === "fixed") {
+            for (let index = Math.max(0, currentIndex - 2); index <= Math.min(retrievalChunks.length - 1, currentIndex + 2); index += 1) {
+              if (index === currentIndex) {
+                continue;
+              }
+              addSegment(this.createRetrievalChunkContextSegment(retrievalChunks[index] ?? null, documentChunkById));
+            }
+          } else {
+            const centerSegment = [...segments.values()].find((segment) => segment.isCenter) ?? null;
+            const onlyKeepNext = centerSegment ? isHeadingLikeShortCenterSegment(centerSegment) : false;
+            if (!onlyKeepNext) {
+              addSegment(this.selectRetrievalChunkCerSide(retrievalChunks, currentIndex, "left", documentChunkById));
+            }
+            addSegment(this.selectRetrievalChunkCerSide(retrievalChunks, currentIndex, "right", documentChunkById));
           }
-          addSegment(this.selectRetrievalChunkCerSide(retrievalChunks, currentIndex, "right", documentChunkById));
         }
       } else {
         const sourceDocumentChunk = documentChunkById.get(item.referenceId);
@@ -2128,7 +2260,7 @@ export class TraditionalRagService {
   }
 
   private createRetrievalChunkContextSegment(
-    chunk: StoredRetrievalChunk | null,
+    chunk: TraditionalRetrievalChunkRecord | null,
     documentChunkById: Map<string, StoredDocumentChunk>,
   ): EvidenceSegment | null {
     if (!chunk) {
@@ -2152,7 +2284,7 @@ export class TraditionalRagService {
   }
 
   private findNearestOversizedRetrievalChunkSegment(
-    chunks: StoredRetrievalChunk[],
+    chunks: TraditionalRetrievalChunkRecord[],
     anchorIndex: number,
     direction: "left" | "right",
     documentChunkById: Map<string, StoredDocumentChunk>,
@@ -2179,7 +2311,7 @@ export class TraditionalRagService {
   }
 
   private selectRetrievalChunkCerSide(
-    chunks: StoredRetrievalChunk[],
+    chunks: TraditionalRetrievalChunkRecord[],
     anchorIndex: number,
     direction: "left" | "right",
     documentChunkById: Map<string, StoredDocumentChunk>,
@@ -2237,7 +2369,7 @@ export class TraditionalRagService {
   }
 
   private findNearestRetrievalChunkSegment(
-    chunks: StoredRetrievalChunk[],
+    chunks: TraditionalRetrievalChunkRecord[],
     anchorDocumentIndex: number,
     direction: "left" | "right",
     documentChunkById: Map<string, StoredDocumentChunk>,
@@ -2248,7 +2380,7 @@ export class TraditionalRagService {
         range: this.resolveRetrievalChunkRange(chunk, documentChunkById),
       }))
       .filter((item) => item.range !== null) as Array<{
-      chunk: StoredRetrievalChunk;
+      chunk: TraditionalRetrievalChunkRecord;
       range: { start: number; end: number };
     }>;
     if (direction === "left") {
@@ -2264,7 +2396,7 @@ export class TraditionalRagService {
   }
 
   private resolveRetrievalChunkRange(
-    chunk: StoredRetrievalChunk,
+    chunk: TraditionalRetrievalChunkRecord,
     documentChunkById: Map<string, StoredDocumentChunk>,
   ): { start: number; end: number } | null {
     const indexes = parseJsonArray<string>(chunk.source_document_chunk_ids_json, [])
@@ -2280,7 +2412,7 @@ export class TraditionalRagService {
   }
 
   private resolveRetrievalChunkBlockType(
-    chunk: StoredRetrievalChunk,
+    chunk: TraditionalRetrievalChunkRecord,
     documentChunkById: Map<string, StoredDocumentChunk>,
   ): string | null {
     const blockTypes = uniqueOrdered(
@@ -2368,7 +2500,7 @@ export class TraditionalRagService {
       }
 
       const retrievalChunkId = groupKey.slice("retrieval:".length);
-      const reference = this.storage.getRetrievalChunk(retrievalChunkId);
+      const reference = this.getTraditionalRetrievalChunk(retrievalChunkId, { documentId: items[0]?.documentId ?? null });
       if (!reference) {
         return null;
       }
@@ -2449,6 +2581,11 @@ export class TraditionalRagService {
       [...new Set(allParsedImages.map(({ image }) => image.page_no))],
     );
     const extractedByHash = new Map(extractedImages.map((image) => [image.image_hash, image] as const));
+    const sameHashOnPageCounts = new Map<string, number>();
+    for (const { image } of allParsedImages) {
+      const key = `${image.page_no}:${image.image_hash}`;
+      sameHashOnPageCounts.set(key, (sameHashOnPageCounts.get(key) ?? 0) + 1);
+    }
     const perPageBudget = new Map<number, number>();
     let docBudget = 0;
     const rows: StorageImageSemanticRecord[] = [];
@@ -2464,9 +2601,14 @@ export class TraditionalRagService {
       let compressedMime = asset.mime_type ?? "image/png";
       if (input.enableImageSemantic) {
         const inspection = await this.pythonAssets.inspectImage(asset.bytes_base64, asset.mime_type);
+        const screeningContext = {
+          sameHashOnPageCount: sameHashOnPageCounts.get(`${image.page_no}:${image.image_hash}`) ?? 1,
+        };
         interferenceScore = Number(inspection?.interference_score ?? 0);
         hasText = Boolean(inspection?.has_text);
-        const shouldDrop = !hasText && interferenceScore >= 0.65;
+        const shouldDrop = inspection
+          ? evaluateImageSemanticCandidateInspection(inspection, screeningContext).shouldDrop
+          : false;
         if (shouldDrop) {
           renderMap.set(image.image_hash, { dropped: true, markdown: "" });
           rows.push({
@@ -2768,10 +2910,110 @@ export class TraditionalRagService {
     return records;
   }
 
+  private buildFixedRetrievalChunks(input: {
+    documentId: string;
+    sourceChunks: SourceChunkRecord[];
+    fixedChunkChars: number;
+  }): StorageFixedRetrievalChunkRecord[] {
+    const maxChars = Math.max(Number(input.fixedChunkChars || 0), 1);
+    const pieces: FixedChunkPiece[] = [];
+    for (const chunk of input.sourceChunks) {
+      if (chunk.blockType === "picture") {
+        pieces.push({
+          sourceChunkId: chunk.id,
+          pageNo: chunk.pageNo,
+          contentMd: chunk.contentMd,
+          blockType: chunk.blockType,
+          mergedPageNosJson: chunk.mergedPageNosJson,
+          mergedBboxesJson: chunk.mergedBboxesJson,
+          bboxJson: chunk.bboxJson,
+        });
+        continue;
+      }
+      const contentParts = splitFixedChunkText(chunk.contentMd, maxChars);
+      for (const part of contentParts) {
+        pieces.push({
+          sourceChunkId: chunk.id,
+          pageNo: chunk.pageNo,
+          contentMd: part,
+          blockType: chunk.blockType,
+          mergedPageNosJson: chunk.mergedPageNosJson,
+          mergedBboxesJson: chunk.mergedBboxesJson,
+          bboxJson: chunk.bboxJson,
+        });
+      }
+    }
+
+    const records: StorageFixedRetrievalChunkRecord[] = [];
+    let ordinal = 0;
+    let pendingPieces: FixedChunkPiece[] = [];
+    const flushPending = () => {
+      if (pendingPieces.length === 0) {
+        return;
+      }
+      const contentMd = normalizeWhitespace(pendingPieces.map((piece) => piece.contentMd).join("\n\n"));
+      const sourceDocumentChunkIds = uniqueOrdered(pendingPieces.map((piece) => piece.sourceChunkId));
+      const pageNos = uniqueOrdered(
+        pendingPieces.flatMap((piece) => parseJsonArray<number>(piece.mergedPageNosJson, [piece.pageNo])),
+      );
+      const bboxes = pendingPieces.flatMap((piece) =>
+        parseJsonArray<[number, number, number, number]>(
+          piece.mergedBboxesJson,
+          [JSON.parse(piece.bboxJson) as [number, number, number, number]],
+        ),
+      );
+      records.push({
+        id: stableId("frchunk", `${input.documentId}:${ordinal}:${sourceDocumentChunkIds.join(",")}:${contentMd}`),
+        documentId: input.documentId,
+        ordinal,
+        contentMd,
+        sizeClass: classifySize(contentMd),
+        summaryText: null,
+        sourceDocumentChunkIdsJson: JSON.stringify(sourceDocumentChunkIds),
+        pageNosJson: JSON.stringify(pageNos),
+        sourceLocator: sourceLocatorFromPages(pageNos),
+        bboxesJson: JSON.stringify(bboxes),
+      });
+      ordinal += 1;
+      pendingPieces = [];
+    };
+
+    for (const piece of pieces) {
+      const pieceText = normalizeWhitespace(piece.contentMd);
+      if (!pieceText) {
+        continue;
+      }
+      const currentText = normalizeWhitespace(pendingPieces.map((item) => item.contentMd).join("\n\n"));
+      const candidate = normalizeWhitespace([currentText, pieceText].filter(Boolean).join("\n\n"));
+      if (piece.blockType === "picture") {
+        if (pendingPieces.length === 0) {
+          pendingPieces = [piece];
+          continue;
+        }
+        pendingPieces.push(piece);
+        if (candidate.length >= maxChars) {
+          flushPending();
+        }
+        continue;
+      }
+      if (candidate.length > maxChars && pendingPieces.length > 0) {
+        flushPending();
+      }
+      pendingPieces.push(piece);
+      const updatedText = normalizeWhitespace(pendingPieces.map((item) => item.contentMd).join("\n\n"));
+      if (updatedText.length >= maxChars) {
+        flushPending();
+      }
+    }
+    flushPending();
+    return records;
+  }
+
   private buildIndexedDocumentChunks(
     documentId: string,
     sourceChunks: SourceChunkRecord[],
     retrievalChunks: StorageRetrievalChunkRecord[],
+    fixedRetrievalChunks: StorageFixedRetrievalChunkRecord[] = [],
   ): StorageDocumentChunkRecord[] {
     const thresholds = getChunkThresholds();
     const referenceBySourceChunkId = new Map<string, string>();
@@ -2816,9 +3058,6 @@ export class TraditionalRagService {
         }
         continue;
       }
-      if (!referenceRetrievalChunkId) {
-        continue;
-      }
       records.push({
         id: stableId("dchunk", `${documentId}:${chunk.id}:${ordinal}:${chunk.contentMd}`),
         documentId,
@@ -2843,11 +3082,17 @@ export class TraditionalRagService {
       unitIdsBySourceChunkId.set(chunk.id, unitIds);
       ordinal += 1;
     }
-    for (const chunk of retrievalChunks) {
-      const sourceChunkIds = parseJsonArray<string>(chunk.sourceDocumentChunkIdsJson, []);
-      const unitIds = sourceChunkIds.flatMap((sourceChunkId) => unitIdsBySourceChunkId.get(sourceChunkId) ?? []);
-      chunk.sourceDocumentChunkIdsJson = JSON.stringify(unitIds);
-    }
+    const remapChunkSourceIds = (
+      chunks: Array<{ sourceDocumentChunkIdsJson: string }>,
+    ) => {
+      for (const chunk of chunks) {
+        const sourceChunkIds = parseJsonArray<string>(chunk.sourceDocumentChunkIdsJson, []);
+        const unitIds = sourceChunkIds.flatMap((sourceChunkId) => unitIdsBySourceChunkId.get(sourceChunkId) ?? []);
+        chunk.sourceDocumentChunkIdsJson = JSON.stringify(unitIds);
+      }
+    };
+    remapChunkSourceIds(retrievalChunks);
+    remapChunkSourceIds(fixedRetrievalChunks);
     return records;
   }
 }

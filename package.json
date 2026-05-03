@@ -6,10 +6,13 @@
   "scripts": {
     "start": "tsx ./src/server/main.ts",
     "dev": "tsx watch ./src/server/main.ts",
+    "dev:extract-pdf-images": "tsx ./scripts/extract-pdf-images.ts",
+    "dev:extract-semantic-images": "tsx ./scripts/extract-semantic-candidate-images.ts",
+    "dev:test-image-candidate": "tsx ./scripts/test-image-semantic-candidate.ts",
     "frontend:build": "npm --prefix ./frontend run build",
     "frontend:dev": "npm --prefix ./frontend run dev",
-    "test": "node --import tsx --test ./tests/agent.test.ts ./tests/blob-store.test.ts ./tests/document-library-service.test.ts ./tests/document-library.test.ts ./tests/document-parsing.test.ts ./tests/explore-sessions.test.ts ./tests/exploration-workflow.test.ts ./tests/http-server.test.ts ./tests/index-search.test.ts ./tests/loader.test.ts ./tests/openai-compatible-model.test.ts ./tests/page-store.test.ts ./tests/prompt.test.ts ./tests/references.test.ts ./tests/sqlite-storage.test.ts",
-    "test:watch": "node --import tsx --test --watch ./tests/agent.test.ts ./tests/blob-store.test.ts ./tests/document-library-service.test.ts ./tests/document-library.test.ts ./tests/document-parsing.test.ts ./tests/explore-sessions.test.ts ./tests/exploration-workflow.test.ts ./tests/http-server.test.ts ./tests/index-search.test.ts ./tests/loader.test.ts ./tests/openai-compatible-model.test.ts ./tests/page-store.test.ts ./tests/prompt.test.ts ./tests/references.test.ts ./tests/sqlite-storage.test.ts",
+    "test": "node --import tsx --test ./tests/agent.test.ts ./tests/blob-store.test.ts ./tests/document-library-service.test.ts ./tests/document-library.test.ts ./tests/document-parsing.test.ts ./tests/explore-sessions.test.ts ./tests/exploration-workflow.test.ts ./tests/http-server.test.ts ./tests/image-semantic-screening.test.ts ./tests/index-search.test.ts ./tests/loader.test.ts ./tests/openai-compatible-model.test.ts ./tests/page-store.test.ts ./tests/prompt.test.ts ./tests/references.test.ts ./tests/sqlite-storage.test.ts",
+    "test:watch": "node --import tsx --test --watch ./tests/agent.test.ts ./tests/blob-store.test.ts ./tests/document-library-service.test.ts ./tests/document-library.test.ts ./tests/document-parsing.test.ts ./tests/explore-sessions.test.ts ./tests/exploration-workflow.test.ts ./tests/http-server.test.ts ./tests/image-semantic-screening.test.ts ./tests/index-search.test.ts ./tests/loader.test.ts ./tests/openai-compatible-model.test.ts ./tests/page-store.test.ts ./tests/prompt.test.ts ./tests/references.test.ts ./tests/sqlite-storage.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

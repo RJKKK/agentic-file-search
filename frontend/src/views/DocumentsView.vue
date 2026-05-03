@@ -28,6 +28,8 @@ const uploadState = reactive({
   file: null,
   enableEmbedding: true,
   enableImageSemantic: true,
+  chunkingStrategy: "small_to_big",
+  fixedChunkChars: 800,
   submitting: false,
   progress: 0,
 });
@@ -53,6 +55,16 @@ const assignState = reactive({
   document: null,
   collections: [],
   selectedIds: [],
+});
+
+const reparseState = reactive({
+  visible: false,
+  submitting: false,
+  document: null,
+  enableEmbedding: true,
+  enableImageSemantic: true,
+  chunkingStrategy: "small_to_big",
+  fixedChunkChars: 800,
 });
 
 onMounted(async () => {
@@ -95,6 +107,8 @@ function openUploadDialog() {
   uploadState.file = null;
   uploadState.enableEmbedding = true;
   uploadState.enableImageSemantic = true;
+  uploadState.chunkingStrategy = "small_to_big";
+  uploadState.fixedChunkChars = 800;
   uploadState.progress = 0;
 }
 
@@ -114,6 +128,10 @@ async function submitUpload() {
     formData.append("file", uploadState.file);
     formData.append("enable_embedding", String(uploadState.enableEmbedding));
     formData.append("enable_image_semantic", String(uploadState.enableImageSemantic));
+    formData.append("chunking_strategy", uploadState.chunkingStrategy);
+    if (uploadState.chunkingStrategy === "fixed") {
+      formData.append("fixed_chunk_chars", String(uploadState.fixedChunkChars || 800));
+    }
     const payload = await uploadWithProgress("/api/documents", formData, (percent) => {
       uploadState.progress = percent;
     });
@@ -186,22 +204,42 @@ async function saveMetadata() {
   }
 }
 
-async function reparseDocument(row = detailState.document) {
+function openReparseDialog(row = detailState.document) {
   if (!row?.id) return;
-  detailState.taskLoading = true;
+  reparseState.document = row;
+  reparseState.enableEmbedding = row.embedding_enabled !== false;
+  reparseState.enableImageSemantic = row.image_semantic_enabled !== false;
+  reparseState.chunkingStrategy = row.retrieval_chunking_strategy || "small_to_big";
+  reparseState.fixedChunkChars = row.fixed_chunk_chars || 800;
+  reparseState.visible = true;
+}
+
+async function submitReparse() {
+  const row = reparseState.document;
+  if (!row?.id) return;
+  reparseState.submitting = true;
   try {
     const params = buildDbParams(appState.dbPath);
     const payload = await requestJson(withQuery(`/api/documents/${encodeURIComponent(row.id)}/parse`, params), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode: "full", force: true }),
+      body: JSON.stringify({
+        mode: "full",
+        force: true,
+        enable_embedding: reparseState.enableEmbedding,
+        enable_image_semantic: reparseState.enableImageSemantic,
+        chunking_strategy: reparseState.chunkingStrategy,
+        fixed_chunk_chars:
+          reparseState.chunkingStrategy === "fixed" ? Number(reparseState.fixedChunkChars || 800) : null,
+      }),
     });
     ElMessage.success(`已创建重解析任务 ${payload.task.id}`);
+    reparseState.visible = false;
     await Promise.all([refreshDocuments(documentList.page), loadDocumentDetail(row.id)]);
   } catch (error) {
     ElMessage.error(error.message);
   } finally {
-    detailState.taskLoading = false;
+    reparseState.submitting = false;
   }
 }
 
@@ -325,6 +363,13 @@ async function saveDocumentCollections() {
             </el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="Chunking" width="150">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.retrieval_chunking_strategy === 'fixed' ? 'warning' : 'info'">
+              {{ row.retrieval_chunking_strategy || "small_to_big" }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="图片语义化" width="140">
           <template #default="{ row }">
             <el-tag size="small" :type="row.image_semantic_enabled ? 'success' : 'info'">
@@ -342,7 +387,7 @@ async function saveDocumentCollections() {
           <template #default="{ row }">
             <el-button size="small" :icon="View" @click="openDocumentDetail(row)">查看</el-button>
             <el-button size="small" :icon="Edit" @click="openAssignDialog(row)">分配</el-button>
-            <el-button size="small" :loading="detailState.taskLoading && detailState.document?.id === row.id" @click="reparseDocument(row)">
+            <el-button size="small" @click="openReparseDialog(row)">
               重解析
             </el-button>
             <el-button
@@ -382,6 +427,17 @@ async function saveDocumentCollections() {
     <div class="upload-options">
       <el-switch v-model="uploadState.enableEmbedding" active-text="启用 embedding" />
       <el-switch v-model="uploadState.enableImageSemantic" active-text="启用图片语义化" />
+      <el-radio-group v-model="uploadState.chunkingStrategy">
+        <el-radio-button label="small_to_big">small_to_big</el-radio-button>
+        <el-radio-button label="fixed">fixed</el-radio-button>
+      </el-radio-group>
+      <el-input-number
+        v-if="uploadState.chunkingStrategy === 'fixed'"
+        v-model="uploadState.fixedChunkChars"
+        :min="1"
+        :step="100"
+        controls-position="right"
+      />
     </div>
     <el-progress
       v-if="uploadState.submitting || uploadState.progress > 0"
@@ -413,11 +469,14 @@ async function saveDocumentCollections() {
           <el-descriptions-item label="图片语义化" :span="2">
             {{ detailState.document.image_semantic_enabled }}
           </el-descriptions-item>
+          <el-descriptions-item label="Chunking" :span="2">
+            strategy={{ detailState.document.retrieval_chunking_strategy }} / fixed chars={{ detailState.document.fixed_chunk_chars ?? "-" }}
+          </el-descriptions-item>
           <el-descriptions-item label="Storage URI" :span="2">{{ detailState.document.storage_uri }}</el-descriptions-item>
         </el-descriptions>
 
         <div class="drawer-actions">
-          <el-button type="primary" :loading="detailState.taskLoading" @click="reparseDocument(detailState.document)">
+          <el-button type="primary" @click="openReparseDialog(detailState.document)">
             重解析
           </el-button>
           <el-button
@@ -474,6 +533,28 @@ async function saveDocumentCollections() {
     <template #footer>
       <el-button @click="assignState.visible = false">取消</el-button>
       <el-button type="primary" :loading="assignState.saving" @click="saveDocumentCollections">保存</el-button>
+    </template>
+  </el-dialog>
+
+  <el-dialog v-model="reparseState.visible" title="重解析配置" width="560px">
+    <div class="upload-options">
+      <el-switch v-model="reparseState.enableEmbedding" active-text="启用 embedding" />
+      <el-switch v-model="reparseState.enableImageSemantic" active-text="启用图片语义化" />
+      <el-radio-group v-model="reparseState.chunkingStrategy">
+        <el-radio-button label="small_to_big">small_to_big</el-radio-button>
+        <el-radio-button label="fixed">fixed</el-radio-button>
+      </el-radio-group>
+      <el-input-number
+        v-if="reparseState.chunkingStrategy === 'fixed'"
+        v-model="reparseState.fixedChunkChars"
+        :min="1"
+        :step="100"
+        controls-position="right"
+      />
+    </div>
+    <template #footer>
+      <el-button @click="reparseState.visible = false">取消</el-button>
+      <el-button type="primary" :loading="reparseState.submitting" @click="submitReparse">开始重解析</el-button>
     </template>
   </el-dialog>
 </template>

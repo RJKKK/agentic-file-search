@@ -224,6 +224,12 @@ async function runRetrieval() {
             Refresh
           </el-button>
         </div>
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          title="系统会按文档自己的分块策略自动路由检索；small_to_big 与 fixed 文档可以混合查询。"
+        />
       </el-card>
     </div>
 

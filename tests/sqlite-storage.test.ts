@@ -33,8 +33,22 @@ describe("sqlite storage", () => {
       "collection_documents",
       "collections",
       "document_chunks",
+      "document_chunks_fts",
+      "document_chunks_fts_config",
+      "document_chunks_fts_content",
+      "document_chunks_fts_data",
+      "document_chunks_fts_docsize",
+      "document_chunks_fts_idx",
       "document_pages",
+      "document_parse_tasks",
       "documents",
+      "fixed_retrieval_chunks",
+      "fixed_retrieval_chunks_fts",
+      "fixed_retrieval_chunks_fts_config",
+      "fixed_retrieval_chunks_fts_content",
+      "fixed_retrieval_chunks_fts_data",
+      "fixed_retrieval_chunks_fts_docsize",
+      "fixed_retrieval_chunks_fts_idx",
       "image_semantic_cache",
       "image_semantics",
       "retrieval_chunks",
@@ -102,6 +116,8 @@ describe("sqlite storage", () => {
 
     assert.equal(storage.getDocument("doc_legacy")?.original_filename, "legacy.pdf");
     assert.equal(storage.getDocument("doc_legacy")?.upload_status, "uploaded");
+    assert.equal(storage.getDocument("doc_legacy")?.retrieval_chunking_strategy, "small_to_big");
+    assert.equal(storage.getDocument("doc_legacy")?.fixed_chunk_chars, null);
     assert.deepEqual(storage.listCollections().map((item) => item.name), ["Legacy"]);
 
     const corpusId = storage.getOrCreateCorpus("blob://library/default");
@@ -335,6 +351,111 @@ describe("sqlite storage", () => {
     const updated = storage.listImageSemanticsForDocument(docId);
     assert.equal(updated[0]?.semantic_text, "A chart");
     assert.equal(updated[0]?.semantic_model, "gemini");
+
+    storage.close();
+  });
+
+  it("stores and keyword-searches fixed retrieval chunks separately", async () => {
+    const root = await mkdtemp(join(tmpdir(), "afs-sqlite-fixed-rchunks-"));
+    const dbPath = join(root, "storage.sqlite");
+    const storage = new SqliteStorage({ dbPath });
+    storage.initialize();
+
+    const corpusId = storage.getOrCreateCorpus("C:/docs");
+    const docId = SqliteStorage.makeDocumentId(corpusId, "alpha.md");
+    storage.upsertDocumentStub({
+      id: docId,
+      corpusId,
+      relativePath: "alpha.md",
+      absolutePath: "C:/docs/alpha.md",
+      content: "Alpha body",
+      metadataJson: "{}",
+      fileMtime: 1,
+      fileSize: 10,
+      contentSha256: "sha-a",
+      originalFilename: "alpha.md",
+      retrievalChunkingStrategy: "fixed",
+      fixedChunkChars: 800,
+    });
+    storage.replaceDocumentChunks(docId, [
+      {
+        id: "dchunk-1",
+        documentId: docId,
+        ordinal: 0,
+        referenceRetrievalChunkId: "frchunk-1",
+        pageNo: 1,
+        documentIndex: 0,
+        pageIndex: 0,
+        blockType: "paragraph",
+        bboxJson: JSON.stringify([0, 0, 10, 10]),
+        contentMd: "Purchase price is 42 million dollars.",
+        sizeClass: "normal",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: JSON.stringify([1]),
+        mergedBboxesJson: JSON.stringify([[0, 0, 10, 10]]),
+      },
+      {
+        id: "dchunk-3",
+        documentId: docId,
+        ordinal: 1,
+        referenceRetrievalChunkId: "frchunk-2",
+        pageNo: 2,
+        documentIndex: 1,
+        pageIndex: 0,
+        blockType: "paragraph",
+        bboxJson: JSON.stringify([0, 10, 10, 20]),
+        contentMd: "Closing date is March 1.",
+        sizeClass: "normal",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: JSON.stringify([2]),
+        mergedBboxesJson: JSON.stringify([[0, 10, 10, 20]]),
+      },
+    ]);
+
+    storage.replaceFixedRetrievalChunks(docId, [
+      {
+        id: "frchunk-1",
+        documentId: docId,
+        ordinal: 0,
+        contentMd: "Purchase price is 42 million dollars.",
+        sizeClass: "normal",
+        summaryText: null,
+        sourceDocumentChunkIdsJson: JSON.stringify(["dchunk-1"]),
+        pageNosJson: JSON.stringify([1]),
+        sourceLocator: "page-1",
+        bboxesJson: JSON.stringify([[0, 0, 10, 10]]),
+      },
+      {
+        id: "frchunk-2",
+        documentId: docId,
+        ordinal: 1,
+        contentMd: "Closing date is March 1.",
+        sizeClass: "normal",
+        summaryText: null,
+        sourceDocumentChunkIdsJson: JSON.stringify(["dchunk-3"]),
+        pageNosJson: JSON.stringify([2]),
+        sourceLocator: "page-2",
+        bboxesJson: JSON.stringify([[0, 10, 10, 20]]),
+      },
+    ]);
+
+    assert.equal(storage.listFixedRetrievalChunks(docId).length, 2);
+    assert.match(storage.getFixedRetrievalChunk("frchunk-1")?.content_md ?? "", /Purchase price/i);
+
+    const hits = storage.keywordSearchFixedRetrievalChunks({
+      query: "\"purchase\" OR \"price\"",
+      documentIds: [docId],
+      limit: 5,
+    });
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0]?.retrieval_chunk_id, "frchunk-1");
+    assert.equal(hits[0]?.document_id, docId);
 
     storage.close();
   });

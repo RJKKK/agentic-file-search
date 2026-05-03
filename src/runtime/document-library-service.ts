@@ -36,9 +36,11 @@ import type { ParsedDocument } from "../types/parsing.js";
 import type {
   DocumentParseStageTiming,
   DocumentParseTaskType,
+  RetrievalChunkingStrategy,
   SqliteStorageBackend,
   StorageDocumentChunkRecord,
   StorageDocumentRecord,
+  StorageFixedRetrievalChunkRecord,
   StorageRetrievalChunkRecord,
   StoredDocument,
   StoredDocumentParseTask,
@@ -47,6 +49,8 @@ import type {
 type UploadParseOptions = {
   enable_embedding: boolean;
   enable_image_semantic: boolean;
+  chunking_strategy: RetrievalChunkingStrategy;
+  fixed_chunk_chars: number | null;
 };
 
 type ReparseOptions = UploadParseOptions & {
@@ -58,6 +62,23 @@ type EmbedOnlyOptions = {
 };
 
 type TaskOptions = UploadParseOptions | ReparseOptions | EmbedOnlyOptions;
+
+const DEFAULT_FIXED_CHUNK_CHARS = 800;
+
+function normalizeChunkingStrategy(value: unknown, fallback: RetrievalChunkingStrategy = "small_to_big"): RetrievalChunkingStrategy {
+  return String(value ?? "").trim() === "fixed" ? "fixed" : fallback;
+}
+
+function normalizeFixedChunkChars(value: unknown): number | null {
+  if (value == null || value === "") {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error("`fixed_chunk_chars` must be a positive integer.");
+  }
+  return Math.floor(parsed);
+}
 
 type QueuedTask =
   | {
@@ -293,9 +314,16 @@ export class DocumentLibraryService {
     const taskId = randomTaskId();
     const sourceObjectKey = buildDocumentObjectKey(docId, filename);
     const pagesPrefix = buildDocumentPagesKeyPrefix(filename);
+    const chunkingStrategy = normalizeChunkingStrategy(input.chunkingStrategy, "small_to_big");
+    const fixedChunkChars =
+      chunkingStrategy === "fixed"
+        ? (normalizeFixedChunkChars(input.fixedChunkChars) ?? DEFAULT_FIXED_CHUNK_CHARS)
+        : null;
     const taskOptions: UploadParseOptions = {
       enable_embedding: input.enableEmbedding !== false,
       enable_image_semantic: input.enableImageSemantic !== false,
+      chunking_strategy: chunkingStrategy,
+      fixed_chunk_chars: fixedChunkChars,
     };
     const stageTimings = buildStageTimings("upload_parse");
     this.storage.createDocumentParseTask({
@@ -342,6 +370,8 @@ export class DocumentLibraryService {
         embeddingEnabled: taskOptions.enable_embedding,
         hasEmbeddings: false,
         imageSemanticEnabled: taskOptions.enable_image_semantic,
+        retrievalChunkingStrategy: taskOptions.chunking_strategy,
+        fixedChunkChars: taskOptions.fixed_chunk_chars,
       };
       this.storage.upsertDocumentStub(documentRecord);
       this.storage.updateDocumentParseTask(taskId, { documentId: docId });
@@ -373,13 +403,27 @@ export class DocumentLibraryService {
     force?: boolean;
     enableEmbedding?: boolean;
     enableImageSemantic?: boolean;
+    chunkingStrategy?: RetrievalChunkingStrategy;
+    fixedChunkChars?: number | null;
   }): Promise<ReparseDocumentResult> {
     const document = this.requireDocument(input.docId);
     const taskId = randomTaskId();
+    const chunkingStrategy = normalizeChunkingStrategy(
+      input.chunkingStrategy,
+      document.retrieval_chunking_strategy,
+    );
+    const fixedChunkChars =
+      chunkingStrategy === "fixed"
+        ? (normalizeFixedChunkChars(input.fixedChunkChars) ??
+          document.fixed_chunk_chars ??
+          DEFAULT_FIXED_CHUNK_CHARS)
+        : null;
     const options: ReparseOptions = {
       force: input.force === true,
       enable_embedding: input.enableEmbedding ?? document.embedding_enabled,
       enable_image_semantic: input.enableImageSemantic ?? document.image_semantic_enabled,
+      chunking_strategy: chunkingStrategy,
+      fixed_chunk_chars: fixedChunkChars,
     };
     this.storage.updateDocumentUploadStatus(document.id, "processing");
     this.storage.createDocumentParseTask({
@@ -563,6 +607,8 @@ export class DocumentLibraryService {
       sourceHash: task.sourceHash,
       enableEmbedding: task.options.enable_embedding,
       enableImageSemantic: task.options.enable_image_semantic,
+      chunkingStrategy: task.options.chunking_strategy,
+      fixedChunkChars: task.options.fixed_chunk_chars,
     });
   }
 
@@ -604,6 +650,8 @@ export class DocumentLibraryService {
       sourceHash,
       enableEmbedding: task.options.enable_embedding,
       enableImageSemantic: task.options.enable_image_semantic,
+      chunkingStrategy: task.options.chunking_strategy,
+      fixedChunkChars: task.options.fixed_chunk_chars,
     });
   }
 
@@ -613,10 +661,15 @@ export class DocumentLibraryService {
   ): Promise<void> {
     const document = this.requireDocument(task.documentId);
     const documentChunks = await this.runTaskStage(task.taskId, stageTimings, "load_document_chunks", async () =>
-      this.storage.listDocumentChunks(document.id).map((chunk) => ({
-        id: chunk.id,
-        unitText: chunk.content_md,
-      })),
+      document.retrieval_chunking_strategy === "fixed"
+        ? this.storage.listFixedRetrievalChunks(document.id).map((chunk) => ({
+            id: chunk.id,
+            unitText: chunk.content_md,
+          }))
+        : this.storage.listDocumentChunks(document.id).map((chunk) => ({
+            id: chunk.id,
+            unitText: chunk.content_md,
+          })),
     );
     const embeddingsWritten = await this.runTaskStage(task.taskId, stageTimings, "build_embeddings", async () =>
       this.traditionalRag.buildEmbeddingsForChunks(document.id, documentChunks),
@@ -639,6 +692,8 @@ export class DocumentLibraryService {
     sourceHash: string;
     enableEmbedding: boolean;
     enableImageSemantic: boolean;
+    chunkingStrategy: RetrievalChunkingStrategy;
+    fixedChunkChars: number | null;
   }): Promise<void> {
     let imageRenderMap: Map<string, ImageChunkRendering> | null = null;
     if (input.enableImageSemantic) {
@@ -675,21 +730,44 @@ export class DocumentLibraryService {
         }),
     );
 
-    const retrievalChunks = await this.runTaskStage(
+    const builtRetrieval = await this.runTaskStage(
       input.taskId,
       input.stageTimings,
       "build_retrieval_chunks",
-      async () => this.traditionalRag.createRetrievalChunks(input.document.id, sourceChunks),
+      async () => ({
+        retrievalChunks:
+          input.chunkingStrategy === "fixed"
+            ? []
+            : this.traditionalRag.createRetrievalChunks(input.document.id, sourceChunks),
+        fixedRetrievalChunks:
+          input.chunkingStrategy === "fixed"
+            ? this.traditionalRag.createFixedRetrievalChunks({
+                documentId: input.document.id,
+                sourceChunks,
+                fixedChunkChars: input.fixedChunkChars ?? DEFAULT_FIXED_CHUNK_CHARS,
+              })
+            : [],
+      }),
     );
+    const { retrievalChunks, fixedRetrievalChunks } = builtRetrieval;
 
     const documentChunks = await this.runTaskStage(
       input.taskId,
       input.stageTimings,
       "build_indexed_document_chunks",
       async () => {
-        const units = this.traditionalRag.createIndexedDocumentChunks(input.document.id, sourceChunks, retrievalChunks);
+        const units =
+          input.chunkingStrategy === "fixed"
+            ? this.traditionalRag.createIndexedDocumentChunks(
+                input.document.id,
+                sourceChunks,
+                [],
+                fixedRetrievalChunks,
+              )
+            : this.traditionalRag.createIndexedDocumentChunks(input.document.id, sourceChunks, retrievalChunks);
         this.storage.replaceDocumentChunks(input.document.id, units);
         this.storage.replaceRetrievalChunks(input.document.id, retrievalChunks);
+        this.storage.replaceFixedRetrievalChunks(input.document.id, fixedRetrievalChunks);
         const chunkCounts = pageChunkCounts(units);
         this.storage.syncDocumentPages(
           input.document.id,
@@ -711,7 +789,7 @@ export class DocumentLibraryService {
         async () =>
           this.traditionalRag.buildEmbeddingsForChunks(
             input.document.id,
-            documentChunks.map((chunk) => ({
+            (input.chunkingStrategy === "fixed" ? fixedRetrievalChunks : documentChunks).map((chunk) => ({
               id: chunk.id,
               unitText: chunk.contentMd,
             })),
@@ -728,6 +806,8 @@ export class DocumentLibraryService {
         embeddingEnabled: input.enableEmbedding,
         hasEmbeddings: input.enableEmbedding && embeddingsWritten > 0,
         imageSemanticEnabled: input.enableImageSemantic,
+        retrievalChunkingStrategy: input.chunkingStrategy,
+        fixedChunkChars: input.fixedChunkChars,
       });
       this.storage.updateDocumentUploadStatus(input.document.id, "completed");
     });
@@ -890,6 +970,7 @@ export class DocumentLibraryService {
     await this.traditionalRag.deleteDocumentIndex(docId);
     this.storage.deleteImageSemanticsForDocument(docId);
     this.storage.syncDocumentPages(docId, []);
+    this.storage.replaceFixedRetrievalChunks(docId, []);
     this.storage.replaceRetrievalChunks(docId, []);
     this.storage.replaceDocumentChunks(docId, []);
     this.storage.updateDocumentParseState(docId, null, false);

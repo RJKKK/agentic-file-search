@@ -171,6 +171,8 @@ export function serializeDocumentSummary(
     embedding_enabled: document.embedding_enabled,
     has_embeddings: document.has_embeddings,
     image_semantic_enabled: document.image_semantic_enabled,
+    retrieval_chunking_strategy: document.retrieval_chunking_strategy,
+    fixed_chunk_chars: document.fixed_chunk_chars,
     is_deleted: document.is_deleted,
     status,
     metadata,

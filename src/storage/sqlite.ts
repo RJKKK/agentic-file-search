@@ -16,10 +16,12 @@ import type {
   DocumentParseTaskType,
   DocumentChunkSizeClass,
   DocumentChunkKeywordHit,
+  FixedRetrievalChunkKeywordHit,
   PublicCollectionRecord,
   SqliteStorageBackend,
   StorageDocumentParseTaskRecord,
   StorageDocumentChunkRecord,
+  StorageFixedRetrievalChunkRecord,
   SqliteStorageOptions,
   StorageDocumentPageRecord,
   StorageDocumentRecord,
@@ -31,6 +33,7 @@ import type {
   StoredDocumentChunk,
   StoredDocumentParseTask,
   StoredDocumentPage,
+  StoredFixedRetrievalChunk,
   StoredImageSemanticCache,
   StoredImageSemantic,
   StoredRetrievalChunk,
@@ -96,6 +99,10 @@ function normalizeStoredDocument(row: SqliteRow): StoredDocument {
     embedding_enabled: Boolean(row.embedding_enabled ?? 1),
     has_embeddings: Boolean(row.has_embeddings ?? 0),
     image_semantic_enabled: Boolean(row.image_semantic_enabled ?? 1),
+    retrieval_chunking_strategy:
+      String(row.retrieval_chunking_strategy ?? "small_to_big") === "fixed" ? "fixed" : "small_to_big",
+    fixed_chunk_chars:
+      row.fixed_chunk_chars == null ? null : Number(row.fixed_chunk_chars),
     last_indexed_at: String(row.last_indexed_at ?? ""),
     is_deleted: Boolean(row.is_deleted),
   };
@@ -201,6 +208,21 @@ function normalizeStoredRetrievalChunk(row: SqliteRow): StoredRetrievalChunk {
           JSON.stringify(row.source_document_chunk_id ? [row.source_document_chunk_id] : []),
       ),
     ),
+    page_nos_json: normalizeJsonText(String(row.page_nos_json ?? "[]")),
+    source_locator: row.source_locator == null ? null : String(row.source_locator),
+    bboxes_json: normalizeJsonText(String(row.bboxes_json ?? "[]")),
+  };
+}
+
+function normalizeStoredFixedRetrievalChunk(row: SqliteRow): StoredFixedRetrievalChunk {
+  return {
+    id: String(row.id),
+    document_id: String(row.document_id),
+    ordinal: Number(row.ordinal ?? 0),
+    content_md: String(row.content_md ?? row.chunk_text ?? ""),
+    size_class: String(row.size_class ?? "normal") as DocumentChunkSizeClass,
+    summary_text: row.summary_text == null ? null : String(row.summary_text),
+    source_document_chunk_ids_json: normalizeJsonText(String(row.source_document_chunk_ids_json ?? "[]")),
     page_nos_json: normalizeJsonText(String(row.page_nos_json ?? "[]")),
     source_locator: row.source_locator == null ? null : String(row.source_locator),
     bboxes_json: normalizeJsonText(String(row.bboxes_json ?? "[]")),
@@ -315,6 +337,8 @@ export class SqliteStorage implements SqliteStorageBackend {
         embedding_enabled INTEGER NOT NULL DEFAULT 1,
         has_embeddings INTEGER NOT NULL DEFAULT 0,
         image_semantic_enabled INTEGER NOT NULL DEFAULT 1,
+        retrieval_chunking_strategy TEXT NOT NULL DEFAULT 'small_to_big',
+        fixed_chunk_chars INTEGER,
         last_indexed_at TEXT NOT NULL,
         is_deleted INTEGER NOT NULL DEFAULT 0,
         UNIQUE(corpus_id, relative_path)
@@ -401,6 +425,23 @@ export class SqliteStorage implements SqliteStorageBackend {
         last_enhanced_at TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS fixed_retrieval_chunks (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+        source_document_chunk_id TEXT NOT NULL REFERENCES document_chunks(id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL,
+        chunk_text TEXT NOT NULL,
+        content_md TEXT NOT NULL DEFAULT '',
+        size_class TEXT NOT NULL,
+        summary_text TEXT,
+        source_document_chunk_ids_json TEXT NOT NULL DEFAULT '[]',
+        page_nos_json TEXT NOT NULL DEFAULT '[]',
+        source_locator TEXT,
+        bboxes_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS image_semantic_cache (
         image_hash TEXT NOT NULL,
         prompt_version TEXT NOT NULL,
@@ -438,6 +479,12 @@ export class SqliteStorage implements SqliteStorageBackend {
       );
 
       CREATE VIRTUAL TABLE IF NOT EXISTS retrieval_chunks_fts USING fts5(
+        chunk_id UNINDEXED,
+        document_id UNINDEXED,
+        chunk_text
+      );
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS fixed_retrieval_chunks_fts USING fts5(
         chunk_id UNINDEXED,
         document_id UNINDEXED,
         chunk_text
@@ -485,6 +532,12 @@ export class SqliteStorage implements SqliteStorageBackend {
 
       CREATE INDEX IF NOT EXISTS idx_retrieval_chunks_source
       ON retrieval_chunks (source_document_chunk_id);
+
+      CREATE INDEX IF NOT EXISTS idx_fixed_retrieval_chunks_document
+      ON fixed_retrieval_chunks (document_id, ordinal);
+
+      CREATE INDEX IF NOT EXISTS idx_fixed_retrieval_chunks_source
+      ON fixed_retrieval_chunks (source_document_chunk_id);
 
       CREATE INDEX IF NOT EXISTS idx_image_semantics_source_page
       ON image_semantics (source_document_id, source_page_no);
@@ -535,6 +588,8 @@ export class SqliteStorage implements SqliteStorageBackend {
     addColumn("documents", "embedding_enabled", "INTEGER NOT NULL DEFAULT 1");
     addColumn("documents", "has_embeddings", "INTEGER NOT NULL DEFAULT 0");
     addColumn("documents", "image_semantic_enabled", "INTEGER NOT NULL DEFAULT 1");
+    addColumn("documents", "retrieval_chunking_strategy", "TEXT NOT NULL DEFAULT 'small_to_big'");
+    addColumn("documents", "fixed_chunk_chars", "INTEGER");
     addColumn("documents", "last_indexed_at", "TEXT NOT NULL DEFAULT ''");
     addColumn("documents", "is_deleted", "INTEGER NOT NULL DEFAULT 0");
 
@@ -572,6 +627,13 @@ export class SqliteStorage implements SqliteStorageBackend {
       addColumn("retrieval_chunks", "source_locator", "TEXT") || invalidateTraditionalRagIndex;
     invalidateTraditionalRagIndex =
       addColumn("retrieval_chunks", "bboxes_json", "TEXT NOT NULL DEFAULT '[]'") || invalidateTraditionalRagIndex;
+
+    addColumn("fixed_retrieval_chunks", "content_md", "TEXT NOT NULL DEFAULT ''");
+    addColumn("fixed_retrieval_chunks", "summary_text", "TEXT");
+    addColumn("fixed_retrieval_chunks", "source_document_chunk_ids_json", "TEXT NOT NULL DEFAULT '[]'");
+    addColumn("fixed_retrieval_chunks", "page_nos_json", "TEXT NOT NULL DEFAULT '[]'");
+    addColumn("fixed_retrieval_chunks", "source_locator", "TEXT");
+    addColumn("fixed_retrieval_chunks", "bboxes_json", "TEXT NOT NULL DEFAULT '[]'");
 
     addColumn("image_semantics", "source_document_id", "TEXT NOT NULL DEFAULT ''");
     addColumn("image_semantics", "source_page_no", "INTEGER NOT NULL DEFAULT 0");
@@ -646,6 +708,15 @@ export class SqliteStorage implements SqliteStorageBackend {
       SET image_semantic_enabled = 1
       WHERE image_semantic_enabled NOT IN (0, 1);
 
+      UPDATE documents
+      SET retrieval_chunking_strategy = 'small_to_big'
+      WHERE retrieval_chunking_strategy NOT IN ('small_to_big', 'fixed');
+
+      UPDATE documents
+      SET fixed_chunk_chars = 800
+      WHERE retrieval_chunking_strategy = 'fixed'
+        AND (fixed_chunk_chars IS NULL OR fixed_chunk_chars <= 0);
+
       UPDATE collections
       SET kind = 'user'
       WHERE kind = '';
@@ -664,6 +735,8 @@ export class SqliteStorage implements SqliteStorageBackend {
     this.db.exec(`
       DELETE FROM document_chunks_fts;
       DELETE FROM retrieval_chunks_fts;
+      DELETE FROM fixed_retrieval_chunks_fts;
+      DELETE FROM fixed_retrieval_chunks;
       DELETE FROM retrieval_chunks;
       DELETE FROM document_chunks;
       UPDATE documents
@@ -757,9 +830,10 @@ export class SqliteStorage implements SqliteStorageBackend {
               source_object_key, pages_prefix, storage_uri, content_type, upload_status,
               page_count, content, metadata_json, file_mtime, file_size, content_sha256,
               parsed_content_sha256, parsed_is_complete, embedding_enabled, has_embeddings,
-              image_semantic_enabled, last_indexed_at, is_deleted
+              image_semantic_enabled, retrieval_chunking_strategy, fixed_chunk_chars,
+              last_indexed_at, is_deleted
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             ON CONFLICT(id) DO UPDATE SET
               corpus_id = excluded.corpus_id,
               relative_path = excluded.relative_path,
@@ -782,6 +856,8 @@ export class SqliteStorage implements SqliteStorageBackend {
               embedding_enabled = excluded.embedding_enabled,
               has_embeddings = excluded.has_embeddings,
               image_semantic_enabled = excluded.image_semantic_enabled,
+              retrieval_chunking_strategy = excluded.retrieval_chunking_strategy,
+              fixed_chunk_chars = excluded.fixed_chunk_chars,
               last_indexed_at = excluded.last_indexed_at,
               is_deleted = 0
           `,
@@ -809,6 +885,8 @@ export class SqliteStorage implements SqliteStorageBackend {
           document.embeddingEnabled == null ? 1 : document.embeddingEnabled ? 1 : 0,
           document.hasEmbeddings ? 1 : 0,
           document.imageSemanticEnabled == null ? 1 : document.imageSemanticEnabled ? 1 : 0,
+          document.retrievalChunkingStrategy === "fixed" ? "fixed" : "small_to_big",
+          document.fixedChunkChars == null ? null : Number(document.fixedChunkChars),
           now,
         );
 
@@ -947,10 +1025,12 @@ export class SqliteStorage implements SqliteStorageBackend {
       embeddingEnabled?: boolean;
       hasEmbeddings?: boolean;
       imageSemanticEnabled?: boolean;
+      retrievalChunkingStrategy?: "small_to_big" | "fixed";
+      fixedChunkChars?: number | null;
     },
   ): StoredDocument | null {
     const updates: string[] = [];
-    const params: Array<string | number> = [];
+    const params: Array<string | number | null> = [];
     if (input.embeddingEnabled != null) {
       updates.push("embedding_enabled = ?");
       params.push(input.embeddingEnabled ? 1 : 0);
@@ -962,6 +1042,14 @@ export class SqliteStorage implements SqliteStorageBackend {
     if (input.imageSemanticEnabled != null) {
       updates.push("image_semantic_enabled = ?");
       params.push(input.imageSemanticEnabled ? 1 : 0);
+    }
+    if (input.retrievalChunkingStrategy != null) {
+      updates.push("retrieval_chunking_strategy = ?");
+      params.push(input.retrievalChunkingStrategy === "fixed" ? "fixed" : "small_to_big");
+    }
+    if ("fixedChunkChars" in input) {
+      updates.push("fixed_chunk_chars = ?");
+      params.push(input.fixedChunkChars == null ? null : Number(input.fixedChunkChars));
     }
     if (updates.length === 0) {
       return this.getDocument(docId);
@@ -1147,6 +1235,84 @@ export class SqliteStorage implements SqliteStorageBackend {
     return rows.map(normalizeStoredRetrievalChunk);
   }
 
+  replaceFixedRetrievalChunks(
+    documentId: string,
+    chunks: StorageFixedRetrievalChunkRecord[],
+  ): { inserted: number; deleted: number } {
+    const deletedFts = Number(
+      this.db.prepare("DELETE FROM fixed_retrieval_chunks_fts WHERE document_id = ?").run(documentId).changes ?? 0,
+    );
+    const deletedChunks = Number(
+      this.db.prepare("DELETE FROM fixed_retrieval_chunks WHERE document_id = ?").run(documentId).changes ?? 0,
+    );
+    if (chunks.length === 0) {
+      return { inserted: 0, deleted: Math.max(deletedFts, deletedChunks) };
+    }
+    const now = utcNowIso();
+    const run = this.db.transaction(() => {
+      const chunkStatement = this.db.prepare(
+        `
+          INSERT INTO fixed_retrieval_chunks (
+            id, document_id, source_document_chunk_id, ordinal, chunk_text, content_md,
+            size_class, summary_text, source_document_chunk_ids_json, page_nos_json, source_locator, bboxes_json,
+            created_at, updated_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+      );
+      for (const chunk of chunks) {
+        const sourceDocumentChunkIds = JSON.parse(chunk.sourceDocumentChunkIdsJson || "[]") as string[];
+        chunkStatement.run(
+          chunk.id,
+          chunk.documentId,
+          sourceDocumentChunkIds[0] ?? "",
+          chunk.ordinal,
+          chunk.contentMd,
+          chunk.contentMd,
+          chunk.sizeClass,
+          chunk.summaryText ?? null,
+          chunk.sourceDocumentChunkIdsJson,
+          chunk.pageNosJson,
+          chunk.sourceLocator ?? null,
+          chunk.bboxesJson ?? "[]",
+          now,
+          now,
+        );
+        this.db
+          .prepare(
+            `
+              INSERT INTO fixed_retrieval_chunks_fts (chunk_id, document_id, chunk_text)
+              VALUES (?, ?, ?)
+            `,
+          )
+          .run(chunk.id, chunk.documentId, chunk.contentMd);
+      }
+    });
+    run();
+    return { inserted: chunks.length, deleted: Math.max(deletedFts, deletedChunks) };
+  }
+
+  getFixedRetrievalChunk(chunkId: string): StoredFixedRetrievalChunk | null {
+    const row = this.db
+      .prepare("SELECT * FROM fixed_retrieval_chunks WHERE id = ? LIMIT 1")
+      .get(chunkId) as SqliteRow | undefined;
+    return row ? normalizeStoredFixedRetrievalChunk(row) : null;
+  }
+
+  listFixedRetrievalChunks(documentId: string): StoredFixedRetrievalChunk[] {
+    const rows = this.db
+      .prepare(
+        `
+          SELECT *
+          FROM fixed_retrieval_chunks
+          WHERE document_id = ?
+          ORDER BY ordinal ASC
+        `,
+      )
+      .all(documentId) as SqliteRow[];
+    return rows.map(normalizeStoredFixedRetrievalChunk);
+  }
+
   keywordSearchDocumentChunks(input: {
     query: string;
     documentIds: string[];
@@ -1187,6 +1353,53 @@ export class SqliteStorage implements SqliteStorageBackend {
       content_md: String(row.content_md ?? ""),
       size_class: String(row.size_class ?? "normal") as DocumentChunkSizeClass,
       is_split_from_oversized: Boolean(row.is_split_from_oversized),
+      score: Number(row.score ?? 0),
+    }));
+  }
+
+  keywordSearchFixedRetrievalChunks(input: {
+    query: string;
+    documentIds: string[];
+    limit: number;
+  }): FixedRetrievalChunkKeywordHit[] {
+    const documentIds = [...new Set(input.documentIds.map((item) => String(item).trim()).filter(Boolean))];
+    if (!input.query.trim() || documentIds.length === 0) {
+      return [];
+    }
+    const placeholders = documentIds.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `
+          SELECT
+            frc.id AS retrieval_chunk_id,
+            frc.document_id,
+            frc.ordinal,
+            frc.content_md,
+            frc.size_class,
+            frc.source_document_chunk_ids_json,
+            frc.page_nos_json,
+            frc.source_locator,
+            frc.bboxes_json,
+            -bm25(fixed_retrieval_chunks_fts) AS score
+          FROM fixed_retrieval_chunks_fts
+          JOIN fixed_retrieval_chunks frc ON frc.id = fixed_retrieval_chunks_fts.chunk_id
+          WHERE fixed_retrieval_chunks_fts MATCH ?
+            AND frc.document_id IN (${placeholders})
+          ORDER BY score DESC, frc.ordinal ASC
+          LIMIT ?
+        `,
+      )
+      .all(input.query, ...documentIds, Math.max(Number(input.limit || 10), 1)) as SqliteRow[];
+    return rows.map((row) => ({
+      retrieval_chunk_id: String(row.retrieval_chunk_id),
+      document_id: String(row.document_id),
+      ordinal: Number(row.ordinal ?? 0),
+      content_md: String(row.content_md ?? ""),
+      size_class: String(row.size_class ?? "normal") as DocumentChunkSizeClass,
+      source_document_chunk_ids_json: normalizeJsonText(String(row.source_document_chunk_ids_json ?? "[]")),
+      page_nos_json: normalizeJsonText(String(row.page_nos_json ?? "[]")),
+      source_locator: row.source_locator == null ? null : String(row.source_locator),
+      bboxes_json: normalizeJsonText(String(row.bboxes_json ?? "[]")),
       score: Number(row.score ?? 0),
     }));
   }

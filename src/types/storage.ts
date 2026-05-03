@@ -6,6 +6,7 @@ Reference: legacy/python/src/fs_explorer/storage/postgres.py
 import type { DocumentCatalog } from "./skills.js";
 
 export type CollectionKind = "user" | "corpus_scope";
+export type RetrievalChunkingStrategy = "small_to_big" | "fixed";
 
 export interface StorageDocumentRecord {
   id: string;
@@ -30,6 +31,8 @@ export interface StorageDocumentRecord {
   embeddingEnabled?: boolean;
   hasEmbeddings?: boolean;
   imageSemanticEnabled?: boolean;
+  retrievalChunkingStrategy?: RetrievalChunkingStrategy;
+  fixedChunkChars?: number | null;
 }
 
 export interface StoredDocument {
@@ -55,6 +58,8 @@ export interface StoredDocument {
   embedding_enabled: boolean;
   has_embeddings: boolean;
   image_semantic_enabled: boolean;
+  retrieval_chunking_strategy: RetrievalChunkingStrategy;
+  fixed_chunk_chars: number | null;
   last_indexed_at: string;
   is_deleted: boolean;
 }
@@ -210,6 +215,32 @@ export interface StorageRetrievalChunkRecord {
   bboxesJson?: string;
 }
 
+export interface StoredFixedRetrievalChunk {
+  id: string;
+  document_id: string;
+  ordinal: number;
+  content_md: string;
+  size_class: DocumentChunkSizeClass;
+  summary_text: string | null;
+  source_document_chunk_ids_json: string;
+  page_nos_json: string;
+  source_locator: string | null;
+  bboxes_json: string;
+}
+
+export interface StorageFixedRetrievalChunkRecord {
+  id: string;
+  documentId: string;
+  ordinal: number;
+  contentMd: string;
+  sizeClass: DocumentChunkSizeClass;
+  summaryText?: string | null;
+  sourceDocumentChunkIdsJson: string;
+  pageNosJson: string;
+  sourceLocator?: string | null;
+  bboxesJson?: string;
+}
+
 export interface StoredImageSemanticCache {
   image_hash: string;
   prompt_version: string;
@@ -285,6 +316,19 @@ export interface DocumentChunkKeywordHit {
   score: number;
 }
 
+export interface FixedRetrievalChunkKeywordHit {
+  retrieval_chunk_id: string;
+  document_id: string;
+  ordinal: number;
+  content_md: string;
+  size_class: DocumentChunkSizeClass;
+  source_document_chunk_ids_json: string;
+  page_nos_json: string;
+  source_locator: string | null;
+  bboxes_json: string;
+  score: number;
+}
+
 export interface StorageImageSemanticCacheRecord {
   imageHash: string;
   promptVersion: string;
@@ -331,6 +375,8 @@ export interface SqliteStorageBackend {
       embeddingEnabled?: boolean;
       hasEmbeddings?: boolean;
       imageSemanticEnabled?: boolean;
+      retrievalChunkingStrategy?: RetrievalChunkingStrategy;
+      fixedChunkChars?: number | null;
     },
   ): StoredDocument | null;
   syncDocumentPages(
@@ -350,11 +396,22 @@ export interface SqliteStorageBackend {
   ): { inserted: number; deleted: number };
   getRetrievalChunk(chunkId: string): StoredRetrievalChunk | null;
   listRetrievalChunks(documentId: string): StoredRetrievalChunk[];
+  replaceFixedRetrievalChunks(
+    documentId: string,
+    chunks: StorageFixedRetrievalChunkRecord[],
+  ): { inserted: number; deleted: number };
+  getFixedRetrievalChunk(chunkId: string): StoredFixedRetrievalChunk | null;
+  listFixedRetrievalChunks(documentId: string): StoredFixedRetrievalChunk[];
   keywordSearchDocumentChunks(input: {
     query: string;
     documentIds: string[];
     limit: number;
   }): DocumentChunkKeywordHit[];
+  keywordSearchFixedRetrievalChunks(input: {
+    query: string;
+    documentIds: string[];
+    limit: number;
+  }): FixedRetrievalChunkKeywordHit[];
   upsertImageSemantics(images: StorageImageSemanticRecord[]): number;
   getImageSemantics(imageHashes: string[]): Record<string, StoredImageSemantic>;
   listImageSemanticsForDocument(

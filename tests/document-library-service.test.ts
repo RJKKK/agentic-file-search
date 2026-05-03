@@ -140,11 +140,15 @@ describe("document library service", () => {
 
     assert.equal(result.document.original_filename, "alpha.docx");
     assert.equal(result.task.task_type, "upload_parse");
+    assert.equal(result.document.retrieval_chunking_strategy, "small_to_big");
+    assert.equal(result.document.fixed_chunk_chars, null);
 
     const document = storage.getDocument(String(result.document.id));
     assert.ok(document);
     assert.equal(document?.page_count, 2);
     assert.equal(document?.upload_status, "completed");
+    assert.equal(document?.retrieval_chunking_strategy, "small_to_big");
+    assert.equal(document?.fixed_chunk_chars, null);
     assert.equal(storage.listDocumentPages(String(result.document.id)).length, 2);
 
     const sourcePath = await blobStore.materialize({
@@ -288,6 +292,39 @@ describe("document library service", () => {
     });
     await waitForTask(service, reparsed.task.id);
     assert.equal(parser.calls, 2);
+
+    storage.close();
+  });
+
+  it("indexes fixed retrieval chunks when the document opts into fixed chunking", async () => {
+    const root = await mkdtemp(join(tmpdir(), "afs-library-service-fixed-"));
+    const dbPath = join(root, "library.sqlite");
+    const objectRoot = join(root, "object-store");
+    const storage = new SqliteStorage({ dbPath });
+    const blobStore = new LocalBlobStore(objectRoot);
+    const parser = new FakeParser(buildEmbeddingBatchParsedDocument(4));
+    storage.initialize();
+    const service = new DocumentLibraryService(storage, blobStore, parser);
+
+    const uploaded = await service.uploadDocument({
+      filename: "fixed.pdf",
+      data: Buffer.from("%PDF fixed", "utf8"),
+      contentType: "application/pdf",
+      enableEmbedding: false,
+      enableImageSemantic: false,
+      chunkingStrategy: "fixed",
+      fixedChunkChars: 8,
+    });
+    await waitForTask(service, uploaded.task.id);
+
+    const document = storage.getDocument(String(uploaded.document.id));
+    assert.equal(document?.retrieval_chunking_strategy, "fixed");
+    assert.equal(document?.fixed_chunk_chars, 8);
+    assert.equal(uploaded.task.options.chunking_strategy, "fixed");
+    assert.equal(uploaded.task.options.fixed_chunk_chars, 8);
+    assert.equal(storage.listRetrievalChunks(String(uploaded.document.id)).length, 0);
+    assert.ok(storage.listFixedRetrievalChunks(String(uploaded.document.id)).length > 0);
+    assert.ok(storage.listDocumentChunks(String(uploaded.document.id)).length > 0);
 
     storage.close();
   });
