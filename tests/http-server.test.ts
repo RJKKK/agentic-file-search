@@ -922,6 +922,7 @@ describe("http server", () => {
     const corpusId = storage.getOrCreateCorpus(root);
     const docId = "doc-cer";
     const oversizedContent =
+      "图片链接：![image](/api/assets/images/demo)\n\n" +
       `${"leading context ".repeat(120)}purchase price appears inside the oversized appendix. ` +
       `${"trailing context ".repeat(120)}`;
 
@@ -1173,7 +1174,9 @@ describe("http server", () => {
       assert.match(String(retrievalChunk?.debug_enriched_content || ""), /chunk\[1\] compressed excerpt:/i);
       assert.match(String(retrievalChunk?.debug_enriched_content || ""), /chunk\[1-n-1\] compressed excerpt:/i);
       assert.match(String(retrievalChunk?.debug_enriched_content || ""), /compressed excerpt/i);
+      assert.match(String(retrievalChunk?.debug_enriched_content || ""), /!\[image\]\(\/api\/assets\/images\/demo\)/);
       assert.match(String(retrievalChunk?.debug_enriched_content || ""), /\/api\/retrieval-chunks\/rchunk-1\/content/);
+      assert.doesNotMatch(String(retrievalChunk?.debug_enriched_content || ""), /!\[image\]\(\/api\/assets\/images\/dem(?:\)|$)/);
       assert.doesNotMatch(String(retrievalChunk?.debug_enriched_content || ""), /\/api\/retrieval-chunks\/rchunk-2\/content/);
       assert.doesNotMatch(String(retrievalChunk?.debug_enriched_content || ""), /\/api\/retrieval-chunks\/rchunk-3\/content/);
       assert.doesNotMatch(String(retrievalChunk?.debug_enriched_content || ""), /\/api\/retrieval-chunks\/rchunk-4\/content/);
@@ -1189,9 +1192,11 @@ describe("http server", () => {
       assert.match(String(oversizedChunk?.debug_enriched_content || ""), /chunk\[2\] summary:/i);
       assert.match(String(oversizedChunk?.debug_enriched_content || ""), /chunk\[2-n-1\] compressed excerpt:/i);
       assert.match(String(oversizedChunk?.debug_enriched_content || ""), /compressed excerpt/i);
+      assert.match(String(oversizedChunk?.debug_enriched_content || ""), /!\[image\]\(\/api\/assets\/images\/demo\)/);
       assert.doesNotMatch(String(oversizedChunk?.debug_enriched_content || ""), /\/api\/retrieval-chunks\/rchunk-2\/content/);
       assert.doesNotMatch(String(oversizedChunk?.debug_enriched_content || ""), /\/api\/retrieval-chunks\/rchunk-4\/content/);
       assert.match(String(oversizedChunk?.debug_enriched_content || ""), /\/api\/retrieval-chunks\/rchunk-1\/content/);
+      assert.doesNotMatch(String(oversizedChunk?.debug_enriched_content || ""), /!\[image\]\(\/api\/assets\/images\/dem(?:\)|$)/);
 
       const queryResult = await rag.query({
         question: "purchase price",
@@ -1209,6 +1214,216 @@ describe("http server", () => {
       process.env.QDRANT_URL = previousQdrantUrl;
       process.env.FS_EXPLORER_SERVER_BASE_URL = previousServerBaseUrl;
       process.env.FS_EXPLORER_PORT = previousPort;
+      storage.close();
+    }
+  });
+
+  it("drops CER context before compressing the center retrieved chunk", async () => {
+    const root = await mkdtemp(join(tmpdir(), "afs-cer-priority-"));
+    const storage = new SqliteStorage({ dbPath: join(root, "storage.sqlite") });
+    storage.initialize();
+    const blobStore = new LocalBlobStore(join(root, "object-store"));
+    const rag = new TraditionalRagService(storage, blobStore);
+    const previousServerBaseUrl = process.env.FS_EXPLORER_SERVER_BASE_URL;
+    const previousPort = process.env.FS_EXPLORER_PORT;
+    const previousBudget = process.env.TRADITIONAL_RAG_EVIDENCE_CHAR_BUDGET;
+    delete process.env.FS_EXPLORER_SERVER_BASE_URL;
+    process.env.FS_EXPLORER_PORT = "8000";
+    process.env.TRADITIONAL_RAG_EVIDENCE_CHAR_BUDGET = "700";
+    const corpusId = storage.getOrCreateCorpus(root);
+    const docId = "doc-cer-priority";
+    const previousContent = `Context before the diagram. ${"shareholder context ".repeat(120)}`;
+    const centerContent = [
+      "## 公司与实际控制人之间的产权及控制关系的方框图",
+      "图片链接：![image](/api/assets/images/demo)",
+      "曾毓群持股香港瑞华投资有限公司 100.00%。",
+      "香港瑞华投资有限公司持股厦门瑞庭 45.00%。",
+      "厦门瑞庭持股宁德时代 23.27%。",
+    ].join("\n\n");
+    const nextContent = `Context after the diagram. ${"financial statement context ".repeat(140)}`;
+
+    storage.upsertDocumentStub({
+      id: docId,
+      corpusId,
+      relativePath: "cer-priority.pdf",
+      absolutePath: join(root, "cer-priority.pdf"),
+      content: "",
+      metadataJson: "{}",
+      fileMtime: 1,
+      fileSize: 1,
+      contentSha256: "hash-cer-priority",
+      originalFilename: "cer-priority.pdf",
+      objectKey: "documents/cer-priority.pdf",
+      sourceObjectKey: "documents/cer-priority.pdf",
+      pagesPrefix: "documents/cer-priority/pages",
+      storageUri: "storage://cer-priority.pdf",
+      contentType: "application/pdf",
+      uploadStatus: "completed",
+      pageCount: 3,
+      parsedContentSha256: "parsed-cer-priority",
+      parsedIsComplete: true,
+      embeddingEnabled: true,
+      hasEmbeddings: true,
+      imageSemanticEnabled: true,
+    });
+
+    storage.replaceDocumentChunks(docId, [
+      {
+        id: "priority-dchunk-1",
+        documentId: docId,
+        ordinal: 1,
+        referenceRetrievalChunkId: "priority-rchunk-1",
+        pageNo: 1,
+        documentIndex: 1,
+        pageIndex: 1,
+        blockType: "paragraph",
+        bboxJson: "[0,0,1,1]",
+        contentMd: previousContent,
+        sizeClass: "normal",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: "[1]",
+        mergedBboxesJson: "[[0,0,1,1]]",
+      },
+      {
+        id: "priority-dchunk-2",
+        documentId: docId,
+        ordinal: 2,
+        referenceRetrievalChunkId: "priority-rchunk-2",
+        pageNo: 2,
+        documentIndex: 2,
+        pageIndex: 1,
+        blockType: "picture",
+        bboxJson: "[0,0,1,1]",
+        contentMd: centerContent,
+        sizeClass: "normal",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: "[2]",
+        mergedBboxesJson: "[[0,0,1,1]]",
+      },
+      {
+        id: "priority-dchunk-3",
+        documentId: docId,
+        ordinal: 3,
+        referenceRetrievalChunkId: "priority-rchunk-3",
+        pageNo: 3,
+        documentIndex: 3,
+        pageIndex: 1,
+        blockType: "paragraph",
+        bboxJson: "[0,0,1,1]",
+        contentMd: nextContent,
+        sizeClass: "normal",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: "[3]",
+        mergedBboxesJson: "[[0,0,1,1]]",
+      },
+    ]);
+
+    storage.replaceRetrievalChunks(docId, [
+      {
+        id: "priority-rchunk-1",
+        documentId: docId,
+        ordinal: 1,
+        contentMd: previousContent,
+        sizeClass: "normal",
+        sourceDocumentChunkIdsJson: JSON.stringify(["priority-dchunk-1"]),
+        pageNosJson: JSON.stringify([1]),
+        sourceLocator: "page-1",
+        bboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+      },
+      {
+        id: "priority-rchunk-2",
+        documentId: docId,
+        ordinal: 2,
+        contentMd: centerContent,
+        sizeClass: "normal",
+        sourceDocumentChunkIdsJson: JSON.stringify(["priority-dchunk-2"]),
+        pageNosJson: JSON.stringify([2]),
+        sourceLocator: "page-2",
+        bboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+      },
+      {
+        id: "priority-rchunk-3",
+        documentId: docId,
+        ordinal: 3,
+        contentMd: nextContent,
+        sizeClass: "normal",
+        sourceDocumentChunkIdsJson: JSON.stringify(["priority-dchunk-3"]),
+        pageNosJson: JSON.stringify([3]),
+        sourceLocator: "page-3",
+        bboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+      },
+    ]);
+
+    const originalFetch = globalThis.fetch;
+    const previousEmbeddingUrl = process.env.EMBEDDING_BASE_URL;
+    const previousEmbeddingKey = process.env.EMBEDDING_API_KEY;
+    const previousQdrantUrl = process.env.QDRANT_URL;
+
+    process.env.EMBEDDING_BASE_URL = "https://example.test/v1";
+    process.env.EMBEDDING_API_KEY = "embed-test-key";
+    process.env.QDRANT_URL = "https://qdrant.test";
+
+    globalThis.fetch = (async (input) => {
+      const url = String(input);
+      if (url === "https://example.test/v1/embeddings") {
+        return new Response(
+          JSON.stringify({
+            data: [{ embedding: [0.1, 0.2, 0.3], index: 0 }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url === "https://qdrant.test/collections/doc_doc-cer-priority/points/search") {
+        return new Response(
+          JSON.stringify({
+            result: [{ id: "qdrant-priority", score: 10, payload: { retrieval_unit_id: "priority-dchunk-2" } }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof globalThis.fetch;
+
+    try {
+      const retrieveResult = await rag.retrieve({
+        question: "方框图",
+        mode: "semantic",
+        documentIds: [docId],
+      });
+
+      const centerChunk = retrieveResult.retrieved_chunks.find((chunk) => chunk.reference_id === "priority-rchunk-2");
+      assert.equal(centerChunk?.debug_cer_applied, true);
+      assert.deepEqual(
+        centerChunk?.debug_cer_context_refs?.map((item) => item.reference_id),
+        ["priority-rchunk-3"],
+      );
+      assert.match(String(centerChunk?.debug_enriched_content || ""), /公司与实际控制人之间的产权及控制关系的方框图/);
+      assert.match(String(centerChunk?.debug_enriched_content || ""), /厦门瑞庭持股宁德时代 23\.27%/);
+      assert.match(String(centerChunk?.debug_enriched_content || ""), /!\[image\]\(\/api\/assets\/images\/demo\)/);
+      assert.doesNotMatch(String(centerChunk?.debug_enriched_content || ""), /chunk\[1-p-1\]/i);
+      assert.match(String(centerChunk?.debug_enriched_content || ""), /chunk\[1-n-1\] compressed excerpt:/i);
+      assert.doesNotMatch(String(centerChunk?.debug_enriched_content || ""), /香港瑞华投$/m);
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.EMBEDDING_BASE_URL = previousEmbeddingUrl;
+      process.env.EMBEDDING_API_KEY = previousEmbeddingKey;
+      process.env.QDRANT_URL = previousQdrantUrl;
+      process.env.FS_EXPLORER_SERVER_BASE_URL = previousServerBaseUrl;
+      process.env.FS_EXPLORER_PORT = previousPort;
+      if (previousBudget === undefined) {
+        delete process.env.TRADITIONAL_RAG_EVIDENCE_CHAR_BUDGET;
+      } else {
+        process.env.TRADITIONAL_RAG_EVIDENCE_CHAR_BUDGET = previousBudget;
+      }
       storage.close();
     }
   });
@@ -1404,6 +1619,86 @@ describe("http server", () => {
     }
   });
 
+  it("expands Chinese keyword queries into subwords during retrieval", async () => {
+    const root = await mkdtemp(join(tmpdir(), "afs-keyword-chinese-"));
+    const storage = new SqliteStorage({ dbPath: join(root, "storage.sqlite") });
+    storage.initialize();
+    const blobStore = new LocalBlobStore(join(root, "object-store"));
+    const rag = new TraditionalRagService(storage, blobStore);
+    const corpusId = storage.getOrCreateCorpus(root);
+    const docId = "doc-keyword-chinese";
+    const heading = "## 公司与实际控制人之间的产权及控制关系的方框图";
+
+    storage.upsertDocumentStub({
+      id: docId,
+      corpusId,
+      relativePath: "keyword.pdf",
+      absolutePath: join(root, "keyword.pdf"),
+      content: "",
+      metadataJson: "{}",
+      fileMtime: 1,
+      fileSize: 1,
+      contentSha256: "hash-keyword-chinese",
+      originalFilename: "keyword.pdf",
+      objectKey: "documents/keyword.pdf",
+      sourceObjectKey: "documents/keyword.pdf",
+      pagesPrefix: "documents/keyword/pages",
+      storageUri: "storage://keyword.pdf",
+      contentType: "application/pdf",
+      uploadStatus: "completed",
+      pageCount: 1,
+      parsedContentSha256: "parsed-keyword-chinese",
+      parsedIsComplete: true,
+      retrievalChunkingStrategy: "small_to_big",
+    });
+    storage.replaceDocumentChunks(docId, [
+      {
+        id: "keyword-dchunk-1",
+        documentId: docId,
+        ordinal: 0,
+        referenceRetrievalChunkId: "keyword-rchunk-1",
+        pageNo: 1,
+        documentIndex: 0,
+        pageIndex: 0,
+        blockType: "section-header",
+        bboxJson: "[0,0,1,1]",
+        contentMd: heading,
+        sizeClass: "small",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: "[1]",
+        mergedBboxesJson: "[[0,0,1,1]]",
+      },
+    ]);
+    storage.replaceRetrievalChunks(docId, [
+      {
+        id: "keyword-rchunk-1",
+        documentId: docId,
+        ordinal: 0,
+        contentMd: heading,
+        sizeClass: "small",
+        sourceDocumentChunkIdsJson: JSON.stringify(["keyword-dchunk-1"]),
+        pageNosJson: JSON.stringify([1]),
+        sourceLocator: "page-1",
+        bboxesJson: JSON.stringify([[0, 0, 1, 1]]),
+      },
+    ]);
+
+    try {
+      const result = await rag.retrieve({
+        question: "输出方框图",
+        mode: "keyword",
+        documentIds: [docId],
+      });
+      assert.equal(result.retrieved_chunks.length > 0, true);
+      assert.equal(result.retrieved_chunks[0]?.reference_id, "keyword-rchunk-1");
+    } finally {
+      storage.close();
+    }
+  });
+
   it("builds embeddings with controlled batch concurrency", async () => {
     const rag = new TraditionalRagService({} as never, {} as never);
     const originalFetch = globalThis.fetch;
@@ -1582,6 +1877,376 @@ describe("http server", () => {
     }
   });
 
+  it("includes previous non-picture context when building image semantics for small_to_big only", async () => {
+    const root = await mkdtemp(join(tmpdir(), "afs-image-context-"));
+    const storage = new SqliteStorage({ dbPath: join(root, "storage.sqlite") });
+    storage.initialize();
+    const blobStore = new LocalBlobStore(join(root, "object-store"));
+    const rag = new TraditionalRagService(storage, blobStore);
+    const corpusId = storage.getOrCreateCorpus(root);
+    const originalFetch = globalThis.fetch;
+    const previousVisionUrl = process.env.VISION_BASE_URL;
+    const previousVisionKey = process.env.VISION_API_KEY;
+    const previousMaxPerPage = process.env.VISION_MAX_SEMANTIC_PER_PAGE;
+    const previousMaxPerDoc = process.env.VISION_MAX_SEMANTIC_PER_DOC;
+    process.env.VISION_BASE_URL = "https://vision.test/v1";
+    process.env.VISION_API_KEY = "vision-test-key";
+    process.env.VISION_MAX_SEMANTIC_PER_PAGE = "5";
+    process.env.VISION_MAX_SEMANTIC_PER_DOC = "5";
+
+    const imageBytes = Buffer.from("fake-image");
+    Object.defineProperty(rag, "pythonAssets", {
+      configurable: true,
+      writable: true,
+      value: {
+        async extractPdfImages() {
+          return [
+            {
+              image_hash: "img-context",
+              page_no: 1,
+              image_index: 0,
+              mime_type: "image/png",
+              width: 100,
+              height: 100,
+              bytes_base64: imageBytes.toString("base64"),
+              byte_size: imageBytes.length,
+            },
+          ];
+        },
+        async inspectImage(bytesBase64: string) {
+          return {
+            supported: true,
+            has_text: true,
+            interference_score: 0,
+            compressed_bytes_base64: bytesBase64,
+            compressed_byte_size: Buffer.from(bytesBase64, "base64").length,
+            output_mime_type: "image/png",
+          };
+        },
+      },
+    });
+
+    const promptBodies: string[] = [];
+    globalThis.fetch = (async (input, init) => {
+      const url = String(input);
+      if (url === "https://vision.test/v1/chat/completions") {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        promptBodies.push(String(body.messages?.[1]?.content?.[0]?.text ?? ""));
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    recognizable: true,
+                    image_kind: "ownership diagram",
+                    contains_text: true,
+                    retrieval_summary: "曾毓群持股香港瑞华投资有限公司 100.00%。",
+                    detail_markdown: "## 逐项关系\n- 曾毓群持股香港瑞华投资有限公司 100.00%。",
+                    visible_text: "曾毓群 100.00%",
+                    keywords: ["方框图", "控制关系"],
+                    entities: ["曾毓群"],
+                    qa_hints: ["问图中控制关系"],
+                    detail_truncated: false,
+                    drop_reason: null,
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof globalThis.fetch;
+
+    const parsedDocument = {
+      parser_name: "test",
+      parser_version: "1",
+      units: [
+        {
+          unit_no: 1,
+          markdown: "## 公司与实际控制人之间的产权及控制关系的方框图",
+          content_hash: "page-1",
+          heading: null,
+          source_locator: "page-1",
+          images: [{ image_hash: "img-context", page_no: 1, image_index: 0, bbox: [0, 0, 1, 1] }],
+          blocks: [
+            {
+              index: 0,
+              block_type: "section-header",
+              bbox: [0, 0, 1, 0.2],
+              markdown: "## 公司与实际控制人之间的产权及控制关系的方框图",
+              char_count: 23,
+              image_hash: null,
+              source_image_index: null,
+            },
+            {
+              index: 1,
+              block_type: "picture",
+              bbox: [0, 0.2, 1, 1],
+              markdown: "![image-placeholder](context)",
+              char_count: 1,
+              image_hash: "img-context",
+              source_image_index: 0,
+            },
+          ],
+        },
+      ],
+    };
+
+    try {
+      storage.upsertDocumentStub({
+        id: "doc-image-context-small",
+        corpusId,
+        relativePath: "context.pdf",
+        absolutePath: join(root, "context.pdf"),
+        content: "",
+        metadataJson: "{}",
+        fileMtime: 1,
+        fileSize: 1,
+        contentSha256: "hash-image-context-small",
+        originalFilename: "context.pdf",
+        retrievalChunkingStrategy: "small_to_big",
+      });
+      storage.upsertDocumentStub({
+        id: "doc-image-context-fixed",
+        corpusId,
+        relativePath: "context-fixed.pdf",
+        absolutePath: join(root, "context-fixed.pdf"),
+        content: "",
+        metadataJson: "{}",
+        fileMtime: 1,
+        fileSize: 1,
+        contentSha256: "hash-image-context-fixed",
+        originalFilename: "context-fixed.pdf",
+        retrievalChunkingStrategy: "fixed",
+      });
+      await rag.renderImages({
+        documentId: "doc-image-context-small",
+        filePath: join(root, "context.pdf"),
+        originalFilename: "context.pdf",
+        parsedDocument,
+        enableImageSemantic: true,
+        retrievalChunkingStrategy: "small_to_big",
+      });
+      Object.defineProperty(rag, "pythonAssets", {
+        configurable: true,
+        writable: true,
+        value: {
+          async extractPdfImages() {
+            return [
+              {
+                image_hash: "img-context-fixed",
+                page_no: 1,
+                image_index: 0,
+                mime_type: "image/png",
+                width: 100,
+                height: 100,
+                bytes_base64: imageBytes.toString("base64"),
+                byte_size: imageBytes.length,
+              },
+            ];
+          },
+          async inspectImage(bytesBase64: string) {
+            return {
+              supported: true,
+              has_text: true,
+              interference_score: 0,
+              compressed_bytes_base64: bytesBase64,
+              compressed_byte_size: Buffer.from(bytesBase64, "base64").length,
+              output_mime_type: "image/png",
+            };
+          },
+        },
+      });
+      await rag.renderImages({
+        documentId: "doc-image-context-fixed",
+        filePath: join(root, "context-fixed.pdf"),
+        originalFilename: "context-fixed.pdf",
+        parsedDocument: {
+          ...parsedDocument,
+          units: [
+            {
+              ...parsedDocument.units[0]!,
+              images: [{ image_hash: "img-context-fixed", page_no: 1, image_index: 0, bbox: [0, 0, 1, 1] }],
+              blocks: [
+                parsedDocument.units[0]!.blocks[0]!,
+                { ...parsedDocument.units[0]!.blocks[1]!, image_hash: "img-context-fixed" },
+              ],
+            },
+          ],
+        },
+        enableImageSemantic: true,
+        retrievalChunkingStrategy: "fixed",
+      });
+
+      assert.equal(promptBodies.length, 2);
+      assert.match(promptBodies[0] ?? "", /邻近上下文/);
+      assert.match(promptBodies[0] ?? "", /公司与实际控制人之间的产权及控制关系的方框图/);
+      assert.doesNotMatch(promptBodies[1] ?? "", /邻近上下文/);
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.VISION_BASE_URL = previousVisionUrl;
+      process.env.VISION_API_KEY = previousVisionKey;
+      if (previousMaxPerPage === undefined) {
+        delete process.env.VISION_MAX_SEMANTIC_PER_PAGE;
+      } else {
+        process.env.VISION_MAX_SEMANTIC_PER_PAGE = previousMaxPerPage;
+      }
+      if (previousMaxPerDoc === undefined) {
+        delete process.env.VISION_MAX_SEMANTIC_PER_DOC;
+      } else {
+        process.env.VISION_MAX_SEMANTIC_PER_DOC = previousMaxPerDoc;
+      }
+      storage.close();
+    }
+  });
+
+  it("adds previous chunk context to picture embeddings without exceeding the embedding-3 budget", async () => {
+    const root = await mkdtemp(join(tmpdir(), "afs-picture-embedding-budget-"));
+    const storage = new SqliteStorage({ dbPath: join(root, "storage.sqlite") });
+    storage.initialize();
+    const blobStore = new LocalBlobStore(join(root, "object-store"));
+    const rag = new TraditionalRagService(storage, blobStore);
+    const corpusId = storage.getOrCreateCorpus(root);
+    const docId = "doc-picture-embedding-budget";
+    storage.upsertDocumentStub({
+      id: docId,
+      corpusId,
+      relativePath: "picture-embedding.pdf",
+      absolutePath: join(root, "picture-embedding.pdf"),
+      content: "",
+      metadataJson: "{}",
+      fileMtime: 1,
+      fileSize: 1,
+      contentSha256: "hash-picture-embedding-budget",
+      originalFilename: "picture-embedding.pdf",
+      retrievalChunkingStrategy: "small_to_big",
+      embeddingEnabled: true,
+      hasEmbeddings: false,
+    });
+    const previousChunkText = `## 公司与实际控制人之间的产权及控制关系的方框图\n${"控制关系说明 ".repeat(40)}`;
+    const pictureChunkText = [
+      "图片链接：",
+      "![image](/api/assets/images/demo)",
+      "",
+      "曾毓群持股香港瑞华投资有限公司 100.00%。",
+      "香港瑞华投资有限公司持股厦门瑞庭 45.00%。",
+      "厦门瑞庭持股宁德时代 23.27%。",
+    ].join("\n");
+    storage.replaceDocumentChunks(docId, [
+      {
+        id: "embed-dchunk-1",
+        documentId: docId,
+        ordinal: 0,
+        referenceRetrievalChunkId: "embed-rchunk-1",
+        pageNo: 1,
+        documentIndex: 0,
+        pageIndex: 0,
+        blockType: "section-header",
+        bboxJson: "[0,0,1,1]",
+        contentMd: previousChunkText,
+        sizeClass: "normal",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: "[1]",
+        mergedBboxesJson: "[[0,0,1,1]]",
+      },
+      {
+        id: "embed-dchunk-2",
+        documentId: docId,
+        ordinal: 1,
+        referenceRetrievalChunkId: "embed-rchunk-2",
+        pageNo: 1,
+        documentIndex: 1,
+        pageIndex: 1,
+        blockType: "picture",
+        bboxJson: "[0,0,1,1]",
+        contentMd: pictureChunkText,
+        sizeClass: "normal",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: "[1]",
+        mergedBboxesJson: "[[0,0,1,1]]",
+      },
+    ]);
+
+    const originalFetch = globalThis.fetch;
+    const previousEmbeddingModel = process.env.EMBEDDING_MODEL_NAME;
+    const previousEmbeddingUrl = process.env.EMBEDDING_BASE_URL;
+    const previousEmbeddingKey = process.env.EMBEDDING_API_KEY;
+    const previousTokenBudget = process.env.EMBEDDING_MODEL_MAX_TOKENS;
+    const previousRatio = process.env.EMBEDDING_MODEL_CHAR_BUDGET_RATIO;
+    const previousQdrantUrl = process.env.QDRANT_URL;
+
+    process.env.EMBEDDING_MODEL_NAME = "embedding-3";
+    process.env.EMBEDDING_BASE_URL = "https://example.test/v1";
+    process.env.EMBEDDING_API_KEY = "embed-test-key";
+    process.env.EMBEDDING_MODEL_MAX_TOKENS = "40";
+    process.env.EMBEDDING_MODEL_CHAR_BUDGET_RATIO = "2";
+    process.env.QDRANT_URL = "https://qdrant.test";
+
+    const embeddingInputs: string[] = [];
+    globalThis.fetch = (async (input, init) => {
+      const url = String(input);
+      if (url === "https://example.test/v1/embeddings") {
+        const body = JSON.parse(String(init?.body ?? "{}"));
+        embeddingInputs.push(...(body.input ?? []));
+        return new Response(
+          JSON.stringify({
+            data: (body.input || []).map((_: unknown, index: number) => ({
+              embedding: [index + 0.1, index + 0.2, index + 0.3],
+              index,
+            })),
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      if (url === "https://qdrant.test/collections/doc_doc-picture-embedding-budget") {
+        return new Response(JSON.stringify({ status: "ok" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url === "https://qdrant.test/collections/doc_doc-picture-embedding-budget/points?wait=true") {
+        return new Response(JSON.stringify({ status: "ok" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof globalThis.fetch;
+
+    try {
+      const written = await rag.buildEmbeddingsForChunks(docId, [
+        { id: "embed-dchunk-1", unitText: previousChunkText },
+        { id: "embed-dchunk-2", unitText: pictureChunkText },
+      ]);
+      assert.equal(written, 2);
+      assert.equal(embeddingInputs.length, 2);
+      assert.equal(embeddingInputs[0], previousChunkText);
+      assert.match(embeddingInputs[1] ?? "", /!\[image\]\(\/api\/assets\/images\/demo\)/);
+      assert.match(embeddingInputs[1] ?? "", /曾毓群持股香港瑞华投资有限公司 100\.00%/);
+      assert.match(embeddingInputs[1] ?? "", /公司与实际控制人之间的产权及控制关系的方框图/);
+      assert.equal((embeddingInputs[1] ?? "").length < [pictureChunkText, previousChunkText].join("\n\n").length, true);
+      assert.doesNotMatch(embeddingInputs[1] ?? "", /鎺у埗鍏崇郴璇存槑.{0,20}鎺у埗鍏崇郴璇存槑/s);
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.EMBEDDING_MODEL_NAME = previousEmbeddingModel;
+      process.env.EMBEDDING_BASE_URL = previousEmbeddingUrl;
+      process.env.EMBEDDING_API_KEY = previousEmbeddingKey;
+      process.env.EMBEDDING_MODEL_MAX_TOKENS = previousTokenBudget;
+      process.env.EMBEDDING_MODEL_CHAR_BUDGET_RATIO = previousRatio;
+      process.env.QDRANT_URL = previousQdrantUrl;
+      storage.close();
+    }
+  });
+
   it("removes blank seam lines when merging a table continued across pages", () => {
     const rag = new TraditionalRagService({} as never, {} as never);
     const documentChunks = rag.createDocumentChunks({
@@ -1693,6 +2358,16 @@ describe("http server", () => {
 
     assert.equal(fixedChunks.length > 1, true);
     assert.equal(fixedChunks.every((chunk) => chunk.contentMd.length <= 120), true);
+    assert.equal(
+      fixedChunks
+        .filter((chunk) => chunk.contentMd.includes("![image]"))
+        .every((chunk) => chunk.contentMd.includes("![image](/api/assets/images/demo)")),
+      true,
+    );
+    assert.equal(
+      fixedChunks.every((chunk) => !/!\[image\]\([^)]*$/.test(chunk.contentMd)),
+      true,
+    );
     assert.match(fixedChunks[0]?.contentMd ?? "", /图片摘要|!\[image\]/);
   });
 

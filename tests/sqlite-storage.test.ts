@@ -487,6 +487,84 @@ describe("sqlite storage", () => {
     storage.close();
   });
 
+  it("indexes Chinese subwords for document and fixed retrieval chunk FTS", async () => {
+    const root = await mkdtemp(join(tmpdir(), "afs-sqlite-chinese-fts-"));
+    const dbPath = join(root, "storage.sqlite");
+    const storage = new SqliteStorage({ dbPath });
+    storage.initialize();
+
+    const corpusId = storage.getOrCreateCorpus("C:/docs");
+    const docId = SqliteStorage.makeDocumentId(corpusId, "diagram.pdf");
+    storage.upsertDocumentStub({
+      id: docId,
+      corpusId,
+      relativePath: "diagram.pdf",
+      absolutePath: "C:/docs/diagram.pdf",
+      content: "",
+      metadataJson: "{}",
+      fileMtime: 1,
+      fileSize: 10,
+      contentSha256: "sha-diagram",
+      originalFilename: "diagram.pdf",
+      retrievalChunkingStrategy: "fixed",
+      fixedChunkChars: 800,
+    });
+    const heading = "## 公司与实际控制人之间的产权及控制关系的方框图";
+    storage.replaceDocumentChunks(docId, [
+      {
+        id: "dchunk-cn-1",
+        documentId: docId,
+        ordinal: 0,
+        referenceRetrievalChunkId: "frchunk-cn-1",
+        pageNo: 1,
+        documentIndex: 0,
+        pageIndex: 0,
+        blockType: "section-header",
+        bboxJson: JSON.stringify([0, 0, 10, 10]),
+        contentMd: heading,
+        sizeClass: "small",
+        summaryText: null,
+        isSplitFromOversized: false,
+        splitIndex: 0,
+        splitCount: 1,
+        mergedPageNosJson: JSON.stringify([1]),
+        mergedBboxesJson: JSON.stringify([[0, 0, 10, 10]]),
+      },
+    ]);
+    storage.replaceFixedRetrievalChunks(docId, [
+      {
+        id: "frchunk-cn-1",
+        documentId: docId,
+        ordinal: 0,
+        contentMd: heading,
+        sizeClass: "small",
+        summaryText: null,
+        sourceDocumentChunkIdsJson: JSON.stringify(["dchunk-cn-1"]),
+        pageNosJson: JSON.stringify([1]),
+        sourceLocator: "page-1",
+        bboxesJson: JSON.stringify([[0, 0, 10, 10]]),
+      },
+    ]);
+
+    const documentHits = storage.keywordSearchDocumentChunks({
+      query: "\"方框图\"",
+      documentIds: [docId],
+      limit: 5,
+    });
+    assert.equal(documentHits.length, 1);
+    assert.equal(documentHits[0]?.document_chunk_id, "dchunk-cn-1");
+
+    const fixedHits = storage.keywordSearchFixedRetrievalChunks({
+      query: "\"控制关系\" OR \"方框图\"",
+      documentIds: [docId],
+      limit: 5,
+    });
+    assert.equal(fixedHits.length, 1);
+    assert.equal(fixedHits[0]?.retrieval_chunk_id, "frchunk-cn-1");
+
+    storage.close();
+  });
+
   it("deletes documents and cascades pages, image semantics, and collection mappings", async () => {
     const root = await mkdtemp(join(tmpdir(), "afs-sqlite-delete-"));
     const dbPath = join(root, "storage.sqlite");

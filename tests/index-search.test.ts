@@ -182,7 +182,7 @@ describe("index search service", () => {
         sourceDocumentId: "doc-alpha",
         sourcePageNo: 1,
         sourceImageIndex: 1,
-        semanticText: "Short retrieval summary.\n" + "A".repeat(500),
+        semanticText: "图片链接：![image](/api/assets/images/demo)\n\nShort retrieval summary.\n" + "A".repeat(500),
         semanticDetailText: "Detailed semantic markdown that should stay out of document context.",
         semanticModel: "gpt-4o-mini",
       },
@@ -195,8 +195,10 @@ describe("index search service", () => {
 
     const document = await service.getDocument("doc-alpha");
     assert.match(document.rendered, /Image semantics cache:/);
+    assert.match(document.rendered, /!\[image\]\(\/api\/assets\/images\/demo\)/);
     assert.match(document.rendered, /Short retrieval summary/);
     assert.match(document.rendered, /\[truncated\]/);
+    assert.doesNotMatch(document.rendered, /!\[image\]\(\/api\/assets\/images\/dem(?:\)|$)/);
     assert.doesNotMatch(document.rendered, /Detailed semantic markdown/);
 
     fixture.storage.close();

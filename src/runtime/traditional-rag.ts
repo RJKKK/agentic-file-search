@@ -4,7 +4,6 @@ Reference: legacy/python/src/fs_explorer/document_library.py
 */
 
 import { Buffer } from "node:buffer";
-import { createHash } from "node:crypto";
 import { extname } from "node:path";
 
 import { resolveDocumentScope } from "./document-library.js";
@@ -16,10 +15,53 @@ import {
 } from "./image-semantic.js";
 import { resolveEmbeddingConfig, resolveTextConfig, resolveVisionConfig } from "./model-config.js";
 import { PythonDocumentAssetBridge } from "./python-document-assets.js";
+import {
+  buildFixedRetrievalChunks,
+  buildIndexedDocumentChunks,
+  buildRetrievalChunks,
+  buildSourceChunks,
+} from "./traditional-rag-chunking.js";
+import {
+  answerContainsAnyDetailLink,
+  appendOversizedChunkLinks,
+  compressEvidenceItems,
+  extractRelevantSegment,
+  isHeadingLikeShortCenterSegment,
+  materializeEvidenceItem,
+  parseCitationNumbers,
+  toPublicChunkReferences,
+  toPublicDetailChunks,
+} from "./traditional-rag-evidence.js";
+import {
+  DEFAULT_EMBEDDING_IMAGE_NEIGHBOR_MAX_CHARS,
+  bboxKey,
+  extractQueryTokens,
+  embeddingCharBudget,
+  getEvidenceCharBudget,
+  imageSemanticCacheVersion,
+  normalizeBaseUrl,
+  normalizeEmbeddingNeighborText,
+  normalizeWhitespace,
+  parseJsonArray,
+  parsePositiveIntegerEnv,
+  qdrantPointIdForRetrievalUnit,
+  resolveTextRequestTimeoutMs,
+  sourceLocatorFromPages,
+  toAbsoluteServerUrl,
+  toFtsQuery,
+  truncateTextPreservingImageLinks,
+  uniqueOrdered,
+  type EvidenceSegment,
+  type GroupedEvidence,
+  type ImageChunkRendering,
+  type PreparedEvidenceSet,
+  type RankedChunkHit,
+  type SourceChunkRecord,
+  type TraditionalRetrievalChunkRecord,
+} from "./traditional-rag-shared.js";
 import type { BlobStore } from "../types/library.js";
-import type { ParsedBlock, ParsedDocument, ParsedImage, ParsedUnit } from "../types/parsing.js";
+import type { ParsedDocument, ParsedImage } from "../types/parsing.js";
 import type {
-  TraditionalRagCerContextRef,
   TraditionalRagChunkReference,
   TraditionalRagDetailChunk,
   TraditionalRagPromptMessage,
@@ -30,277 +72,14 @@ import type {
 } from "../types/rag.js";
 import type {
   SqliteStorageBackend,
-  StorageDocumentChunkRecord,
-  StorageFixedRetrievalChunkRecord,
   StorageImageSemanticRecord,
-  StorageRetrievalChunkRecord,
-  StoredDocument,
   StoredDocumentChunk,
-  StoredFixedRetrievalChunk,
   StoredImageSemantic,
-  StoredRetrievalChunk,
 } from "../types/storage.js";
 
-const DEFAULT_SMALL_CHUNK_MAX_CHARS = 399;
-const DEFAULT_NORMAL_CHUNK_MAX_CHARS = 2000;
-const DEFAULT_EVIDENCE_CHAR_BUDGET = 12000;
-const CER_CONTEXT_EXCERPT_TARGET = 600;
 const MAX_IMAGE_BYTES_FOR_VISION = 4 * 1024 * 1024;
-const IMAGE_PROMPT_VERSION = "v2";
 
-interface ChunkThresholds {
-  smallMaxChars: number;
-  normalMaxChars: number;
-}
-
-interface SourceChunkRecord {
-  id: string;
-  documentId: string;
-  pageNo: number;
-  documentIndex: number;
-  pageIndex: number;
-  blockType: string;
-  bboxJson: string;
-  contentMd: string;
-  sizeClass: "small" | "normal" | "oversized";
-  summaryText: string | null;
-  mergedPageNosJson: string;
-  mergedBboxesJson: string;
-}
-
-interface RetrievalChunkPlan {
-  id: string;
-  documentId: string;
-  ordinal: number;
-  contentMd: string;
-  sizeClass: "small" | "normal" | "oversized";
-  summaryText: string | null;
-  sourceChunkIds: string[];
-  pageNosJson: string;
-  sourceLocator: string | null;
-  bboxesJson: string;
-}
-
-interface FixedChunkPiece {
-  sourceChunkId: string;
-  pageNo: number;
-  contentMd: string;
-  blockType: string;
-  mergedPageNosJson: string;
-  mergedBboxesJson: string;
-  bboxJson: string;
-}
-
-export interface ImageChunkRendering {
-  dropped: boolean;
-  markdown: string;
-}
-
-interface RankedChunkHit {
-  retrievalUnitId: string;
-  documentId: string;
-  sourceDocumentChunkId: string;
-  referenceRetrievalChunkId: string | null;
-  ordinal: number;
-  score: number;
-  unitText: string;
-  isSplitFromOversized: boolean;
-}
-
-type TraditionalRetrievalChunkRecord = StoredRetrievalChunk | StoredFixedRetrievalChunk;
-
-interface GroupedEvidence {
-  citationNo: number;
-  referenceId: string;
-  referenceKind: "retrieval_chunk" | "document_chunk";
-  documentId: string;
-  documentName: string;
-  sourceLocator: string | null;
-  hasOversizedSplitChild: boolean;
-  documentChunkIds: string[];
-  retrievalUnitIds: string[];
-  pageNos: number[];
-  bboxes: Array<[number, number, number, number]>;
-  score: number;
-  summaryText: string | null;
-  sourceLink: string;
-  mergedExcerpt: string;
-  baseContent: string;
-  enrichedContent: string;
-  content: string;
-  cerApplied: boolean;
-  cerContextRefs: TraditionalRagCerContextRef[];
-  cerSegments: EvidenceSegment[];
-  compressionApplied: boolean;
-}
-
-interface EvidenceSegment {
-  citationNo: number;
-  referenceId: string;
-  referenceKind: "retrieval_chunk" | "document_chunk";
-  summaryText: string | null;
-  mergedExcerpt: string;
-  sourceLink: string;
-  sourceLocator: string | null;
-  pageNos: number[];
-  sortOrder: number;
-  blockType: string | null;
-  isOversized: boolean;
-  isCenter: boolean;
-}
-
-interface PreparedEvidenceSet {
-  mode: TraditionalRetrievalMode;
-  question: string;
-  warnings: string[];
-  chunks: GroupedEvidence[];
-}
-
-function stableId(prefix: string, value: string): string {
-  return `${prefix}_${createHash("sha1").update(value, "utf8").digest("hex")}`;
-}
-
-function stableUuid(value: string): string {
-  const hex = createHash("sha1").update(value, "utf8").digest("hex").slice(0, 32).split("");
-  hex[12] = "5";
-  hex[16] = ((Number.parseInt(hex[16] || "0", 16) & 0x3) | 0x8).toString(16);
-  return `${hex.slice(0, 8).join("")}-${hex.slice(8, 12).join("")}-${hex.slice(12, 16).join("")}-${hex.slice(16, 20).join("")}-${hex.slice(20, 32).join("")}`;
-}
-
-function qdrantPointIdForRetrievalUnit(retrievalUnitId: string): string {
-  return stableUuid(`qdrant:${retrievalUnitId}`);
-}
-
-function parsePositiveIntegerEnv(name: string, fallback: number): number {
-  const raw = String(process.env[name] ?? "").trim();
-  if (!raw) {
-    return fallback;
-  }
-  const parsed = Number.parseInt(raw, 10);
-  if (!Number.isFinite(parsed) || parsed < 1) {
-    console.warn(`[traditional-rag] Invalid ${name}=${JSON.stringify(raw)}; using ${fallback}.`);
-    return fallback;
-  }
-  return parsed;
-}
-
-function getChunkThresholds(): ChunkThresholds {
-  const smallMaxChars = parsePositiveIntegerEnv(
-    "TRADITIONAL_RAG_SMALL_CHUNK_MAX_CHARS",
-    DEFAULT_SMALL_CHUNK_MAX_CHARS,
-  );
-  const normalMaxChars = parsePositiveIntegerEnv(
-    "TRADITIONAL_RAG_NORMAL_CHUNK_MAX_CHARS",
-    DEFAULT_NORMAL_CHUNK_MAX_CHARS,
-  );
-  if (normalMaxChars <= smallMaxChars) {
-    console.warn(
-      `[traditional-rag] Invalid thresholds: normal (${normalMaxChars}) must be greater than small (${smallMaxChars}); using defaults.`,
-    );
-    return {
-      smallMaxChars: DEFAULT_SMALL_CHUNK_MAX_CHARS,
-      normalMaxChars: DEFAULT_NORMAL_CHUNK_MAX_CHARS,
-    };
-  }
-  return { smallMaxChars, normalMaxChars };
-}
-
-function getEvidenceCharBudget(): number {
-  return parsePositiveIntegerEnv(
-    "TRADITIONAL_RAG_EVIDENCE_CHAR_BUDGET",
-    DEFAULT_EVIDENCE_CHAR_BUDGET,
-  );
-}
-
-function classifySize(text: string): "small" | "normal" | "oversized" {
-  const thresholds = getChunkThresholds();
-  const length = String(text || "").length;
-  if (length <= thresholds.smallMaxChars) {
-    return "small";
-  }
-  if (length <= thresholds.normalMaxChars) {
-    return "normal";
-  }
-  return "oversized";
-}
-
-function normalizeWhitespace(value: string): string {
-  return String(value || "").replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-}
-
-function mergeContinuedBlockMarkdown(left: string, right: string, blockType: string): string {
-  if (blockType !== "table") {
-    return normalizeWhitespace(`${left}\n\n${right}`);
-  }
-  const normalizedLeft = String(left || "").replace(/\r\n/g, "\n");
-  const normalizedRight = String(right || "").replace(/\r\n/g, "\n");
-  const leftTrimmed = normalizedLeft.replace(/(?:\n[ \t]*)+$/g, "");
-  const rightTrimmed = normalizedRight.replace(/^(?:[ \t]*\n)+/g, "");
-  if (!leftTrimmed.trim()) {
-    return rightTrimmed.trim();
-  }
-  if (!rightTrimmed.trim()) {
-    return leftTrimmed.trim();
-  }
-  return `${leftTrimmed}\n${rightTrimmed}`.trim();
-}
-
-function toFtsQuery(value: string): string {
-  const tokens = extractQueryTokens(value);
-  if (!tokens?.length) {
-    return String(value || "").replace(/["']/g, " ").trim();
-  }
-  return [...new Set(tokens)].map((token) => `"${token}"`).join(" OR ");
-}
-
-function parseJsonArray<T>(raw: string, fallback: T[] = []): T[] {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return Array.isArray(parsed) ? (parsed as T[]) : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-function bboxKey(bbox: [number, number, number, number]): string {
-  return JSON.stringify(bbox.map((value) => Number(value.toFixed(3))));
-}
-
-function extractQueryTokens(value: string): string[] {
-  return [...new Set(String(value || "").toLowerCase().match(/[\u4e00-\u9fff]{1,}|[a-z0-9_]{2,}/g) ?? [])];
-}
-
-function normalizeBaseUrl(baseUrl: string | null): string {
-  return (baseUrl?.trim() || "https://api.openai.com/v1").replace(/\/+$/, "");
-}
-
-function resolveServerBaseUrl(): string {
-  const configured = String(process.env.FS_EXPLORER_SERVER_BASE_URL ?? "").trim();
-  if (configured) {
-    return configured.replace(/\/+$/, "");
-  }
-  const port = parsePositiveIntegerEnv("FS_EXPLORER_PORT", 8000);
-  return `http://localhost:${port}`;
-}
-
-function toAbsoluteServerUrl(pathOrUrl: string): string {
-  const value = String(pathOrUrl || "").trim();
-  if (!value) {
-    return value;
-  }
-  if (/^https?:\/\//i.test(value)) {
-    return value;
-  }
-  return `${resolveServerBaseUrl()}${value.startsWith("/") ? value : `/${value}`}`;
-}
-
-function resolveTextRequestTimeoutMs(): number {
-  const raw = Number.parseInt(process.env.FS_EXPLORER_TEXT_TIMEOUT_MS || "", 10);
-  if (Number.isFinite(raw) && raw > 0) {
-    return raw;
-  }
-  return 60_000;
-}
+export type { ImageChunkRendering } from "./traditional-rag-shared.js";
 
 async function fetchWithTimeout(
   input: string,
@@ -514,6 +293,7 @@ async function createEmbeddings(
 async function describeImageWithVision(input: {
   bytes: Uint8Array;
   mimeType: string;
+  contextText?: string | null;
 }): Promise<ImageSemanticPayload | null> {
   const config = resolveVisionConfig();
   if (!config.apiKey) {
@@ -521,7 +301,7 @@ async function describeImageWithVision(input: {
   }
   const baseUrl = (config.baseUrl?.trim() || "https://api.openai.com/v1").replace(/\/+$/, "");
   const dataUrl = `data:${input.mimeType};base64,${Buffer.from(input.bytes).toString("base64")}`;
-  const prompts = buildVisionPromptMessages();
+  const prompts = buildVisionPromptMessages({ contextText: input.contextText ?? null });
   const payload = await fetchJsonWithTimeout(
     `${baseUrl}/chat/completions`,
     {
@@ -587,6 +367,7 @@ function buildAnswerSystemPrompt(variant: "json" | "stream"): string {
   if (variant === "json") {
     return (
       "Answer only from the numbered evidence. Do not reproduce long evidence excerpts. " +
+      "If you want to output with images, please use Markdown format them."+
       "Evidence blocks may contain direct links to the full content. For oversized evidence, the excerpt may be compressed and the link can be included in your answer when users should inspect the full content." +
       "Return strict JSON with keys answer and citations. citations must be an array of evidence numbers such as [1, 3]. " +
       "Use inline references like [1] in the answer when helpful."
@@ -594,6 +375,7 @@ function buildAnswerSystemPrompt(variant: "json" | "stream"): string {
   }
   return (
     "Answer only from the numbered evidence. Cite supporting evidence using [n]. " +
+    "If you want to output with images, please use Markdown format them."+
     "Do not quote or restate long evidence excerpts. If the evidence is insufficient, say so briefly. " +
     "Evidence blocks may contain direct links to the full content. For oversized evidence, the excerpt may be compressed and the link can be included in your answer when users should inspect the full content."
   );
@@ -649,11 +431,10 @@ function buildAnswerRequestPayload(input: {
 
 function buildFallbackAnswer(hits: GroupedEvidence[]): string {
   if (hits.length === 0) {
-    return "未召回到可用证据。";
+    return "No relevant evidence was found.";
   }
-  return `已召回 ${hits.length} 个相关片段，请查看下方“详情内容如下”。`;
+  return `Found ${hits.length} relevant evidence chunks.`;
 }
-
 async function answerWithCitations(input: {
   question: string;
   hits: GroupedEvidence[];
@@ -941,669 +722,6 @@ async function searchQdrant(documentId: string, vector: number[], limit: number)
   })).filter((item) => item.id);
 }
 
-function pageDominatedByType(unit: ParsedUnit, blockType: string): boolean {
-  if (!unit.blocks.length) {
-    return false;
-  }
-  const normalized = unit.blocks.filter((block) => normalizeWhitespace(block.markdown));
-  if (!normalized.length) {
-    return false;
-  }
-  const matching = normalized.filter((block) => block.block_type === blockType);
-  if (!matching.length) {
-    return false;
-  }
-  const matchedChars = matching.reduce((sum, block) => sum + block.markdown.length, 0);
-  const totalChars = normalized.reduce((sum, block) => sum + block.markdown.length, 0);
-  return matchedChars / Math.max(totalChars, 1) >= 0.7;
-}
-
-function ruleSummary(content: string, blockType: string): string {
-  const text = normalizeWhitespace(content);
-  if (!text) {
-    return "";
-  }
-  if (blockType === "table") {
-    const lines = text.split("\n").filter(Boolean).slice(0, 12);
-    return lines.join("\n").slice(0, 500);
-  }
-  const sentences = text.split(/(?<=[。！？.!?])\s+/).filter(Boolean);
-  if (sentences.length <= 3) {
-    return text.slice(0, 500);
-  }
-  const wordScores = new Map<string, number>();
-  for (const token of text.toLowerCase().match(/[\u4e00-\u9fff]{1,}|[a-z0-9_]{2,}/g) ?? []) {
-    wordScores.set(token, (wordScores.get(token) ?? 0) + 1);
-  }
-  const middle = sentences.slice(1, -1)
-    .map((sentence) => ({
-      sentence,
-      score: (sentence.toLowerCase().match(/[\u4e00-\u9fff]{1,}|[a-z0-9_]{2,}/g) ?? []).reduce(
-        (sum, token) => sum + (wordScores.get(token) ?? 0),
-        0,
-      ),
-    }))
-    .sort((left, right) => right.score - left.score)
-    .slice(0, 3)
-    .map((item) => item.sentence);
-  const ordered = [sentences[0], ...middle, sentences[sentences.length - 1]].join(" ");
-  return ordered.slice(0, 500);
-}
-
-function splitOversized(content: string, blockType: string): string[] {
-  const thresholds = getChunkThresholds();
-  const text = normalizeWhitespace(content);
-  if (text.length <= thresholds.normalMaxChars) {
-    return [text];
-  }
-  const units =
-    blockType === "table"
-      ? text.split("\n").filter(Boolean)
-      : text.split(/\n{2,}|(?<=[。！？.!?])\s+/).filter(Boolean);
-  const parts: string[] = [];
-  let current = "";
-  for (const piece of units) {
-    const candidate = current ? `${current}\n\n${piece}` : piece;
-    if (candidate.length <= thresholds.normalMaxChars) {
-      current = candidate;
-      continue;
-    }
-    if (current) {
-      parts.push(current);
-    }
-    if (piece.length <= thresholds.normalMaxChars) {
-      current = piece;
-      continue;
-    }
-    for (let index = 0; index < piece.length; index += thresholds.normalMaxChars) {
-      parts.push(piece.slice(index, index + thresholds.normalMaxChars));
-    }
-    current = "";
-  }
-  if (current) {
-    parts.push(current);
-  }
-  return parts;
-}
-
-function splitFixedChunkText(content: string, maxChars: number): string[] {
-  const text = String(content || "");
-  if (text.length <= maxChars) {
-    return [text];
-  }
-  const parts: string[] = [];
-  let remaining = text;
-  while (remaining.length > maxChars) {
-    const slice = remaining.slice(0, maxChars);
-    const bestBreakAt = Math.max(
-      slice.lastIndexOf("\n\n"),
-      slice.lastIndexOf("。"),
-      slice.lastIndexOf("！"),
-      slice.lastIndexOf("？"),
-      slice.lastIndexOf(". "),
-      slice.lastIndexOf(" "),
-    );
-    const breakAt = bestBreakAt >= 0 ? bestBreakAt : maxChars;
-    const end = breakAt > Math.floor(maxChars * 0.5) ? breakAt : maxChars;
-    parts.push(remaining.slice(0, end).trim());
-    remaining = remaining.slice(end).trimStart();
-  }
-  if (remaining.trim()) {
-    parts.push(remaining.trim());
-  }
-  return parts.filter((part) => part.length > 0);
-}
-
-function splitFixedChunkTextSmart(content: string, maxChars: number): string[] {
-  const text = normalizeWhitespace(String(content || ""));
-  if (text.length <= maxChars) {
-    return [text];
-  }
-  const parts: string[] = [];
-  let remaining = text;
-  while (remaining.length > maxChars) {
-    const slice = remaining.slice(0, maxChars);
-    const bestBreakAt = Math.max(
-      ...[
-        "\n## ",
-        "\n### ",
-        "\n#### ",
-        "\n- ",
-        "\n1. ",
-        "\n2. ",
-        "\n3. ",
-        "\n\n",
-        "\n",
-        "。",
-        "！",
-        "？",
-        "；",
-        ". ",
-        "; ",
-        " ",
-      ].map((marker) => slice.lastIndexOf(marker)),
-    );
-    const breakAt = bestBreakAt >= 0 ? bestBreakAt : maxChars;
-    const end = breakAt > Math.floor(maxChars * 0.5) ? breakAt : maxChars;
-    parts.push(slice.slice(0, end).trim());
-    remaining = remaining.slice(end).trimStart();
-  }
-  if (remaining.trim()) {
-    parts.push(remaining.trim());
-  }
-  return parts.filter((part) => part.length > 0);
-}
-
-function isHeadingLikeShortCenterSegment(segment: EvidenceSegment): boolean {
-  if (!segment.isCenter) {
-    return false;
-  }
-  if (segment.blockType && segment.blockType !== "text") {
-    return false;
-  }
-  const text = normalizeWhitespace(segment.mergedExcerpt);
-  if (!text || text.length > 160) {
-    return false;
-  }
-  const lines = String(segment.mergedExcerpt || "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  if (lines.length === 0) {
-    return false;
-  }
-  return lines.some((line) => {
-    const normalizedLine = line.replace(/\*+/g, "").trim();
-    return (
-      /^#{1,6}\s*/.test(line) ||
-      /^(section|chapter|appendix)\b/i.test(normalizedLine) ||
-      /(利润表|资产负债表|现金流量表|所有者权益变动表|附注|注释)$/.test(normalizedLine)
-    );
-  });
-}
-
-function uniqueOrdered<T>(values: T[]): T[] {
-  return [...new Set(values)];
-}
-
-function sourceLocatorFromPages(pageNos: number[]): string | null {
-  const normalized = uniqueOrdered(
-    pageNos.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0),
-  );
-  if (normalized.length === 0) {
-    return null;
-  }
-  if (normalized.length === 1) {
-    return `page-${normalized[0]}`;
-  }
-  return `pages-${normalized.join("-")}`;
-}
-
-function buildCerSegmentLabels(citationNo: number, segments: EvidenceSegment[]): string[] {
-  if (segments.length === 0) {
-    return [];
-  }
-  const labels = new Array<string>(segments.length).fill(`chunk[${citationNo}]`);
-  const centerIndex = segments.findIndex((segment) => segment.isCenter);
-  if (centerIndex < 0) {
-    return labels;
-  }
-  labels[centerIndex] = `chunk[${citationNo}]`;
-  let previousCount = 0;
-  for (let index = centerIndex - 1; index >= 0; index -= 1) {
-    previousCount += 1;
-    labels[index] = `chunk[${citationNo}-p-${previousCount}]`;
-  }
-  let nextCount = 0;
-  for (let index = centerIndex + 1; index < segments.length; index += 1) {
-    nextCount += 1;
-    labels[index] = `chunk[${citationNo}-n-${nextCount}]`;
-  }
-  return labels;
-}
-
-function composeSegmentContent(segment: EvidenceSegment, chunkLabel: string): string {
-  return composeEvidenceContent({
-    chunkLabel,
-    summaryText: segment.summaryText,
-    mergedExcerpt: segment.mergedExcerpt,
-    sourceLink: segment.sourceLink,
-    includeSource: segment.isOversized,
-  });
-}
-
-function sentenceSplit(text: string): string[] {
-  const normalized = normalizeWhitespace(text);
-  if (!normalized) {
-    return [];
-  }
-  const sentences = normalized
-    .split(/(?<=[\n。！？!?])\s+/)
-    .map((value) => value.trim())
-    .filter(Boolean);
-  return sentences.length ? sentences : [normalized];
-}
-
-function isTableSegment(segment: EvidenceSegment): boolean {
-  return segment.blockType === "table";
-}
-
-function extractRelevantTextSegment(text: string, queryTokens: string[]): string {
-  const sentences = sentenceSplit(text);
-  if (sentences.length <= 2 || queryTokens.length === 0) {
-    return normalizeWhitespace(text);
-  }
-  const lowered = sentences.map((sentence) => sentence.toLowerCase());
-  const hits = lowered
-    .map((sentence, index) => ({
-      index,
-      matched: queryTokens.some((token) => sentence.includes(token)),
-    }))
-    .filter((item) => item.matched)
-    .map((item) => item.index);
-  if (hits.length === 0) {
-    return compressExcerptAroundKeywords(text, queryTokens, Math.min(Math.max(text.length, 160), CER_CONTEXT_EXCERPT_TARGET));
-  }
-  const keep = new Set<number>();
-  for (const index of hits) {
-    keep.add(index);
-    if (index > 0) {
-      keep.add(index - 1);
-    }
-    if (index + 1 < sentences.length) {
-      keep.add(index + 1);
-    }
-  }
-  return [...keep]
-    .sort((left, right) => left - right)
-    .map((index) => sentences[index] ?? "")
-    .filter(Boolean)
-    .join("\n");
-}
-
-function extractRelevantTableSegment(text: string, queryTokens: string[]): string {
-  const lines = normalizeWhitespace(text).split("\n").map((line) => line.trim()).filter(Boolean);
-  if (lines.length <= 3 || queryTokens.length === 0) {
-    return normalizeWhitespace(text);
-  }
-  const keep = new Set<number>();
-  keep.add(0);
-  for (let index = 0; index < lines.length; index += 1) {
-    const lowered = lines[index]!.toLowerCase();
-    if (!queryTokens.some((token) => lowered.includes(token))) {
-      continue;
-    }
-    keep.add(index);
-    if (index > 0) {
-      keep.add(index - 1);
-    }
-    if (index + 1 < lines.length) {
-      keep.add(index + 1);
-    }
-  }
-  if (keep.size <= 1) {
-    return compressExcerptAroundKeywords(text, queryTokens, Math.min(Math.max(text.length, 160), CER_CONTEXT_EXCERPT_TARGET));
-  }
-  return [...keep]
-    .sort((left, right) => left - right)
-    .map((index) => lines[index] ?? "")
-    .filter(Boolean)
-    .join("\n");
-}
-
-function extractRelevantSegment(segment: EvidenceSegment, queryTokens: string[]): string {
-  if (!segment.mergedExcerpt) {
-    return segment.mergedExcerpt;
-  }
-  return isTableSegment(segment)
-    ? extractRelevantTableSegment(segment.mergedExcerpt, queryTokens)
-    : extractRelevantTextSegment(segment.mergedExcerpt, queryTokens);
-}
-
-function materializeEvidenceItem(item: GroupedEvidence): GroupedEvidence {
-  const cerSegments = item.cerSegments.map((segment) =>
-    segment.isCenter
-      ? {
-          ...segment,
-          summaryText: item.summaryText,
-          mergedExcerpt: item.mergedExcerpt,
-          sourceLink: item.sourceLink,
-          sourceLocator: item.sourceLocator,
-          pageNos: item.pageNos,
-          isOversized: item.hasOversizedSplitChild,
-        }
-      : segment,
-  );
-  const baseContent = composeEvidenceContent({
-    chunkLabel: `chunk[${item.citationNo}]`,
-    summaryText: item.summaryText,
-    mergedExcerpt: item.mergedExcerpt,
-    sourceLink: item.sourceLink,
-    includeSource: item.hasOversizedSplitChild,
-  });
-  const cerLabels = buildCerSegmentLabels(item.citationNo, cerSegments);
-  const enrichedContent = cerSegments
-    .map((segment, segmentIndex) => composeSegmentContent(segment, cerLabels[segmentIndex] || `chunk[${item.citationNo}]`))
-    .filter((value) => String(value || "").trim())
-    .join("\n\n");
-  return {
-    ...item,
-    cerSegments,
-    baseContent,
-    enrichedContent,
-    content: enrichedContent || baseContent,
-    cerApplied: cerSegments.length > 1,
-    cerContextRefs: cerSegments
-      .filter((segment) => !segment.isCenter)
-      .map((segment) => ({
-        reference_id: segment.referenceId,
-        reference_kind: segment.referenceKind,
-        role: "context" as const,
-        source_locator: segment.sourceLocator,
-        source_link: segment.sourceLink,
-        page_nos: segment.pageNos,
-      })),
-  };
-}
-
-function toPublicChunkReference(
-  item: GroupedEvidence,
-  options: { includeCerDebug?: boolean } = {},
-): TraditionalRagChunkReference {
-  const base = {
-    citation_no: item.citationNo,
-    reference_id: item.referenceId,
-    reference_kind: item.referenceKind,
-    document_id: item.documentId,
-    document_name: item.documentName,
-    source_locator: item.sourceLocator,
-    show_full_chunk_detail: false,
-    document_chunk_ids: item.documentChunkIds,
-    retrieval_unit_ids: item.retrievalUnitIds,
-    page_nos: item.pageNos,
-    bboxes: item.bboxes,
-    score: item.score,
-    source_link: item.sourceLink,
-    compression_applied: item.compressionApplied,
-  };
-  if (!options.includeCerDebug) {
-    return base;
-  }
-  return {
-    ...base,
-    debug_cer_applied: item.cerApplied,
-    debug_cer_context_refs: item.cerContextRefs,
-    debug_enriched_content: item.content,
-  };
-}
-
-function toPublicChunkReferences(
-  items: GroupedEvidence[],
-  options: { includeCerDebug?: boolean } = {},
-): TraditionalRagChunkReference[] {
-  const detailIds = new Set(selectHighScoreOversizedChunks(items).map((item) => item.referenceId));
-  return items.map((item) => ({
-    ...toPublicChunkReference(item, options),
-    show_full_chunk_detail: detailIds.has(item.referenceId),
-  }));
-}
-
-function toPublicDetailChunks(items: GroupedEvidence[]): TraditionalRagDetailChunk[] {
-  const detailMap = new Map<string, TraditionalRagDetailChunk>();
-  for (const item of items) {
-    const add = (chunk: TraditionalRagDetailChunk) => {
-      const key = `${chunk.reference_kind}:${chunk.reference_id}`;
-      if (!detailMap.has(key)) {
-        detailMap.set(key, chunk);
-      }
-    };
-    if (item.referenceKind === "retrieval_chunk" && item.hasOversizedSplitChild) {
-      add({
-        ...toPublicChunkReference(item),
-        show_full_chunk_detail: true,
-      });
-    }
-    if (item.referenceKind === "document_chunk" && item.hasOversizedSplitChild) {
-      add({
-        ...toPublicChunkReference(item),
-        show_full_chunk_detail: true,
-      });
-    }
-    for (const segment of item.cerSegments) {
-      if (!segment.isOversized || !segment.sourceLink) {
-        continue;
-      }
-      add({
-        citation_no: item.citationNo,
-        reference_id: segment.referenceId,
-        reference_kind: segment.referenceKind,
-        document_id: item.documentId,
-        document_name: item.documentName,
-        source_locator: segment.sourceLocator,
-        show_full_chunk_detail: true,
-        document_chunk_ids:
-          segment.referenceKind === "retrieval_chunk" && segment.referenceId === item.referenceId
-            ? item.documentChunkIds
-            : segment.referenceKind === "document_chunk"
-              ? [segment.referenceId]
-              : [],
-        retrieval_unit_ids: item.retrievalUnitIds,
-        page_nos: segment.pageNos,
-        bboxes: [],
-        score: item.score,
-        source_link: segment.sourceLink,
-        compression_applied: item.compressionApplied,
-      });
-    }
-  }
-  return [...detailMap.values()];
-}
-
-function answerContainsAnyDetailLink(answer: string, detailChunks: TraditionalRagDetailChunk[]): boolean {
-  const normalized = String(answer || "");
-  return detailChunks.some((item) => item.source_link && normalized.includes(item.source_link));
-}
-
-function parseCitationNumbers(value: string): number[] {
-  const citations: number[] = [];
-  for (const match of String(value || "").matchAll(/\[(\d+(?:\s*,\s*\d+)*)\]/g)) {
-    const raw = String(match[1] ?? "");
-    for (const piece of raw.split(",")) {
-      const parsed = Number.parseInt(piece.trim(), 10);
-      if (Number.isFinite(parsed) && parsed > 0) {
-        citations.push(parsed);
-      }
-    }
-  }
-  return uniqueOrdered(citations);
-}
-
-function selectHighScoreOversizedChunks(chunks: GroupedEvidence[]): GroupedEvidence[] {
-  const oversized = chunks.filter((item) => item.hasOversizedSplitChild);
-  if (oversized.length === 0) {
-    return [];
-  }
-  const maxScore = Math.max(...oversized.map((item) => item.score), 0);
-  const threshold = maxScore * 0.85;
-  return oversized.filter((item) => item.score >= threshold);
-}
-
-function appendOversizedChunkLinks(answer: string, chunks: GroupedEvidence[]): string {
-  const selected = selectHighScoreOversizedChunks(chunks).filter((item) => item.sourceLink);
-  if (selected.length === 0) {
-    return answer;
-  }
-  const links = uniqueOrdered(
-    selected.map(
-      (item) =>
-        `- [引用 ${item.citationNo} 对应完整块](${item.sourceLink})`,
-    ),
-  );
-  const suffix = `详情内容如下：\n${links.join("\n")}`;
-  const trimmed = String(answer || "").trim();
-  if (!trimmed) {
-    return suffix;
-  }
-  if (links.every((link) => trimmed.includes(link))) {
-    return trimmed;
-  }
-  return `${trimmed}\n\n${suffix}`;
-}
-
-function composeEvidenceContent(input: {
-  chunkLabel: string;
-  summaryText: string | null;
-  mergedExcerpt: string;
-  sourceLink: string;
-  includeSource?: boolean;
-}): string {
-  const summaryBlock = input.summaryText ? `${input.chunkLabel} summary:\n${input.summaryText}` : null;
-  const excerptBlock = `${input.chunkLabel} compressed excerpt:\n${input.mergedExcerpt}`;
-  const oversizedNote =
-    input.includeSource && input.sourceLink
-      ? (
-          `Note: the ${input.chunkLabel} is shown as a compressed excerpt. ` +
-          `Full content is available at ${input.sourceLink}, and you may provide this link directly to the user when it is helpful.`
-        )
-      : null;
-  return [summaryBlock, excerptBlock, oversizedNote]
-    .filter((value) => String(value || "").trim())
-    .join("\n\n");
-}
-
-function fallbackCompressExcerpt(text: string, targetLength: number): string {
-  const normalized = normalizeWhitespace(text);
-  if (normalized.length <= targetLength) {
-    return normalized;
-  }
-  if (targetLength <= 12) {
-    return normalized.slice(0, Math.max(targetLength, 0));
-  }
-  const head = Math.max(Math.floor(targetLength * 0.35), 4);
-  const tail = Math.max(targetLength - head - 3, 4);
-  return `${normalized.slice(0, head)}...${normalized.slice(Math.max(normalized.length - tail, head))}`;
-}
-
-function compressExcerptAroundKeywords(text: string, queryTokens: string[], targetLength: number): string {
-  const normalized = normalizeWhitespace(text);
-  if (normalized.length <= targetLength) {
-    return normalized;
-  }
-  if (targetLength <= 24) {
-    return fallbackCompressExcerpt(normalized, targetLength);
-  }
-  const lowered = normalized.toLowerCase();
-  const anchorIndexes = queryTokens
-    .map((token) => lowered.indexOf(token))
-    .filter((index) => index >= 0)
-    .sort((left, right) => left - right);
-  if (anchorIndexes.length === 0) {
-    return fallbackCompressExcerpt(normalized, targetLength);
-  }
-  const center = Math.round(anchorIndexes.reduce((sum, index) => sum + index, 0) / anchorIndexes.length);
-  const focusLength = Math.max(Math.floor(targetLength * 0.55), Math.min(240, targetLength));
-  const focusStart = Math.max(0, Math.min(center - Math.floor(focusLength / 2), normalized.length - focusLength));
-  const focusEnd = Math.min(normalized.length, focusStart + focusLength);
-  const focus = normalized.slice(focusStart, focusEnd).trim();
-  let remaining = targetLength - focus.length;
-  if (remaining <= 3) {
-    return focus.slice(0, targetLength);
-  }
-  const leftRoom = Math.max(Math.floor(remaining * 0.45), 0);
-  const rightRoom = Math.max(remaining - leftRoom - 6, 0);
-  const leftPart = focusStart > 0 ? fallbackCompressExcerpt(normalized.slice(0, focusStart), leftRoom).trim() : "";
-  const rightPart =
-    focusEnd < normalized.length
-      ? fallbackCompressExcerpt(normalized.slice(focusEnd), rightRoom).trim()
-      : "";
-  const parts = [
-    leftPart ? `${leftPart}...` : "",
-    focus,
-    rightPart ? `...${rightPart}` : "",
-  ].filter(Boolean);
-  const result = parts.join("\n");
-  return result.length <= targetLength ? result : fallbackCompressExcerpt(result, targetLength);
-}
-
-function compressEvidenceItems(
-  items: GroupedEvidence[],
-  question: string,
-  budget: number,
-): GroupedEvidence[] {
-  const queryTokens = extractQueryTokens(question);
-  const materialized = items.map((item) => materializeEvidenceItem(item));
-  const totalLength = materialized.reduce((sum, item) => sum + item.content.length, 0);
-  if (totalLength <= budget) {
-    return materialized;
-  }
-  const contextCompressed = materialized.map((item) => {
-    let changed = false;
-    const cerSegments = item.cerSegments.map((segment) => {
-      if (segment.isCenter || !segment.mergedExcerpt) {
-        return segment;
-      }
-      const maxLength = segment.referenceKind === "document_chunk" ? CER_CONTEXT_EXCERPT_TARGET : 240;
-      if (segment.mergedExcerpt.length <= maxLength) {
-        return segment;
-      }
-      changed = true;
-      return {
-        ...segment,
-        mergedExcerpt: compressExcerptAroundKeywords(segment.mergedExcerpt, queryTokens, maxLength),
-      };
-    });
-    return changed
-      ? materializeEvidenceItem({
-          ...item,
-          cerSegments,
-          compressionApplied: true,
-        })
-      : item;
-  });
-  const contextCompressedLength = contextCompressed.reduce((sum, item) => sum + item.content.length, 0);
-  if (contextCompressedLength <= budget) {
-    return contextCompressed;
-  }
-  const lockedLength = contextCompressed.reduce(
-    (sum, item) => sum + Math.max(item.content.length - item.mergedExcerpt.length, 0),
-    0,
-  );
-  const availableForExcerpts = Math.max(budget - lockedLength, 0);
-  const totalExcerptLength = contextCompressed.reduce((sum, item) => sum + item.mergedExcerpt.length, 0);
-  const compressed = contextCompressed.map((item) => {
-    if (!item.mergedExcerpt) {
-      return item;
-    }
-    const share =
-      totalExcerptLength > 0
-        ? item.mergedExcerpt.length / totalExcerptLength
-        : 1 / Math.max(contextCompressed.length, 1);
-    const targetLength = Math.max(Math.floor(availableForExcerpts * share), 80);
-    if (item.mergedExcerpt.length <= targetLength) {
-      return item;
-    }
-    const mergedExcerpt = compressExcerptAroundKeywords(item.mergedExcerpt, queryTokens, targetLength);
-    return materializeEvidenceItem({
-      ...item,
-      mergedExcerpt,
-      compressionApplied: true,
-    });
-  });
-  let running = compressed.reduce((sum, item) => sum + item.content.length, 0);
-  if (running <= budget) {
-    return compressed;
-  }
-  const sortedByScore = [...compressed].sort((left, right) => left.score - right.score);
-  const dropped = new Set<string>();
-  for (const item of sortedByScore) {
-    if (running <= budget) {
-      break;
-    }
-    dropped.add(item.referenceId);
-    running -= item.content.length;
-  }
-  return compressed.filter((item) => !dropped.has(item.referenceId));
-}
 
 export class TraditionalRagService {
   private readonly pythonAssets = new PythonDocumentAssetBridge();
@@ -1620,18 +738,19 @@ export class TraditionalRagService {
     parsedDocument: ParsedDocument;
     enableEmbedding?: boolean;
     enableImageSemantic?: boolean;
+    retrievalChunkingStrategy?: "small_to_big" | "fixed";
   }): Promise<{ pageChunkCounts: Map<number, number>; chunksWritten: number; retrievalChunksWritten: number; embeddingsWritten: number }> {
     const imageRenderMap = await this.processImages({
       ...input,
       enableImageSemantic: input.enableImageSemantic !== false,
     });
-    const sourceChunks = this.buildSourceChunks({
+    const sourceChunks = buildSourceChunks({
       documentId: input.documentId,
       parsedDocument: input.parsedDocument,
       imageRenderMap,
     });
-    const retrievalChunks = this.buildRetrievalChunks(input.documentId, sourceChunks);
-    const documentChunks = this.buildIndexedDocumentChunks(input.documentId, sourceChunks, retrievalChunks);
+    const retrievalChunks = buildRetrievalChunks(input.documentId, sourceChunks);
+    const documentChunks = buildIndexedDocumentChunks(input.documentId, sourceChunks, retrievalChunks);
     this.storage.replaceDocumentChunks(input.documentId, documentChunks);
     this.storage.replaceRetrievalChunks(input.documentId, retrievalChunks);
 
@@ -1679,9 +798,15 @@ export class TraditionalRagService {
       unitText: string;
     }>,
   ): Promise<number> {
+    const document = this.storage?.getDocument?.(documentId) ?? null;
+    const strategy = document?.retrieval_chunking_strategy === "fixed" ? "fixed" : "small_to_big";
+    const embeddingTexts =
+      strategy === "small_to_big"
+        ? this.buildEmbeddingTextsForDocumentChunks(documentId, retrievalUnits)
+        : retrievalUnits.map((chunk) => ({ id: chunk.id, text: chunk.unitText }));
     return rebuildQdrantCollection(
       documentId,
-      retrievalUnits.map((chunk) => ({ id: chunk.id, text: chunk.unitText })),
+      embeddingTexts,
     );
   }
 
@@ -1691,6 +816,7 @@ export class TraditionalRagService {
     originalFilename: string;
     parsedDocument: ParsedDocument;
     enableImageSemantic?: boolean;
+    retrievalChunkingStrategy?: "small_to_big" | "fixed";
   }): Promise<Map<string, ImageChunkRendering>> {
     return this.processImages({
       ...input,
@@ -1703,31 +829,141 @@ export class TraditionalRagService {
     parsedDocument: ParsedDocument;
     imageRenderMap: Map<string, ImageChunkRendering>;
   }): SourceChunkRecord[] {
-    return this.buildSourceChunks(input);
+    return buildSourceChunks(input);
   }
 
   createRetrievalChunks(
     documentId: string,
     documentChunks: SourceChunkRecord[],
-  ): StorageRetrievalChunkRecord[] {
-    return this.buildRetrievalChunks(documentId, documentChunks);
+  ) {
+    return buildRetrievalChunks(documentId, documentChunks);
   }
 
   createFixedRetrievalChunks(input: {
     documentId: string;
     sourceChunks: SourceChunkRecord[];
     fixedChunkChars: number;
-  }): StorageFixedRetrievalChunkRecord[] {
-    return this.buildFixedRetrievalChunks(input);
+  }) {
+    return buildFixedRetrievalChunks(input);
   }
 
   createIndexedDocumentChunks(
     documentId: string,
     sourceChunks: SourceChunkRecord[],
-    retrievalChunks: StorageRetrievalChunkRecord[],
-    fixedRetrievalChunks: StorageFixedRetrievalChunkRecord[] = [],
-  ): StorageDocumentChunkRecord[] {
-    return this.buildIndexedDocumentChunks(documentId, sourceChunks, retrievalChunks, fixedRetrievalChunks);
+    retrievalChunks: ReturnType<typeof buildRetrievalChunks>,
+    fixedRetrievalChunks: ReturnType<typeof buildFixedRetrievalChunks> = [],
+  ) {
+    return buildIndexedDocumentChunks(documentId, sourceChunks, retrievalChunks, fixedRetrievalChunks);
+  }
+
+  private buildEmbeddingTextsForDocumentChunks(
+    documentId: string,
+    retrievalUnits: Array<{
+      id: string;
+      unitText: string;
+    }>,
+  ): Array<{ id: string; text: string }> {
+    const storedChunks = this.storage?.listDocumentChunks?.(documentId) ?? [];
+    if (storedChunks.length === 0) {
+      return retrievalUnits.map((chunk) => ({ id: chunk.id, text: chunk.unitText }));
+    }
+    const chunkById = new Map(storedChunks.map((chunk) => [chunk.id, chunk] as const));
+    const orderedChunks = [...storedChunks].sort((left, right) => left.ordinal - right.ordinal);
+    const previousNonPictureById = new Map<string, StoredDocumentChunk | null>();
+    let previousNonPicture: StoredDocumentChunk | null = null;
+    for (const chunk of orderedChunks) {
+      previousNonPictureById.set(chunk.id, previousNonPicture);
+      if (chunk.block_type !== "picture" && normalizeWhitespace(chunk.content_md)) {
+        previousNonPicture = chunk;
+      }
+    }
+    const maxChars = embeddingCharBudget();
+    const neighborMaxChars = parsePositiveIntegerEnv(
+      "EMBEDDING_IMAGE_NEIGHBOR_MAX_CHARS",
+      DEFAULT_EMBEDDING_IMAGE_NEIGHBOR_MAX_CHARS,
+    );
+    return retrievalUnits.map((chunk) => {
+      const storedChunk = chunkById.get(chunk.id);
+      if (!storedChunk || storedChunk.block_type !== "picture") {
+        return { id: chunk.id, text: chunk.unitText };
+      }
+      const previousChunk = previousNonPictureById.get(chunk.id) ?? null;
+      const previousText = previousChunk
+        ? normalizeEmbeddingNeighborText(previousChunk.summary_text || previousChunk.content_md, neighborMaxChars)
+        : "";
+      const combined = this.composePictureEmbeddingText({
+        pictureText: storedChunk.content_md,
+        previousChunkText: previousText,
+        maxChars,
+      });
+      return {
+        id: chunk.id,
+        text: combined || truncateTextPreservingImageLinks(storedChunk.content_md, maxChars),
+      };
+    });
+  }
+
+  private composePictureEmbeddingText(input: {
+    pictureText: string;
+    previousChunkText?: string | null;
+    maxChars: number;
+  }): string {
+    const pictureText = normalizeWhitespace(input.pictureText);
+    if (!pictureText) {
+      return pictureText;
+    }
+    const previousChunkText = normalizeWhitespace(input.previousChunkText ?? "");
+    const baseLength = pictureText.length;
+    if (!previousChunkText) {
+      return truncateTextPreservingImageLinks(pictureText, input.maxChars);
+    }
+    const separatorLength = 2;
+    if (baseLength + separatorLength + previousChunkText.length <= input.maxChars) {
+      return normalizeWhitespace([pictureText, previousChunkText].join("\n\n"));
+    }
+    if (baseLength + separatorLength <= input.maxChars) {
+      const remaining = Math.max(input.maxChars - baseLength - separatorLength, 0);
+      const trimmedNeighbor = normalizeEmbeddingNeighborText(previousChunkText, remaining);
+      return normalizeWhitespace([pictureText, trimmedNeighbor].filter(Boolean).join("\n\n"));
+    }
+    return truncateTextPreservingImageLinks(pictureText, input.maxChars);
+  }
+
+  private findPreviousNonPictureBlockMarkdown(
+    parsedDocument: ParsedDocument,
+    targetImage: ParsedImage,
+  ): string | null {
+    let previousNonPicture: string | null = null;
+    for (const unit of parsedDocument.units) {
+      const blocks = unit.blocks.length
+        ? unit.blocks
+        : [
+            {
+              index: 0,
+              block_type: "text",
+              bbox: [0, 0, 0, 0] as [number, number, number, number],
+              markdown: unit.markdown,
+              char_count: unit.markdown.length,
+              image_hash: null,
+              source_image_index: null,
+            },
+          ];
+      for (const block of blocks) {
+        const blockMarkdown = normalizeWhitespace(block.markdown);
+        if (block.block_type !== "picture" && blockMarkdown) {
+          previousNonPicture = blockMarkdown;
+        }
+        if (
+          unit.unit_no === targetImage.page_no &&
+          block.block_type === "picture" &&
+          block.image_hash === targetImage.image_hash &&
+          (block.source_image_index == null || block.source_image_index === targetImage.image_index)
+        ) {
+          return previousNonPicture;
+        }
+      }
+    }
+    return previousNonPicture;
   }
 
   async deleteDocumentIndex(documentId: string): Promise<void> {
@@ -2040,31 +1276,15 @@ export class TraditionalRagService {
       getEvidenceCharBudget(),
     ).map((item, index) => {
       const citationNo = index + 1;
-      const cerSegments = item.cerSegments.map((segment) => ({
-        ...segment,
-        citationNo,
-      }));
-      const baseContent = composeEvidenceContent({
-        chunkLabel: `chunk[${citationNo}]`,
-        summaryText: item.summaryText,
-        mergedExcerpt: item.mergedExcerpt,
-        sourceLink: item.sourceLink,
-        includeSource: item.hasOversizedSplitChild,
-      });
-      const cerLabels = buildCerSegmentLabels(citationNo, cerSegments);
-      const enrichedContent = cerSegments
-        .map((segment, segmentIndex) => composeSegmentContent(segment, cerLabels[segmentIndex] || `chunk[${citationNo}]`))
-        .filter((value) => String(value || "").trim())
-        .join("\n\n");
-      return {
+      return materializeEvidenceItem({
         ...item,
         citationNo,
-        cerSegments,
-        baseContent,
-        enrichedContent,
-        content: enrichedContent || baseContent,
+        cerSegments: item.cerSegments.map((segment) => ({
+          ...segment,
+          citationNo,
+        })),
         sourceLocator: item.sourceLocator || sourceLocatorFromPages(item.pageNos),
-      };
+      });
     });
 
     return {
@@ -2603,6 +1823,7 @@ export class TraditionalRagService {
     originalFilename: string;
     parsedDocument: ParsedDocument;
     enableImageSemantic: boolean;
+    retrievalChunkingStrategy?: "small_to_big" | "fixed";
   }): Promise<Map<string, ImageChunkRendering>> {
     const renderMap = new Map<string, ImageChunkRendering>();
     const allParsedImages = input.parsedDocument.units.flatMap((unit) => unit.images.map((image) => ({ unit, image })));
@@ -2678,7 +1899,12 @@ export class TraditionalRagService {
         pageBudget < Number(process.env.VISION_MAX_SEMANTIC_PER_PAGE || 3) &&
         docBudget < Number(process.env.VISION_MAX_SEMANTIC_PER_DOC || 50)
       ) {
-        const cached = this.storage.getImageSemanticCache(image.image_hash, IMAGE_PROMPT_VERSION);
+        const contextText =
+          input.retrievalChunkingStrategy === "fixed"
+            ? null
+            : this.findPreviousNonPictureBlockMarkdown(input.parsedDocument, image);
+        const cacheVersion = imageSemanticCacheVersion(contextText);
+        const cached = this.storage.getImageSemanticCache(image.image_hash, cacheVersion);
         if (cached) {
           semanticPayload = {
             recognizable: cached.recognizable,
@@ -2697,11 +1923,12 @@ export class TraditionalRagService {
           semanticPayload = await describeImageWithVision({
             bytes: compressedBytes,
             mimeType: compressedMime,
+            contextText,
           });
           if (semanticPayload) {
             this.storage.upsertImageSemanticCache({
               imageHash: image.image_hash,
-              promptVersion: IMAGE_PROMPT_VERSION,
+              promptVersion: cacheVersion,
               recognizable: Boolean(semanticPayload.recognizable),
               imageKind: semanticPayload.image_kind ?? null,
               containsText: semanticPayload.contains_text ?? null,
@@ -2774,338 +2001,4 @@ export class TraditionalRagService {
     return renderMap;
   }
 
-  private buildSourceChunks(input: {
-    documentId: string;
-    parsedDocument: ParsedDocument;
-    imageRenderMap: Map<string, ImageChunkRendering>;
-  }): SourceChunkRecord[] {
-    const perPage = input.parsedDocument.units.map((unit) => ({
-      unitNo: unit.unit_no,
-      blocks: this.renderUnitBlocks(unit, input.imageRenderMap),
-    }));
-    const records: SourceChunkRecord[] = [];
-    let documentIndex = 0;
-    for (let pageIndex = 0; pageIndex < perPage.length; pageIndex += 1) {
-      const page = perPage[pageIndex]!;
-      for (let blockIndex = 0; blockIndex < page.blocks.length; blockIndex += 1) {
-        const block = page.blocks[blockIndex]!;
-        if (!normalizeWhitespace(block.markdown)) {
-          continue;
-        }
-        let mergedContent = block.markdown;
-        const mergedPageNos = [page.unitNo];
-        const mergedBboxes = [block.bbox];
-        let scanPageIndex = pageIndex;
-        while (
-          ["table", "text"].includes(block.block_type) &&
-          scanPageIndex + 1 < perPage.length &&
-          blockIndex === page.blocks.length - 1
-        ) {
-          const nextPage = perPage[scanPageIndex + 1]!;
-          const nextHead = nextPage.blocks[0];
-          const nextUnit = input.parsedDocument.units[scanPageIndex + 1]!;
-          if (!nextHead || nextHead.block_type !== block.block_type || !pageDominatedByType(nextUnit, block.block_type)) {
-            break;
-          }
-          mergedContent = mergeContinuedBlockMarkdown(mergedContent, nextHead.markdown, block.block_type);
-          mergedPageNos.push(nextPage.unitNo);
-          mergedBboxes.push(nextHead.bbox);
-          nextPage.blocks = nextPage.blocks.slice(1);
-          scanPageIndex += 1;
-        }
-        const sizeClass = classifySize(mergedContent);
-        const record: SourceChunkRecord = {
-          id: stableId("schunk", `${input.documentId}:${documentIndex}:${page.unitNo}:${block.index}:${mergedContent}`),
-          documentId: input.documentId,
-          pageNo: page.unitNo,
-          documentIndex,
-          pageIndex: block.index,
-          blockType: block.block_type,
-          bboxJson: JSON.stringify(block.bbox),
-          contentMd: mergedContent,
-          sizeClass,
-          summaryText: sizeClass === "oversized" ? ruleSummary(mergedContent, block.block_type) : null,
-          mergedPageNosJson: JSON.stringify(mergedPageNos),
-          mergedBboxesJson: JSON.stringify(mergedBboxes.map((bbox) => [...bbox])),
-        };
-        records.push(record);
-        documentIndex += 1;
-      }
-    }
-    return records;
-  }
-
-  private renderUnitBlocks(
-    unit: ParsedUnit,
-    imageRenderMap: Map<string, ImageChunkRendering>,
-  ): ParsedBlock[] {
-    const blocks = unit.blocks.length
-      ? [...unit.blocks]
-      : [
-          {
-            index: 0,
-            block_type: "text",
-            bbox: [0, 0, 0, 0],
-            markdown: unit.markdown,
-            char_count: unit.markdown.length,
-            image_hash: null,
-            source_image_index: null,
-          },
-        ];
-    return blocks
-      .map((block) => {
-        if (block.block_type !== "picture" || !block.image_hash) {
-          return block;
-        }
-        const rendered = imageRenderMap.get(block.image_hash);
-        return {
-          ...block,
-          markdown: rendered?.dropped ? "" : rendered?.markdown || block.markdown,
-          char_count: (rendered?.markdown || block.markdown).length,
-        };
-      })
-      .filter((block) => normalizeWhitespace(block.markdown));
-  }
-
-  private buildRetrievalChunks(
-    documentId: string,
-    documentChunks: SourceChunkRecord[],
-  ): StorageRetrievalChunkRecord[] {
-    const thresholds = getChunkThresholds();
-    const records: StorageRetrievalChunkRecord[] = [];
-    let ordinal = 0;
-    let pendingSmall: SourceChunkRecord[] = [];
-    const createContextChunk = (
-      chunks: SourceChunkRecord[],
-      contentMd: string,
-      input: { sizeClass?: "small" | "normal" | "oversized"; summaryText?: string | null } = {},
-    ): StorageRetrievalChunkRecord => {
-      const sourceDocumentChunkIds = chunks.map((item) => item.id);
-      const pageNos = uniqueOrdered(
-        chunks.flatMap((item) => parseJsonArray<number>(item.mergedPageNosJson ?? "[]", [item.pageNo])),
-      );
-      const bboxes = chunks.flatMap((item) =>
-        parseJsonArray<[number, number, number, number]>(
-          item.mergedBboxesJson ?? "[]",
-          [JSON.parse(item.bboxJson) as [number, number, number, number]],
-        ),
-      );
-      return {
-        id: stableId("rchunk", `${documentId}:${ordinal}:${sourceDocumentChunkIds.join(",")}:${contentMd}`),
-        documentId,
-        ordinal,
-        contentMd,
-        sizeClass: input.sizeClass ?? classifySize(contentMd),
-        summaryText: input.summaryText ?? null,
-        sourceDocumentChunkIdsJson: JSON.stringify(sourceDocumentChunkIds),
-        pageNosJson: JSON.stringify(pageNos),
-        sourceLocator: sourceLocatorFromPages(pageNos),
-        bboxesJson: JSON.stringify(bboxes),
-      };
-    };
-    const flushPending = () => {
-      if (pendingSmall.length === 0) {
-        return;
-      }
-      const text = normalizeWhitespace(pendingSmall.map((item) => item.contentMd).join("\n\n"));
-      records.push(createContextChunk(pendingSmall, text));
-      ordinal += 1;
-      pendingSmall = [];
-    };
-
-    for (const chunk of documentChunks) {
-      if (chunk.sizeClass === "small") {
-        const candidate = normalizeWhitespace(
-          [...pendingSmall.map((item) => item.contentMd), chunk.contentMd].join("\n\n"),
-        );
-        if (candidate.length > thresholds.normalMaxChars) {
-          flushPending();
-          pendingSmall = [chunk];
-        } else {
-          pendingSmall.push(chunk);
-        }
-        continue;
-      }
-      flushPending();
-      if (chunk.sizeClass === "normal") {
-        records.push(createContextChunk([chunk], chunk.contentMd));
-        ordinal += 1;
-        continue;
-      }
-      if (chunk.sizeClass === "oversized") {
-        records.push(
-          createContextChunk([chunk], chunk.contentMd, {
-            sizeClass: "oversized",
-            summaryText: chunk.summaryText,
-          }),
-        );
-        ordinal += 1;
-      }
-    }
-    flushPending();
-    return records;
-  }
-
-  private buildFixedRetrievalChunks(input: {
-    documentId: string;
-    sourceChunks: SourceChunkRecord[];
-    fixedChunkChars: number;
-  }): StorageFixedRetrievalChunkRecord[] {
-    const maxChars = Math.max(Number(input.fixedChunkChars || 0), 1);
-    const pieces: FixedChunkPiece[] = [];
-    for (const chunk of input.sourceChunks) {
-      const contentParts = splitFixedChunkTextSmart(chunk.contentMd, maxChars);
-      for (const part of contentParts) {
-        pieces.push({
-          sourceChunkId: chunk.id,
-          pageNo: chunk.pageNo,
-          contentMd: part,
-          blockType: chunk.blockType,
-          mergedPageNosJson: chunk.mergedPageNosJson,
-          mergedBboxesJson: chunk.mergedBboxesJson,
-          bboxJson: chunk.bboxJson,
-        });
-      }
-    }
-
-    const records: StorageFixedRetrievalChunkRecord[] = [];
-    let ordinal = 0;
-    let pendingPieces: FixedChunkPiece[] = [];
-    const flushPending = () => {
-      if (pendingPieces.length === 0) {
-        return;
-      }
-      const contentMd = normalizeWhitespace(pendingPieces.map((piece) => piece.contentMd).join("\n\n"));
-      const sourceDocumentChunkIds = uniqueOrdered(pendingPieces.map((piece) => piece.sourceChunkId));
-      const pageNos = uniqueOrdered(
-        pendingPieces.flatMap((piece) => parseJsonArray<number>(piece.mergedPageNosJson, [piece.pageNo])),
-      );
-      const bboxes = pendingPieces.flatMap((piece) =>
-        parseJsonArray<[number, number, number, number]>(
-          piece.mergedBboxesJson,
-          [JSON.parse(piece.bboxJson) as [number, number, number, number]],
-        ),
-      );
-      records.push({
-        id: stableId("frchunk", `${input.documentId}:${ordinal}:${sourceDocumentChunkIds.join(",")}:${contentMd}`),
-        documentId: input.documentId,
-        ordinal,
-        contentMd,
-        sizeClass: classifySize(contentMd),
-        summaryText: null,
-        sourceDocumentChunkIdsJson: JSON.stringify(sourceDocumentChunkIds),
-        pageNosJson: JSON.stringify(pageNos),
-        sourceLocator: sourceLocatorFromPages(pageNos),
-        bboxesJson: JSON.stringify(bboxes),
-      });
-      ordinal += 1;
-      pendingPieces = [];
-    };
-
-    for (const piece of pieces) {
-      const pieceText = normalizeWhitespace(piece.contentMd);
-      if (!pieceText) {
-        continue;
-      }
-      const currentText = normalizeWhitespace(pendingPieces.map((item) => item.contentMd).join("\n\n"));
-      const candidate = normalizeWhitespace([currentText, pieceText].filter(Boolean).join("\n\n"));
-      if (candidate.length > maxChars && pendingPieces.length > 0) {
-        flushPending();
-      }
-      pendingPieces.push(piece);
-      const updatedText = normalizeWhitespace(pendingPieces.map((item) => item.contentMd).join("\n\n"));
-      if (updatedText.length >= maxChars) {
-        flushPending();
-      }
-    }
-    flushPending();
-    return records;
-  }
-
-  private buildIndexedDocumentChunks(
-    documentId: string,
-    sourceChunks: SourceChunkRecord[],
-    retrievalChunks: StorageRetrievalChunkRecord[],
-    fixedRetrievalChunks: StorageFixedRetrievalChunkRecord[] = [],
-  ): StorageDocumentChunkRecord[] {
-    const thresholds = getChunkThresholds();
-    const referenceBySourceChunkId = new Map<string, string>();
-    for (const chunk of retrievalChunks) {
-      for (const sourceChunkId of parseJsonArray<string>(chunk.sourceDocumentChunkIdsJson, [])) {
-        referenceBySourceChunkId.set(sourceChunkId, chunk.id);
-      }
-    }
-
-    const records: StorageDocumentChunkRecord[] = [];
-    const unitIdsBySourceChunkId = new Map<string, string[]>();
-    let ordinal = 0;
-    for (const chunk of sourceChunks) {
-      const referenceRetrievalChunkId = referenceBySourceChunkId.get(chunk.id) ?? null;
-      if (chunk.sizeClass === "oversized") {
-        const parts = splitOversized(chunk.contentMd, chunk.blockType);
-        for (let splitIndex = 0; splitIndex < parts.length; splitIndex += 1) {
-          const part = parts[splitIndex]!;
-          records.push({
-            id: stableId("dchunk", `${documentId}:${chunk.id}:${splitIndex}:${part}`),
-            documentId,
-            ordinal,
-            referenceRetrievalChunkId,
-            pageNo: chunk.pageNo,
-            documentIndex: chunk.documentIndex,
-            pageIndex: chunk.pageIndex,
-            blockType: chunk.blockType,
-            bboxJson: chunk.bboxJson,
-            contentMd: part,
-            sizeClass: part.length <= thresholds.smallMaxChars ? "small" : "normal",
-            summaryText: chunk.summaryText,
-            isSplitFromOversized: true,
-            splitIndex,
-            splitCount: parts.length,
-            mergedPageNosJson: chunk.mergedPageNosJson,
-            mergedBboxesJson: chunk.mergedBboxesJson,
-          });
-          const unitIds = unitIdsBySourceChunkId.get(chunk.id) ?? [];
-          unitIds.push(records[records.length - 1]!.id);
-          unitIdsBySourceChunkId.set(chunk.id, unitIds);
-          ordinal += 1;
-        }
-        continue;
-      }
-      records.push({
-        id: stableId("dchunk", `${documentId}:${chunk.id}:${ordinal}:${chunk.contentMd}`),
-        documentId,
-        referenceRetrievalChunkId,
-        ordinal,
-        pageNo: chunk.pageNo,
-        documentIndex: chunk.documentIndex,
-        pageIndex: chunk.pageIndex,
-        blockType: chunk.blockType,
-        bboxJson: chunk.bboxJson,
-        contentMd: chunk.contentMd,
-        sizeClass: chunk.sizeClass,
-        summaryText: chunk.summaryText,
-        isSplitFromOversized: false,
-        splitIndex: 0,
-        splitCount: 1,
-        mergedPageNosJson: chunk.mergedPageNosJson,
-        mergedBboxesJson: chunk.mergedBboxesJson,
-      });
-      const unitIds = unitIdsBySourceChunkId.get(chunk.id) ?? [];
-      unitIds.push(records[records.length - 1]!.id);
-      unitIdsBySourceChunkId.set(chunk.id, unitIds);
-      ordinal += 1;
-    }
-    const remapChunkSourceIds = (
-      chunks: Array<{ sourceDocumentChunkIdsJson: string }>,
-    ) => {
-      for (const chunk of chunks) {
-        const sourceChunkIds = parseJsonArray<string>(chunk.sourceDocumentChunkIdsJson, []);
-        const unitIds = sourceChunkIds.flatMap((sourceChunkId) => unitIdsBySourceChunkId.get(sourceChunkId) ?? []);
-        chunk.sourceDocumentChunkIdsJson = JSON.stringify(unitIds);
-      }
-    };
-    remapChunkSourceIds(retrievalChunks);
-    remapChunkSourceIds(fixedRetrievalChunks);
-    return records;
-  }
 }

@@ -704,6 +704,7 @@ export class DocumentLibraryService {
           originalFilename: input.document.original_filename || input.document.relative_path,
           parsedDocument: input.parsedDocument,
           enableImageSemantic: true,
+          retrievalChunkingStrategy: input.chunkingStrategy,
         }),
       );
     } else {
@@ -726,6 +727,7 @@ export class DocumentLibraryService {
               originalFilename: input.document.original_filename || input.document.relative_path,
               parsedDocument: input.parsedDocument,
               enableImageSemantic: false,
+              retrievalChunkingStrategy: input.chunkingStrategy,
             })),
         }),
     );

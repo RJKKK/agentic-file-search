@@ -10,6 +10,7 @@ import { dirname } from "node:path";
 
 import Database from "better-sqlite3";
 
+import { buildChineseFtsIndexText } from "../runtime/chinese-fts.js";
 import type { DocumentCatalog, DocumentRecord, DocumentSummary } from "../types/skills.js";
 import type {
   DocumentParseTaskStatus,
@@ -1147,7 +1148,7 @@ export class SqliteStorage implements SqliteStorageBackend {
           now,
           now,
         );
-        ftsStatement.run(chunk.id, chunk.documentId, chunk.contentMd);
+        ftsStatement.run(chunk.id, chunk.documentId, buildChineseFtsIndexText(chunk.contentMd));
       }
     });
     run();
@@ -1200,6 +1201,12 @@ export class SqliteStorage implements SqliteStorageBackend {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
       );
+      const ftsStatement = this.db.prepare(
+        `
+          INSERT INTO retrieval_chunks_fts (chunk_id, document_id, chunk_text)
+          VALUES (?, ?, ?)
+        `,
+      );
       for (const chunk of chunks) {
         const sourceDocumentChunkIds = JSON.parse(chunk.sourceDocumentChunkIdsJson || "[]") as string[];
         chunkStatement.run(
@@ -1219,6 +1226,7 @@ export class SqliteStorage implements SqliteStorageBackend {
           now,
           now,
         );
+        ftsStatement.run(chunk.id, chunk.documentId, buildChineseFtsIndexText(chunk.contentMd));
       }
     });
     run();
@@ -1296,7 +1304,7 @@ export class SqliteStorage implements SqliteStorageBackend {
               VALUES (?, ?, ?)
             `,
           )
-          .run(chunk.id, chunk.documentId, chunk.contentMd);
+          .run(chunk.id, chunk.documentId, buildChineseFtsIndexText(chunk.contentMd));
       }
     });
     run();

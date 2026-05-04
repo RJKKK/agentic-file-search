@@ -8,7 +8,11 @@ import {
   REPEATED_TOOLCALL_PROMPT,
   renderActionRepairPrompt,
 } from "../src/agent/prompts.js";
-import { buildVisionPromptMessages, renderImageSemantic } from "../src/runtime/image-semantic.js";
+import {
+  buildVisionPromptMessages,
+  renderImageSemantic,
+  truncateImageSemanticPreview,
+} from "../src/runtime/image-semantic.js";
 import { loadSkills } from "../src/runtime/load-skills.js";
 import { buildToolRegistry } from "../src/runtime/registry.js";
 
@@ -70,10 +74,24 @@ describe("system prompt", () => {
     assert.match(prompt.systemPrompt, /Return strict JSON only/i);
     assert.match(prompt.systemPrompt, /retrieval_summary/i);
     assert.match(prompt.systemPrompt, /detail_markdown/i);
-    assert.match(prompt.userPrompt, /流程图、业务图、时序图：务必详尽描述/);
+    assert.match(prompt.userPrompt, /流程图、业务图、时序图、方框图：务必详尽描述/);
     assert.match(prompt.userPrompt, /结构图、架构图、关系图、网络拓扑图：务必详尽描述/);
-    assert.match(prompt.userPrompt, /统计图表：务必详尽描述/);
+    assert.match(prompt.userPrompt, /统计图表：务必详尽描述图表类型、坐标轴、单位、图例/);
+    assert.match(prompt.userPrompt, /关系图、股权图、穿透图、组织关系图的硬性要求/);
+    assert.match(prompt.userPrompt, /每条关系尽量写成主谓宾结构句子/);
+    assert.match(prompt.userPrompt, /A 持股 B 100\.00%/);
+    assert.match(prompt.userPrompt, /## 逐项关系/);
     assert.match(prompt.userPrompt, /detail_truncated/);
+  });
+
+  it("injects neighboring context into the vision prompt with non-hallucination guardrails", () => {
+    const prompt = buildVisionPromptMessages({
+      contextText: "## 公司与实际控制人之间的产权及控制关系的方框图\n曾毓群为实际控制人。",
+    });
+
+    assert.match(prompt.userPrompt, /邻近上下文/);
+    assert.match(prompt.userPrompt, /公司与实际控制人之间的产权及控制关系的方框图/);
+    assert.match(prompt.userPrompt, /不得仅凭邻近上下文补造/);
   });
 
   it("renders layered image semantics with a short retrieval text and a separate detailed text", () => {
@@ -91,8 +109,20 @@ describe("system prompt", () => {
 
     assert.match(rendered.shortMarkdown ?? "", /流程图描述采购申请到审批完成的主流程/);
     assert.match(rendered.shortMarkdown ?? "", /\[Keywords\]/);
+    assert.match(rendered.shortMarkdown ?? "", /!\[image\]\(\/api\/assets\/images\/demo\)/);
     assert.match(rendered.semanticDetailText ?? "", /## 关键结构与关系/);
     assert.match(rendered.semanticDetailText ?? "", /\[detail_truncated=true\]/);
     assert.equal((rendered.semanticText?.length ?? 0) > 0, true);
+  });
+
+  it("preserves full image links when truncating image semantic previews", () => {
+    const preview = truncateImageSemanticPreview(
+      "图片链接：![image](/api/assets/images/demo)\n\n" + "Detailed explanation ".repeat(40),
+      80,
+    );
+
+    assert.match(preview, /图片链接：!\[image\]\(\/api\/assets\/images\/demo\)/);
+    assert.match(preview, /\[truncated\]/);
+    assert.doesNotMatch(preview, /!\[image\]\(\/api\/assets\/images\/dem(?:\)|$)/);
   });
 });
